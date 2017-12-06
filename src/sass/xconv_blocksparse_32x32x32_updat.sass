@@ -1,0 +1,1017 @@
+# Kernel: xconv_blocksparse_32x32x32_updat
+
+[-
+our ($type, $E16, $I16, $O16, $D);
+sub E16 { return $type eq 'h' || $E16; }
+sub I16 { return $type eq 'h' || $I16; }
+sub O16 { return $type eq 'h' || $O16; }
+
+our $dtypeE  = E16() ?  'U16' :  '32';
+our $dtypeI  = I16() ?  'U16' :  '32';
+our $dtypeO  = O16() ?  'U16' :  '32';
+
+our $dshiftE = E16() ?    '1' :   '2';
+our $dshiftI = I16() ?    '1' :   '2';
+our $dshiftO = O16() ?    '1' :   '2';
+
+our $dsizeE  = E16() ?    '2' :   '4';
+our $dsizeI  = I16() ?    '2' :   '4';
+our $dsizeO  = O16() ?    '2' :   '4';
+
+sub dtypeE  { return $dtypeE;  }
+sub dtypeI  { return $dtypeI;  }
+sub dtypeO  { return $dtypeO;  }
+
+sub dsizeE  { return $dsizeE;  }
+sub dsizeI  { return $dsizeI;  }
+sub dsizeF  { return $dsizeO;  }
+
+sub dshiftE { return $dshiftE; }
+sub dshiftI { return $dshiftI; }
+sub dshiftO { return $dshiftO; }
+
+sub deterministic { return $D; }
+-]
+
+<CONSTANT_MAPPING>
+
+    addr_zero  : 4x<32*33*4>
+    szShareE   : (32*33)
+    szShareI   : (32*33)
+
+    param_Block[0]  : c[0x0][0x140]
+    param_Block[1]  : c[0x0][0x144]
+    param_LutMPQ[0] : c[0x0][0x148]
+    param_LutMPQ[1] : c[0x0][0x14c]
+    param_LutCK[0]  : c[0x0][0x150]
+    param_LutCK[1]  : c[0x0][0x154]
+    param_O[0]      : c[0x0][0x158]
+    param_O[1]      : c[0x0][0x15c]
+    param_E[0]      : c[0x0][0x160]
+    param_E[1]      : c[0x0][0x164]
+    param_I[0]      : c[0x0][0x168]
+    param_I[1]      : c[0x0][0x16c]
+    param_alpha     : c[0x0][0x170]
+    param_TRS       : c[0x0][0x174]
+    param_magic_TRS : c[0x0][0x178]
+    param_shift_TRS : c[0x0][0x17c]
+    param_CDHW      : c[0x0][0x180]
+    param_KMPQ      : c[0x0][0x184]
+    param_N         : c[0x0][0x188]
+    param_sizeF     : c[0x0][0x18c]
+
+</CONSTANT_MAPPING>
+
+<REGISTER_MAPPING>
+
+        0-3 ~ idx_Blk
+       0-63 : czero<00-63>
+
+     3, 2,11,10,19,18,27,26 : cx<0-7>y0
+     7, 6,15,14,23,22,31,30 : cx<0-7>y1
+     1, 0, 9, 8,17,16,25,24 : cx<0-7>y2
+     5, 4,13,12,21,20,29,28 : cx<0-7>y3
+    35,34,43,42,51,50,59,58 : cx<0-7>y4
+    39,38,47,46,55,54,63,62 : cx<0-7>y5
+    33,32,41,40,49,48,57,56 : cx<0-7>y6
+    37,36,45,44,53,52,61,60 : cx<0-7>y7
+
+      64-79 : j0Ey<0-7>, j0Ix<0-7>
+      80-95 : j1Ey<0-7>, j1Ix<0-7>
+
+     96-111 : offset0E<0-3>, offset4E<0-3>, offset0I<0-3>, offset4I<0-3>
+     96-111 : E0<0-3>, E4<0-3>, I0<0-3>, I4<0-3>
+    112-127 : track0E<0-7>, track4E<0-7>
+    128-143 : track0I<0-7>, track4I<0-7>
+
+      64-65 : Block<0-1>
+      66-71 : block<0-5>
+
+      64-75 : mpqOffset<0-3>, dhwOffset0<0-3>, dhwOffset4<0-3>
+      76-89 : LutK0<0-1>, LutK4<0-1>, LutC0<0-1>, LutC4<0-1>, LutMPQ<0-1>, LutDHW0<0-1>, LutDHW4<0-1>
+      90-95 ~ kOffset<0|4>, cOffset<0|4>
+
+     96-143 ~ tidY, tidX, tid32_2, tid1, tid16, tid16_1, readIs2, block_MPQ, k<0|4>, ctrs<0|4>, c<0|4>, trs<0|4>, lutK<0|4>, lutC<0|4>, lutDHW<0|4>, lutMPQ
+
+    144-155 ~ writeS, readEs, readIs, swapBuf, N, KMPQ, CDHW, predE0, predE4, predI0, predI4
+    156-167 ~ tid, idx_MPQ, idx_K, idx_CTRS, block_C, block_K, block_CK, block_F, TRS, writeOs
+
+
+      16-31 ~ s<00|04|08|12>
+      64-95 ~ p00_<0-7>, p04_<0-7>, p08_<0-7>, p12_<0-7>
+      64-95 : shuffle_x<0-7>y0, shuffle_x<0-7>y1, shuffle_x<0-7>y2, shuffle_x<0-7>y3
+      64-95 : shuffle_x<0-7>y4, shuffle_x<0-7>y5, shuffle_x<0-7>y6, shuffle_x<0-7>y7
+     96-103 : Out00_<0-1>, Out04_<0-1>, Out08_<0-1>, Out12_<0-1>
+    104-155 ~ tid31, tid32, alpha, readOs, CTRS, CTRS16, ctrs, k<00|04|08|12>, offsetO<00|04|08|12>
+
+</REGISTER_MAPPING>
+
+--:-:2:-:1      S2R idx_Blk, SR_CTAID.X;
+--:-:1:-:1      S2R tid,     SR_TID.X;
+
+02:-:-:-:6      XMAD idx_Blk, idx_Blk, 6, RZ;
+--:-:-:-:6      LEA      Block0.CC, idx_Blk,   param_Block[0],     2;
+--:-:-:-:2      LEA.HI.X Block1,    idx_Blk,   param_Block[1], RZ, 2;
+
+--:-:-:-:1      LDG.E.CI.64 block0, [Block + 4x<0>];
+--:-:-:-:1      LDG.E.CI.64 block2, [Block + 4x<2>];
+--:-:2:-:1      LDG.E.CI.64 block4, [Block + 4x<4>];
+
+// idx_MPQ, idx_CTRS/idx_K, block_C, block_K, block_CK, block_F
+//02:-:-:-:1      MOV idx_MPQ,      block0;
+//02:-:-:-:1      SHR.U32 idx_K,    block1, 16;
+//02:-:-:-:1      LOP.AND idx_CTRS, block1, 0xffff;
+//02:-:-:-:1      MOV block_C,      block2;
+//02:-:-:-:1      MOV block_K,      block3;
+//02:-:-:-:1      MOV block_CK,     block4;
+//02:-:-:-:1      MOV block_F,      block5;
+
+<SCHEDULE_BLOCK>
+<ORDERED>
+--:-:-:-:1      STS.128 [addr_zero], RZ;
+[+ join '', map sprintf("--:-:-:-:1      LDS.U.128 czero%02d, [addr_zero];\n", $_ * 4), 0..15; +]
+
+02:-:-:-:1      LOP.AND idx_CTRS, block1, 0xffff;
+--:-:-:-:1      MOV block_CK, block4;
+--:-:-:-:1      MOV block_C, block2;
+--:-:-:-:1      MOV idx_MPQ, block0;
+--:-:-:-:1      SHR.U32 idx_K, block1, 16;
+--:-:-:-:1      MOV block_K, block3;
+--:-:-:-:1      MOV block_F, block5;
+</ORDERED>
+
+// tidX = ((tid & 31) >> 3) + ((tid & -32) >> 2)
+// tidY =  (tid &  7) << 2
+01:-:-:-:1      LOP.AND tid32_2, tid,   -32;
+--:-:-:-:1      SHR.U32 tid32_2, tid32_2, 2;
+--:-:-:-:1      BFE.U32 tidX,    tid,     0x203; // 2 bits at position 3
+--:-:-:-:1      LOP.OR  tidX,    tidX,    tid32_2;
+--:-:-:-:1      LOP.AND tidY,    tid,     7;
+--:-:-:-:1      SHL     tidY,    tidY,    2;
+
+// The extra tidY here is to avoid bank conflicts on write
+// writeS = (tidY*32 + tidX + tidY) * 4
+--:-:-:-:1      ISCADD writeS, tidY,   tidX, 5;
+--:-:-:-:1      IADD   writeS, writeS, tidY;
+--:-:-:-:1      SHL    writeS, writeS, 2;
+
+// readEs = ((tid & 8) >> 2) | (tid & 1)
+--:-:-:-:1      LOP.AND tid1,   tid,    1;
+--:-:-:-:1      LOP.AND readEs, tid,    8;
+--:-:-:-:1      SHR.U32 readEs, readEs, 2;
+--:-:-:-:1      LOP.OR  readEs, readEs, tid1;
+
+// readIs  = (tid >> 1) & 3
+--:-:-:-:1      BFE.U32 readIs, tid, 0x201; // 2 bits at position 1
+
+// tid16 = tid & -16
+--:-:-:-:1      LOP.AND tid16, tid, -16;
+
+// Arrange 8 tiles horizontally in the I direction
+// Add some spacing (readEs << 2) to avoid write bank conflicts
+// readIs2 = readIs + (tid16 >> 1) + (readEs << 2)
+--:-:-:-:1      SHR.U32 tid16_1, tid16, 1;
+--:-:-:-:1      IADD    readIs2, tid16_1, readIs;
+--:-:-:-:1      ISCADD  readIs2, readEs,  readIs2, 2;
+
+// readEs  <<= 4
+// readIs  <<= 4
+// readIs2 <<= 4
+--:-:-:-:1      SHL readEs,  readEs,  4;
+--:-:-:-:1      SHL readIs,  readIs,  4;
+--:-:-:-:1      SHL readIs2, readIs2, 4;
+
+// writeOs = readEs*32*8 + readIs2
+--:-:-:-:1      ISCADD writeOs, readEs, readIs2, 8;
+
+// Each block of 16 threads works on 4 lines
+// readEs += tid16 / 4 * 32 * 4
+// readIs += tid16 / 4 * 32 * 4
+--:-:-:-:1      ISCADD readEs, tid16, readEs, 5;
+--:-:-:-:1      ISCADD readIs, tid16, readIs, 5;
+
+// Shift each group of 16 theads over by 4
+--:-:-:-:1      IADD  readEs, readEs, tid16;
+--:-:-:-:1      IADD3 readIs, readIs, 4x<szShareE>, tid16;
+
+// k = idx_K*32 + tidX
+--:-:-:-:1      ISCADD k0, idx_K, tidX, 5;
+--:-:-:-:1      IADD   k4, k0, 4;
+
+--:-:-:-:1      ISETP.LT.AND P3, PT, k0, block_K, PT;
+--:-:-:-:1      ISETP.LT.AND P4, PT, k4, block_K, PT;
+
+// ctrs = idx_CTRS*32 + tidX
+--:-:-:-:1      ISCADD ctrs0, idx_CTRS, tidX, 5;
+--:-:-:-:1      IADD   ctrs4, ctrs0, 4;
+
+// c    = ctrs / TRS
+// trs  = ctrs % TRS
+--:-:-:-:1      MOV TRS, param_TRS;
+--:-:-:-:1      XMAD c0, ctrs0, param_magic_TRS, RZ;
+--:-:-:-:1      SHR.U32 c0, c0, param_shift_TRS;
+--:-:-:-:1      VMAD.U16.U16 trs0, -c0, TRS, ctrs0;
+
+--:-:-:-:1      XMAD c4, ctrs4, param_magic_TRS, RZ;
+--:-:-:-:1      SHR.U32 c4, c4, param_shift_TRS;
+--:-:-:-:1      VMAD.U16.U16 trs4, -c4, TRS, ctrs4;
+
+--:-:-:-:1      ISETP.LT.AND P5, PT, c0, block_C, PT;
+--:-:-:-:1      ISETP.LT.AND P6, PT, c4, block_C, PT;
+
+// lutK = block_CK + block_C + k
+--:-:-:-:1      IADD3 lutK0, block_CK, block_C, k0;
+--:-:-:-:1      IADD3 lutK4, block_CK, block_C, k4;
+--:-:-:-:1      LEA    LutK00.CC, lutK0, param_LutCK[0], 2;
+--:-:-:-:1      IADD.X LutK01,       RZ, param_LutCK[1];
+
+--:-:-:-:1  @P3 LDG.E.CI.32 kOffset0, [LutK0];
+
+// block_MPQ = idx_MPQ*(TRS*32 + 32) + tidY
+--:-:-:-:1      ISCADD block_MPQ, TRS, 32, 5;
+--:-:-:-:1      XMAD   block_MPQ, block_MPQ, idx_MPQ, tidY;
+
+// lutMPQ = block_MPQ + TRS*32
+--:-:-:-:1      ISCADD lutMPQ, TRS, block_MPQ, 5;
+--:-:-:-:1      LEA    LutMPQ0.CC, lutMPQ, param_LutMPQ[0], 2;
+--:-:-:-:1      IADD.X LutMPQ1,        RZ, param_LutMPQ[1];
+
+--:-:3:-:1  @P3 LDG.E.CI.128 mpqOffset, [LutMPQ];
+
+--:-:-:-:1      LEA    LutK40.CC, lutK4, param_LutCK[0], 2;
+--:-:-:-:1      IADD.X LutK41,       RZ, param_LutCK[1];
+
+--:-:4:-:1  @P4 LDG.E.CI.32 kOffset4, [LutK4];
+
+// lutC = block_CK + c
+--:-:-:-:1      IADD lutC0, block_CK, c0;
+--:-:-:-:1      IADD lutC4, block_CK, c4;
+--:-:-:-:1      LEA    LutC00.CC, lutC0, param_LutCK[0], 2;
+--:-:-:-:1      IADD.X LutC01,       RZ, param_LutCK[1];
+
+--:-:-:-:1  @P5 LDG.E.CI.32 cOffset0, [LutC0];
+
+// lutDHW =  block_MPQ + trs*32
+--:-:-:-:1      ISCADD lutDHW0, trs0, block_MPQ, 5;
+--:-:-:-:1      ISCADD lutDHW4, trs4, block_MPQ, 5;
+--:-:-:-:1      LEA    LutDHW00.CC, lutDHW0, param_LutMPQ[0], 2;
+--:-:-:-:1      IADD.X LutDHW01,         RZ, param_LutMPQ[1];
+
+--:-:5:-:1  @P5 LDG.E.CI.128 dhwOffset0, [LutDHW0];
+
+--:-:-:-:1      LEA    LutC40.CC, lutC4, param_LutCK[0], 2;
+--:-:-:-:1      IADD.X LutC41,       RZ, param_LutCK[1];
+
+--:-:-:-:1  @P6 LDG.E.CI.32 cOffset4, [LutC4];
+
+--:-:-:-:1      LEA    LutDHW40.CC, lutDHW4, param_LutMPQ[0], 2;
+--:-:-:-:1      IADD.X LutDHW41,         RZ, param_LutMPQ[1];
+
+--:-:6:-:1  @P6 LDG.E.CI.128 dhwOffset4, [LutDHW4];
+
+
+--:-:-:-:1      MOV N,    param_N;
+--:-:-:-:1      MOV KMPQ, param_KMPQ;
+--:-:-:-:1      MOV CDHW, param_CDHW;
+--:-:-:-:1      SHL KMPQ, KMPQ, [+ dshiftE() +];
+--:-:-:-:1      SHL CDHW, CDHW, [+ dshiftI() +];
+
+--:-:-:-:1      IADD N, N, -1;
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+04:-:-:-:1      ISETP.GE.AND P0, PT, mpqOffset0, RZ, P3;
+--:-:-:-:1      ISETP.GE.AND P1, PT, mpqOffset1, RZ, P3;
+--:-:-:-:1      ISETP.GE.AND P2, PT, mpqOffset2, RZ, P3;
+--:-:-:-:1      ISETP.GE.AND P3, PT, mpqOffset3, RZ, P3;
+--:-:-:-:1      IADD offset0E0, kOffset0, mpqOffset0;
+--:-:-:-:1      IADD offset0E1, kOffset0, mpqOffset1;
+--:-:-:-:1      IADD offset0E2, kOffset0, mpqOffset2;
+--:-:-:-:1      IADD offset0E3, kOffset0, mpqOffset3;
+--:-:-:-:1      P2R predE0, PR, RZ, 0x0f;
+--:-:-:-:1      LEA    track0E0.CC, offset0E0, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track0E1,           RZ, param_E[1];
+--:-:-:-:1      LEA    track0E2.CC, offset0E1, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track0E3,           RZ, param_E[1];
+--:-:-:-:1      LEA    track0E4.CC, offset0E2, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track0E5,           RZ, param_E[1];
+--:-:-:-:1      LEA    track0E6.CC, offset0E3, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track0E7,           RZ, param_E[1];
+--:-:-:-:1 @!P0 MOV E00, RZ;
+--:-:-:-:1 @!P1 MOV E01, RZ;
+--:-:-:-:1 @!P2 MOV E02, RZ;
+--:-:-:-:1 @!P3 MOV E03, RZ;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeE() +] E00, [track0E0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeE() +] E01, [track0E2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeE() +] E02, [track0E4];
+--:-:3:-:1  @P3 LDG.E.CI.[+ dtypeE() +] E03, [track0E6];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+08:-:-:-:1      ISETP.GE.AND P0, PT, mpqOffset0, RZ, P4;
+--:-:-:-:1      ISETP.GE.AND P1, PT, mpqOffset1, RZ, P4;
+--:-:-:-:1      ISETP.GE.AND P2, PT, mpqOffset2, RZ, P4;
+--:-:-:-:1      ISETP.GE.AND P3, PT, mpqOffset3, RZ, P4;
+--:-:-:-:1      IADD offset4E0, kOffset4, mpqOffset0;
+--:-:-:-:1      IADD offset4E1, kOffset4, mpqOffset1;
+--:-:-:-:1      IADD offset4E2, kOffset4, mpqOffset2;
+--:-:-:-:1      IADD offset4E3, kOffset4, mpqOffset3;
+--:-:-:-:1      P2R predE4, PR, RZ, 0x0f;
+--:-:-:-:1      LEA    track4E0.CC, offset4E0, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track4E1,           RZ, param_E[1];
+--:-:-:-:1      LEA    track4E2.CC, offset4E1, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track4E3,           RZ, param_E[1];
+--:-:-:-:1      LEA    track4E4.CC, offset4E2, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track4E5,           RZ, param_E[1];
+--:-:-:-:1      LEA    track4E6.CC, offset4E3, param_E[0], [+ dshiftE() +];
+--:-:-:-:1      IADD.X track4E7,           RZ, param_E[1];
+--:-:-:-:1 @!P0 MOV E40, RZ;
+--:-:-:-:1 @!P1 MOV E41, RZ;
+--:-:-:-:1 @!P2 MOV E42, RZ;
+--:-:-:-:1 @!P3 MOV E43, RZ;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeE() +] E40, [track4E0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeE() +] E41, [track4E2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeE() +] E42, [track4E4];
+--:-:4:-:1  @P3 LDG.E.CI.[+ dtypeE() +] E43, [track4E6];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+10:-:-:-:1      ISETP.GE.AND P0, PT, dhwOffset00, RZ, P5;
+--:-:-:-:1      ISETP.GE.AND P1, PT, dhwOffset01, RZ, P5;
+--:-:-:-:1      ISETP.GE.AND P2, PT, dhwOffset02, RZ, P5;
+--:-:-:-:1      ISETP.GE.AND P3, PT, dhwOffset03, RZ, P5;
+--:-:-:-:1      IADD offset0I0, cOffset0, dhwOffset00;
+--:-:-:-:1      IADD offset0I1, cOffset0, dhwOffset01;
+--:-:-:-:1      IADD offset0I2, cOffset0, dhwOffset02;
+--:-:-:-:1      IADD offset0I3, cOffset0, dhwOffset03;
+--:-:-:-:1      P2R predI0, PR, RZ, 0x0f;
+--:-:-:-:1      LEA    track0I0.CC, offset0I0, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track0I1,           RZ, param_I[1];
+--:-:-:-:1      LEA    track0I2.CC, offset0I1, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track0I3,           RZ, param_I[1];
+--:-:-:-:1      LEA    track0I4.CC, offset0I2, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track0I5,           RZ, param_I[1];
+--:-:-:-:1      LEA    track0I6.CC, offset0I3, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track0I7,           RZ, param_I[1];
+--:-:-:-:1 @!P0 MOV I00, RZ;
+--:-:-:-:1 @!P1 MOV I01, RZ;
+--:-:-:-:1 @!P2 MOV I02, RZ;
+--:-:-:-:1 @!P3 MOV I03, RZ;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeI() +] I00, [track0I0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeI() +] I01, [track0I2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeI() +] I02, [track0I4];
+--:-:5:-:1  @P3 LDG.E.CI.[+ dtypeI() +] I03, [track0I6];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+20:-:-:-:1      ISETP.GE.AND P0, PT, dhwOffset40, RZ, P6;
+--:-:-:-:1      ISETP.GE.AND P1, PT, dhwOffset41, RZ, P6;
+--:-:-:-:1      ISETP.GE.AND P2, PT, dhwOffset42, RZ, P6;
+--:-:-:-:1      ISETP.GE.AND P3, PT, dhwOffset43, RZ, P6;
+--:-:-:-:1      IADD offset4I0, cOffset4, dhwOffset40;
+--:-:-:-:1      IADD offset4I1, cOffset4, dhwOffset41;
+--:-:-:-:1      IADD offset4I2, cOffset4, dhwOffset42;
+--:-:-:-:1      IADD offset4I3, cOffset4, dhwOffset43;
+--:-:-:-:1      P2R predI4, PR, RZ, 0x0f;
+--:-:-:-:1      LEA    track4I0.CC, offset4I0, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track4I1,           RZ, param_I[1];
+--:-:-:-:1      LEA    track4I2.CC, offset4I1, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track4I3,           RZ, param_I[1];
+--:-:-:-:1      LEA    track4I4.CC, offset4I2, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track4I5,           RZ, param_I[1];
+--:-:-:-:1      LEA    track4I6.CC, offset4I3, param_I[0], [+ dshiftI() +];
+--:-:-:-:1      IADD.X track4I7,           RZ, param_I[1];
+--:-:-:-:1 @!P0 MOV I40, RZ;
+--:-:-:-:1 @!P1 MOV I41, RZ;
+--:-:-:-:1 @!P2 MOV I42, RZ;
+--:-:-:-:1 @!P3 MOV I43, RZ;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeI() +] I40, [track4I0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeI() +] I41, [track4I2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeI() +] I42, [track4I4];
+--:-:6:-:1  @P3 LDG.E.CI.[+ dtypeI() +] I43, [track4I6];
+
+--:-:-:-:1      ISETP.GT.AND P4, PT, N, RZ, PT;
+--:-:-:-:1      IADD N, N, -1;
+</SCHEDULE_BLOCK>
+[+
+    return E16() ? q{
+04:-:-:-:1      F2F.F32.F16 E00, E00;
+--:-:-:-:1      F2F.F32.F16 E01, E01;
+--:-:-:-:1      F2F.F32.F16 E02, E02;
+--:-:3:-:1      F2F.F32.F16 E03, E03;
+
+08:-:-:-:1      F2F.F32.F16 E40, E40;
+--:-:-:-:1      F2F.F32.F16 E41, E41;
+--:-:-:-:1      F2F.F32.F16 E42, E42;
+--:-:4:-:1      F2F.F32.F16 E43, E43;
+    } : '';
++]
+[+
+    return I16() ? q{
+10:-:-:-:1      F2F.F32.F16 I00, I00;
+--:-:-:-:1      F2F.F32.F16 I01, I01;
+--:-:-:-:1      F2F.F32.F16 I02, I02;
+--:-:5:-:1      F2F.F32.F16 I03, I03;
+
+20:-:-:-:1      F2F.F32.F16 I40, I40;
+--:-:-:-:1      F2F.F32.F16 I41, I41;
+--:-:-:-:1      F2F.F32.F16 I42, I42;
+--:-:6:-:1      F2F.F32.F16 I43, I43;
+    } : '';
++]
+<SCHEDULE_BLOCK>
+04:-:-:-:1      STS [writeS + 4x<0*32 + 0>], E00;
+--:-:-:-:1      STS [writeS + 4x<1*32 + 0>], E01;
+--:-:-:-:1      STS [writeS + 4x<2*32 + 0>], E02;
+--:-:-:-:1      STS [writeS + 4x<3*32 + 0>], E03;
+--:-:-:-:1  @P4 IADD   track0E0.CC, track0E0, KMPQ;
+--:-:-:-:1  @P4 IADD.X track0E1,    track0E1, RZ;
+--:-:-:-:1  @P4 IADD   track0E2.CC, track0E2, KMPQ;
+--:-:-:-:1  @P4 IADD.X track0E3,    track0E3, RZ;
+--:-:-:-:1  @P4 IADD   track0E4.CC, track0E4, KMPQ;
+--:-:-:-:1  @P4 IADD.X track0E5,    track0E5, RZ;
+--:-:-:-:1  @P4 IADD   track0E6.CC, track0E6, KMPQ;
+--:-:-:-:1  @P4 IADD.X track0E7,    track0E7, RZ;
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+08:-:-:-:1      STS [writeS + 4x<0*32 + 4>], E40;
+--:-:-:-:1      STS [writeS + 4x<1*32 + 4>], E41;
+--:-:-:-:1      STS [writeS + 4x<2*32 + 4>], E42;
+--:-:-:-:1      STS [writeS + 4x<3*32 + 4>], E43;
+--:-:-:-:1  @P4 IADD   track4E0.CC, track4E0, KMPQ;
+--:-:-:-:1  @P4 IADD.X track4E1,    track4E1, RZ;
+--:-:-:-:1  @P4 IADD   track4E2.CC, track4E2, KMPQ;
+--:-:-:-:1  @P4 IADD.X track4E3,    track4E3, RZ;
+--:-:-:-:1  @P4 IADD   track4E4.CC, track4E4, KMPQ;
+--:-:-:-:1  @P4 IADD.X track4E5,    track4E5, RZ;
+--:-:-:-:1  @P4 IADD   track4E6.CC, track4E6, KMPQ;
+--:-:-:-:1  @P4 IADD.X track4E7,    track4E7, RZ;
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+10:-:-:-:1      STS [writeS + 4x<0*32 + 0 + szShareE>], I00;
+--:-:-:-:1      STS [writeS + 4x<1*32 + 0 + szShareE>], I01;
+--:-:-:-:1      STS [writeS + 4x<2*32 + 0 + szShareE>], I02;
+--:-:-:-:1      STS [writeS + 4x<3*32 + 0 + szShareE>], I03;
+--:-:-:-:1  @P4 IADD   track0I0.CC, track0I0, CDHW;
+--:-:-:-:1  @P4 IADD.X track0I1,    track0I1, RZ;
+--:-:-:-:1  @P4 IADD   track0I2.CC, track0I2, CDHW;
+--:-:-:-:1  @P4 IADD.X track0I3,    track0I3, RZ;
+--:-:-:-:1  @P4 IADD   track0I4.CC, track0I4, CDHW;
+--:-:-:-:1  @P4 IADD.X track0I5,    track0I5, RZ;
+--:-:-:-:1  @P4 IADD   track0I6.CC, track0I6, CDHW;
+--:-:-:-:1  @P4 IADD.X track0I7,    track0I7, RZ;
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+20:-:-:-:1      STS [writeS + 4x<0*32 + 4 + szShareE>], I40;
+--:-:-:-:1      STS [writeS + 4x<1*32 + 4 + szShareE>], I41;
+--:-:-:-:1      STS [writeS + 4x<2*32 + 4 + szShareE>], I42;
+--:-:-:-:1      STS [writeS + 4x<3*32 + 4 + szShareE>], I43;
+--:-:-:-:1  @P4 IADD   track4I0.CC, track4I0, CDHW;
+--:-:-:-:1  @P4 IADD.X track4I1,    track4I1, RZ;
+--:-:-:-:1  @P4 IADD   track4I2.CC, track4I2, CDHW;
+--:-:-:-:1  @P4 IADD.X track4I3,    track4I3, RZ;
+--:-:-:-:1  @P4 IADD   track4I4.CC, track4I4, CDHW;
+--:-:-:-:1  @P4 IADD.X track4I5,    track4I5, RZ;
+--:-:-:-:1  @P4 IADD   track4I6.CC, track4I6, CDHW;
+--:-:-:-:1  @P4 IADD.X track4I7,    track4I7, RZ;
+</SCHEDULE_BLOCK>
+
+--:-:-:-:5      BAR.SYNC 0;
+
+<SCHEDULE_BLOCK>
+--:-:-:-:1      IADD32I writeS, writeS, 4x<szShareE + szShareI>;
+--:-:-:-:1      MOV32I swapBuf, -4x<szShareE + szShareI>;
+
+--:-:-:-:1      LDS.U.128 j0Ey0, [readEs + 4x<0*32 + 00>];
+--:-:-:-:1      LDS.U.128 j0Ix0, [readIs + 4x<0*32 + 00>];
+--:-:-:-:1      LDS.U.128 j0Ey4, [readEs + 4x<0*32 + 16>];
+--:-:1:-:1      LDS.U.128 j0Ix4, [readIs + 4x<0*32 + 16>];
+
+--:-:-:-:1  @P4 R2P PR, predE0, 0x0f;
+--:-:-:-:1 @!P4 R2P PR,     RZ, 0x0f;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeE() +] E00, [track0E0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeE() +] E01, [track0E2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeE() +] E02, [track0E4];
+--:-:3:-:1  @P3 LDG.E.CI.[+ dtypeE() +] E03, [track0E6];
+
+--:-:-:-:1  @P4 R2P PR, predE4, 0x0f;
+--:-:-:-:1 @!P4 R2P PR,     RZ, 0x0f;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeE() +] E40, [track4E0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeE() +] E41, [track4E2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeE() +] E42, [track4E4];
+--:-:4:-:1  @P3 LDG.E.CI.[+ dtypeE() +] E43, [track4E6];
+
+--:-:-:-:1  @P4 R2P PR, predI0, 0x0f;
+--:-:-:-:1 @!P4 R2P PR,     RZ, 0x0f;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeI() +] I00, [track0I0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeI() +] I01, [track0I2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeI() +] I02, [track0I4];
+--:-:5:-:1  @P3 LDG.E.CI.[+ dtypeI() +] I03, [track0I6];
+
+--:-:-:-:1  @P4 R2P PR, predI4, 0x0f;
+--:-:-:-:1 @!P4 R2P PR,     RZ, 0x0f;
+--:-:-:-:1  @P0 LDG.E.CI.[+ dtypeI() +] I40, [track4I0];
+--:-:-:-:1  @P1 LDG.E.CI.[+ dtypeI() +] I41, [track4I2];
+--:-:-:-:1  @P2 LDG.E.CI.[+ dtypeI() +] I42, [track4I4];
+--:-:6:-:1  @P3 LDG.E.CI.[+ dtypeI() +] I43, [track4I6];
+</SCHEDULE_BLOCK>
+
+LOOP:
+--:-:-:-:1      ISETP.GT.AND P5, PT, N, RZ, PT;
+[+
+    our ($dtypeE, $dshiftE, $dsizeE, $dtypeI, $dshiftI, $dsizeI);
+
+    my %insert = (
+
+        j0c1  => "--:-:-:-:1      ISETP.GE.AND P6, PT, N, RZ, PT;\n" .
+                 "--:-:-:-:1      IADD N, N, -1;\n",
+
+        E16() ? (
+            j0c8  => "04:-:-:-:1  \@P6 F2F.F32.F16 E00, E00;\n",
+            j0c10 => "--:-:-:-:1  \@P6 F2F.F32.F16 E01, E01;\n",
+            j0c12 => "--:-:-:-:1  \@P6 F2F.F32.F16 E02, E02;\n",
+            j0c14 => "--:-:3:-:1  \@P6 F2F.F32.F16 E03, E03;\n",
+        ) : (),
+
+        j0c27 => "04:-:-:-:1  \@P6 STS [writeS + 4x<0*32 + 0>], E00;\n",
+        j0c29 => "--:-:-:-:1  \@P6 STS [writeS + 4x<1*32 + 0>], E01;\n",
+        j0c31 => "--:-:-:-:1  \@P6 STS [writeS + 4x<2*32 + 0>], E02;\n",
+        j0c33 => "--:3:-:-:1  \@P6 STS [writeS + 4x<3*32 + 0>], E03;\n",
+
+        j0c28 => "--:-:-:-:1  \@P5 IADD   track0E0.CC, track0E0, KMPQ;\n",
+        j0c34 => "--:-:-:-:1  \@P5 IADD.X track0E1,    track0E1, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track0E2.CC, track0E2, KMPQ;\n",
+        j0c37 => "--:-:-:-:1  \@P5 IADD.X track0E3,    track0E3, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track0E4.CC, track0E4, KMPQ;\n",
+        j0c42 => "--:-:-:-:1  \@P5 IADD.X track0E5,    track0E5, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track0E6.CC, track0E6, KMPQ;\n",
+        j0c47 => "--:-:-:-:1  \@P5 IADD.X track0E7,    track0E7, RZ;\n",
+
+        j0c35 => "--:-:-:-:1  \@P5 R2P PR, predE0, 0x0f;\n",
+        j0c36 => "--:-:-:-:1 \@!P5 R2P PR,     RZ, 0x0f;\n",
+
+        j0c48 => "04:-:-:-:1  \@P0 LDG.E.CI.$dtypeE E00, [track0E0];\n",
+        j0c50 => "--:-:-:-:1  \@P1 LDG.E.CI.$dtypeE E01, [track0E2];\n",
+        j0c52 => "--:-:-:-:1  \@P2 LDG.E.CI.$dtypeE E02, [track0E4];\n",
+        j0c54 => "--:-:3:-:1  \@P3 LDG.E.CI.$dtypeE E03, [track0E6];\n",
+
+        E16() ? (
+            j0c56 => "08:-:-:-:1  \@P6 F2F.F32.F16 E40, E40;\n",
+            j0c58 => "--:-:-:-:1  \@P6 F2F.F32.F16 E41, E41;\n",
+            j0c60 => "--:-:-:-:1  \@P6 F2F.F32.F16 E42, E42;\n",
+            j0c62 => "--:-:4:-:1  \@P6 F2F.F32.F16 E43, E43;\n",
+        ) : (),
+
+        j1c10 => "08:-:-:-:1  \@P6 STS [writeS + 4x<0*32 + 4>], E40;\n",
+        j1c12 => "--:-:-:-:1  \@P6 STS [writeS + 4x<1*32 + 4>], E41;\n",
+        j1c14 => "--:-:-:-:1  \@P6 STS [writeS + 4x<2*32 + 4>], E42;\n",
+        j1c16 => "--:4:-:-:1  \@P6 STS [writeS + 4x<3*32 + 4>], E43;\n",
+
+        j1c11 => "--:-:-:-:1  \@P5 IADD   track4E0.CC, track4E0, KMPQ;\n",
+        j1c17 => "--:-:-:-:1  \@P5 IADD.X track4E1,    track4E1, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track4E2.CC, track4E2, KMPQ;\n",
+        j1c20 => "--:-:-:-:1  \@P5 IADD.X track4E3,    track4E3, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track4E4.CC, track4E4, KMPQ;\n",
+        j1c25 => "--:-:-:-:1  \@P5 IADD.X track4E5,    track4E5, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track4E6.CC, track4E6, KMPQ;\n",
+        j1c30 => "--:-:-:-:1  \@P5 IADD.X track4E7,    track4E7, RZ;\n",
+
+        j1c18 => "--:-:-:-:1  \@P5 R2P PR, predE4, 0x0f;\n",
+        j1c19 => "--:-:-:-:1 \@!P5 R2P PR,     RZ, 0x0f;\n",
+
+        j1c31 => "08:-:-:-:1  \@P0 LDG.E.CI.$dtypeE E40, [track4E0];\n",
+        j1c33 => "--:-:-:-:1  \@P1 LDG.E.CI.$dtypeE E41, [track4E2];\n",
+        j1c35 => "--:-:-:-:1  \@P2 LDG.E.CI.$dtypeE E42, [track4E4];\n",
+        j1c37 => "--:-:4:-:1  \@P3 LDG.E.CI.$dtypeE E43, [track4E6];\n",
+
+        I16() ? (
+            j1c39 => "10:-:-:-:1  \@P6 F2F.F32.F16 I00, I00;\n",
+            j1c41 => "--:-:-:-:1  \@P6 F2F.F32.F16 I01, I01;\n",
+            j1c43 => "--:-:-:-:1  \@P6 F2F.F32.F16 I02, I02;\n",
+            j1c45 => "--:-:5:-:1  \@P6 F2F.F32.F16 I03, I03;\n",
+        ) : (),
+
+        j1c56 => "10:-:-:-:1  \@P6 STS [writeS + 4x<0*32 + 0 + szShareE>], I00;\n",
+        j1c58 => "--:-:-:-:1  \@P6 STS [writeS + 4x<1*32 + 0 + szShareE>], I01;\n",
+        j1c60 => "--:-:-:-:1  \@P6 STS [writeS + 4x<2*32 + 0 + szShareE>], I02;\n",
+        j1c62 => "--:5:-:-:1  \@P6 STS [writeS + 4x<3*32 + 0 + szShareE>], I03;\n",
+
+        j1c57 => "--:-:-:-:1  \@P5 IADD   track0I0.CC, track0I0, CDHW;\n",
+        j1c63 => "--:-:-:-:1  \@P5 IADD.X track0I1,    track0I1, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track0I2.CC, track0I2, CDHW;\n",
+        j2c3  => "--:-:-:-:1  \@P5 IADD.X track0I3,    track0I3, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track0I4.CC, track0I4, CDHW;\n",
+        j2c7  => "--:-:-:-:1  \@P5 IADD.X track0I5,    track0I5, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track0I6.CC, track0I6, CDHW;\n",
+        j2c12 => "--:-:-:-:1  \@P5 IADD.X track0I7,    track0I7, RZ;\n",
+
+        j2c1  => "--:-:-:-:1  \@P5 R2P PR, predI0, 0x0f;\n",
+        j2c5  => "--:-:-:-:1 \@!P5 R2P PR,     RZ, 0x0f;\n",
+
+        j2c15 => "10:-:-:-:1  \@P0 LDG.E.CI.$dtypeI I00, [track0I0];\n",
+        j2c17 => "--:-:-:-:1  \@P1 LDG.E.CI.$dtypeI I01, [track0I2];\n",
+        j2c19 => "--:-:-:-:1  \@P2 LDG.E.CI.$dtypeI I02, [track0I4];\n",
+        j2c21 => "--:-:5:-:1  \@P3 LDG.E.CI.$dtypeI I03, [track0I6];\n",
+
+        I16() ? (
+            j2c27 => "20:-:-:-:1  \@P6 F2F.F32.F16 I40, I40;\n",
+            j2c29 => "--:-:-:-:1  \@P6 F2F.F32.F16 I41, I41;\n",
+            j2c31 => "--:-:-:-:1  \@P6 F2F.F32.F16 I42, I42;\n",
+            j2c33 => "--:-:6:-:1  \@P6 F2F.F32.F16 I43, I43;\n",
+        ) : (),
+
+        j2c50 => "20:-:-:-:1  \@P6 STS [writeS + 4x<0*32 + 4 + szShareE>], I40;\n",
+        j2c52 => "--:-:-:-:1  \@P6 STS [writeS + 4x<1*32 + 4 + szShareE>], I41;\n",
+        j2c54 => "--:-:-:-:1  \@P6 STS [writeS + 4x<2*32 + 4 + szShareE>], I42;\n",
+        j2c56 => "--:6:-:-:1  \@P6 STS [writeS + 4x<3*32 + 4 + szShareE>], I43;\n",
+
+        j2c51 => "--:-:-:-:1  \@P5 IADD   track4I0.CC, track4I0, CDHW;\n",
+        j2c57 => "--:-:-:-:1  \@P5 IADD.X track4I1,    track4I1, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track4I2.CC, track4I2, CDHW;\n",
+        j2c60 => "--:-:-:-:1  \@P5 IADD.X track4I3,    track4I3, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track4I4.CC, track4I4, CDHW;\n",
+        j3c1  => "--:-:-:-:1  \@P5 IADD.X track4I5,    track4I5, RZ;\n" .
+                 "--:-:-:-:1  \@P5 IADD   track4I6.CC, track4I6, CDHW;\n",
+        j3c6  => "--:-:-:-:1  \@P5 IADD.X track4I7,    track4I7, RZ;\n",
+
+        j2c58 => "--:-:-:-:1  \@P5 R2P PR, predI4, 0x0f;\n",
+        j2c59 => "--:-:-:-:1 \@!P5 R2P PR,     RZ, 0x0f;\n",
+
+        j3c8  => "20:-:-:-:1  \@P0 LDG.E.CI.$dtypeI I40, [track4I0];\n",
+        j3c10 => "--:-:-:-:1  \@P1 LDG.E.CI.$dtypeI I41, [track4I2];\n",
+        j3c12 => "--:-:-:-:1  \@P2 LDG.E.CI.$dtypeI I42, [track4I4];\n",
+        j3c14 => "--:-:6:-:1  \@P3 LDG.E.CI.$dtypeI I43, [track4I6];\n",
+
+        j3c15 => "--:-:-:-:5      BAR.SYNC 0;\n" .
+                 "--:-:-:-:1  \@P6 IADD readEs, readEs, -swapBuf;\n" .
+                 "--:-:-:-:1  \@P6 IADD readIs, readIs, -swapBuf;\n" .
+                 "--:-:-:-:1  \@P6 IADD writeS, writeS,  swapBuf;\n" .
+                 "--:-:-:-:1  \@P6 IADD swapBuf, RZ,    -swapBuf;\n",
+
+        j3c63 => "--:-:-:Y:5  \@P6 BRA.U LOOP;\n",
+    );
+
+    my @cOrder;
+    my @swirl = ([0,2],[1,2],[1,0],[0,0]);
+    my @y = (0,1,4,5);
+    foreach my $x (0,2,4,6)
+    {
+        foreach my $y (@y)
+        {
+            push @cOrder, [$x + $_->[0], $y + $_->[1]] foreach @swirl;
+        }
+        @y = reverse @y;
+    }
+    my $out;
+    foreach my $j (0 .. 3)
+    {
+        my $odd      = $j & 1;
+        my $nOdd     = !$odd + 0;
+        my $rsOffset = ($j + 1) % 4;
+        my $rsPred   = $j == 3 ? '@P6' : '   ';
+        my ($c0, $c2, $c4, $c6) = $j == 3 ? (16,18,20,22) : (0,2,4,6);
+
+        $insert{"j${j}c$c0"} = sprintf "--:-:-:-:1  %s LDS.U.128 j%dEy0, [readEs + 4x<%d*32 + 00>];\n", $rsPred, $nOdd, $rsOffset;
+        $insert{"j${j}c$c2"} = sprintf "--:-:-:-:1  %s LDS.U.128 j%dIx0, [readIs + 4x<%d*32 + 00>];\n", $rsPred, $nOdd, $rsOffset;
+        $insert{"j${j}c$c4"} = sprintf "--:-:-:-:1  %s LDS.U.128 j%dEy4, [readEs + 4x<%d*32 + 16>];\n", $rsPred, $nOdd, $rsOffset;
+        $insert{"j${j}c$c6"} = sprintf "--:-:1:-:1  %s LDS.U.128 j%dIx4, [readIs + 4x<%d*32 + 16>];\n", $rsPred, $nOdd, $rsOffset;
+
+        foreach my $c (0 .. 63)
+        {
+            my ($x,$y) = @{$cOrder[$c]};
+
+            my $ins    = $insert{"j${j}c$c"} || '';
+
+            my $stall  = $ins =~ /LDS|I2I|I2F|F2I|F2F|LDG|STS|BAR|BRA/ ? 0 : 1;
+
+            my $yield  = $c == 32 && $stall ? 'Y' : '-';
+
+            my $wait   = $c == 0 ? '01' : '--';
+
+            my $ctrl   = "$wait:-:-:$yield:$stall";
+
+            $out .= sprintf "%s      FFMA cx%dy%d, j%dIx%d, j%dEy%d, cx%dy%d;\n%s", $ctrl,  $x,$y,  $odd,$x,  $odd,$y,  $x,$y,  $ins;
+        }
+    }
+    return $out;
++]
+
+
+
+<SCHEDULE_BLOCK>
+--:-:-:-:1      LOP.AND tid31, tid, 31;
+--:-:-:-:1      SHR.U32 tid32, tid, 5;
+
+// CTRS = block_C * TRS
+--:-:-:-:1      XMAD CTRS, block_C, TRS, RZ;
+--:-:-:-:1      SHL  CTRS16, CTRS, 4;
+
+// ctrs = idx_CTRS*32 + tid31
+--:-:-:-:1      ISCADD  ctrs, idx_CTRS, tid31, 5;
+
+
+--:-:-:-:1      ISETP.LT.AND P4, PT, ctrs, CTRS, PT;
+
+// k = idx_K*32 + tid32
+--:-:-:-:1      ISCADD  k00, idx_K, tid32, 5;
+--:-:-:-:1      IADD    k04, k00, 4;
+--:-:-:-:1      IADD    k08, k00, 8;
+--:-:-:-:1      IADD    k12, k00, 12;
+
+--:-:-:-:1      ISETP.LT.AND P0, PT, k00, block_K, P4;
+--:-:-:-:1      ISETP.LT.AND P1, PT, k04, block_K, P4;
+--:-:-:-:1      ISETP.LT.AND P2, PT, k08, block_K, P4;
+--:-:-:-:1      ISETP.LT.AND P3, PT, k12, block_K, P4;
+
+// offsetF = block_F + k*CTRS + ctrs;
+--:-:-:-:1      IADD block_F, block_F, ctrs;
+[+
+    return deterministic() ? q{
+// block_F += idx_MPQ * sizeF
+--:-:-:-:1      XMAD.LO2C block_F, idx_M, param_sizeF, block_F;
+    } : '';
++]
+--:-:-:-:1      XMAD offsetO00, k00, CTRS, block_F;
+--:-:-:-:1      XMAD offsetO04, k04, CTRS, block_F;
+--:-:-:-:1      XMAD offsetO08, k08, CTRS, block_F;
+--:-:-:-:1      XMAD offsetO12, k12, CTRS, block_F;
+
+// readOs = (tid32*32*8 + tid_31) * 4
+--:-:-:-:1      ISCADD readOs, tid32, tid31, 8;
+--:-:-:-:1      SHL    readOs, readOs, 2;
+
+--:-:-:-:1      MOV alpha, param_alpha;
+
+--:-:-:-:1      FMUL shuffle_x0y0, cx0y0, alpha;
+--:-:-:-:1      FMUL shuffle_x1y0, cx1y0, alpha;
+--:-:-:-:1      FMUL shuffle_x2y0, cx2y0, alpha;
+--:-:-:-:1      FMUL shuffle_x3y0, cx3y0, alpha;
+--:-:-:-:1      FMUL shuffle_x4y0, cx4y0, alpha;
+--:-:-:-:1      FMUL shuffle_x5y0, cx5y0, alpha;
+--:-:-:-:1      FMUL shuffle_x6y0, cx6y0, alpha;
+--:-:-:-:1      FMUL shuffle_x7y0, cx7y0, alpha;
+--:-:-:-:1      FMUL shuffle_x0y1, cx0y1, alpha;
+--:-:-:-:1      FMUL shuffle_x1y1, cx1y1, alpha;
+--:-:-:-:1      FMUL shuffle_x2y1, cx2y1, alpha;
+--:-:-:-:1      FMUL shuffle_x3y1, cx3y1, alpha;
+--:-:-:-:1      FMUL shuffle_x4y1, cx4y1, alpha;
+--:-:-:-:1      FMUL shuffle_x5y1, cx5y1, alpha;
+--:-:-:-:1      FMUL shuffle_x6y1, cx6y1, alpha;
+--:-:-:-:1      FMUL shuffle_x7y1, cx7y1, alpha;
+--:-:-:-:1      FMUL shuffle_x0y2, cx0y2, alpha;
+--:-:-:-:1      FMUL shuffle_x1y2, cx1y2, alpha;
+--:-:-:-:1      FMUL shuffle_x2y2, cx2y2, alpha;
+--:-:-:-:1      FMUL shuffle_x3y2, cx3y2, alpha;
+--:-:-:-:1      FMUL shuffle_x4y2, cx4y2, alpha;
+--:-:-:-:1      FMUL shuffle_x5y2, cx5y2, alpha;
+--:-:-:-:1      FMUL shuffle_x6y2, cx6y2, alpha;
+--:-:-:-:1      FMUL shuffle_x7y2, cx7y2, alpha;
+--:-:-:-:1      FMUL shuffle_x0y3, cx0y3, alpha;
+--:-:-:-:1      FMUL shuffle_x1y3, cx1y3, alpha;
+--:-:-:-:1      FMUL shuffle_x2y3, cx2y3, alpha;
+--:-:-:-:1      FMUL shuffle_x3y3, cx3y3, alpha;
+--:-:-:-:1      FMUL shuffle_x4y3, cx4y3, alpha;
+--:-:-:-:1      FMUL shuffle_x5y3, cx5y3, alpha;
+--:-:-:-:1      FMUL shuffle_x6y3, cx6y3, alpha;
+--:-:-:-:1      FMUL shuffle_x7y3, cx7y3, alpha;
+--:-:-:-:1      STS.128 [writeOs+4x<0*256 + 00>], shuffle_x0y0;
+--:-:-:-:1      STS.128 [writeOs+4x<0*256 + 16>], shuffle_x4y0;
+--:-:-:-:1      STS.128 [writeOs+4x<1*256 + 00>], shuffle_x0y1;
+--:-:-:-:1      STS.128 [writeOs+4x<1*256 + 16>], shuffle_x4y1;
+--:-:-:-:1      STS.128 [writeOs+4x<2*256 + 00>], shuffle_x0y2;
+--:-:-:-:1      STS.128 [writeOs+4x<2*256 + 16>], shuffle_x4y2;
+--:-:-:-:1      STS.128 [writeOs+4x<3*256 + 00>], shuffle_x0y3;
+--:-:-:-:1      STS.128 [writeOs+4x<3*256 + 16>], shuffle_x4y3;
+</SCHEDULE_BLOCK>
+
+--:-:-:-:5      BAR.SYNC 0;
+
+--:-:-:-:5      CAL STORE_O;
+
+--:-:-:-:5      BAR.SYNC 0;
+
+<SCHEDULE_BLOCK>
+--:-:-:-:1      IADD k00, k00, 16;
+--:-:-:-:1      IADD k04, k04, 16;
+--:-:-:-:1      IADD k08, k08, 16;
+--:-:-:-:1      IADD k12, k12, 16;
+
+--:-:-:-:1      IADD offsetO00, offsetO00, CTRS16;
+--:-:-:-:1      IADD offsetO04, offsetO04, CTRS16;
+--:-:-:-:1      IADD offsetO08, offsetO08, CTRS16;
+--:-:-:-:1      IADD offsetO12, offsetO12, CTRS16;
+
+--:-:-:-:1      ISETP.LT.AND P0, PT, k00, block_K, P4;
+--:-:-:-:1      ISETP.LT.AND P1, PT, k04, block_K, P4;
+--:-:-:-:1      ISETP.LT.AND P2, PT, k08, block_K, P4;
+--:-:-:-:1      ISETP.LT.AND P3, PT, k12, block_K, P4;
+
+--:-:-:-:1      FMUL shuffle_x0y4, cx0y4, alpha;
+--:-:-:-:1      FMUL shuffle_x1y4, cx1y4, alpha;
+--:-:-:-:1      FMUL shuffle_x2y4, cx2y4, alpha;
+--:-:-:-:1      FMUL shuffle_x3y4, cx3y4, alpha;
+--:-:-:-:1      FMUL shuffle_x4y4, cx4y4, alpha;
+--:-:-:-:1      FMUL shuffle_x5y4, cx5y4, alpha;
+--:-:-:-:1      FMUL shuffle_x6y4, cx6y4, alpha;
+--:-:-:-:1      FMUL shuffle_x7y4, cx7y4, alpha;
+--:-:-:-:1      FMUL shuffle_x0y5, cx0y5, alpha;
+--:-:-:-:1      FMUL shuffle_x1y5, cx1y5, alpha;
+--:-:-:-:1      FMUL shuffle_x2y5, cx2y5, alpha;
+--:-:-:-:1      FMUL shuffle_x3y5, cx3y5, alpha;
+--:-:-:-:1      FMUL shuffle_x4y5, cx4y5, alpha;
+--:-:-:-:1      FMUL shuffle_x5y5, cx5y5, alpha;
+--:-:-:-:1      FMUL shuffle_x6y5, cx6y5, alpha;
+--:-:-:-:1      FMUL shuffle_x7y5, cx7y5, alpha;
+--:-:-:-:1      FMUL shuffle_x0y6, cx0y6, alpha;
+--:-:-:-:1      FMUL shuffle_x1y6, cx1y6, alpha;
+--:-:-:-:1      FMUL shuffle_x2y6, cx2y6, alpha;
+--:-:-:-:1      FMUL shuffle_x3y6, cx3y6, alpha;
+--:-:-:-:1      FMUL shuffle_x4y6, cx4y6, alpha;
+--:-:-:-:1      FMUL shuffle_x5y6, cx5y6, alpha;
+--:-:-:-:1      FMUL shuffle_x6y6, cx6y6, alpha;
+--:-:-:-:1      FMUL shuffle_x7y6, cx7y6, alpha;
+--:-:-:-:1      FMUL shuffle_x0y7, cx0y7, alpha;
+--:-:-:-:1      FMUL shuffle_x1y7, cx1y7, alpha;
+--:-:-:-:1      FMUL shuffle_x2y7, cx2y7, alpha;
+--:-:-:-:1      FMUL shuffle_x3y7, cx3y7, alpha;
+--:-:-:-:1      FMUL shuffle_x4y7, cx4y7, alpha;
+--:-:-:-:1      FMUL shuffle_x5y7, cx5y7, alpha;
+--:-:-:-:1      FMUL shuffle_x6y7, cx6y7, alpha;
+--:-:-:-:1      FMUL shuffle_x7y7, cx7y7, alpha;
+--:-:-:-:1      STS.128 [writeOs+4x<0*256 + 00>], shuffle_x0y4;
+--:-:-:-:1      STS.128 [writeOs+4x<0*256 + 16>], shuffle_x4y4;
+--:-:-:-:1      STS.128 [writeOs+4x<1*256 + 00>], shuffle_x0y5;
+--:-:-:-:1      STS.128 [writeOs+4x<1*256 + 16>], shuffle_x4y5;
+--:-:-:-:1      STS.128 [writeOs+4x<2*256 + 00>], shuffle_x0y6;
+--:-:-:-:1      STS.128 [writeOs+4x<2*256 + 16>], shuffle_x4y6;
+--:-:-:-:1      STS.128 [writeOs+4x<3*256 + 00>], shuffle_x0y7;
+--:-:-:-:1      STS.128 [writeOs+4x<3*256 + 16>], shuffle_x4y7;
+</SCHEDULE_BLOCK>
+--:-:-:-:5      BAR.SYNC 0;
+
+--:-:-:-:5      CAL STORE_O;
+
+0f:-:-:-:5      EXIT;
+
+STORE_O:
+
+<SCHEDULE_BLOCK>
+01:-:-:-:1  @P0 LEA    Out00_0.CC, offsetO00, param_O[0], [+ dshiftO() +];
+--:-:-:-:1  @P0 IADD.X Out00_1,           RZ, param_O[1];
+--:-:-:-:1  @P0 LDS p00_0, [readOs + 4x< 0*256 + 0*32 + 0*16>];
+--:-:-:-:1  @P0 LDS p00_1, [readOs + 4x< 0*256 + 1*32 + 0*16>];
+--:-:-:-:1  @P0 LDS p00_2, [readOs + 4x< 0*256 + 2*32 + 0*16>];
+--:-:-:-:1  @P0 LDS p00_3, [readOs + 4x< 0*256 + 3*32 + 0*16>];
+--:-:-:-:1  @P0 LDS p00_4, [readOs + 4x< 0*256 + 4*32 + 0*16>];
+--:-:-:-:1  @P0 LDS p00_5, [readOs + 4x< 0*256 + 5*32 + 0*16>];
+--:-:-:-:1  @P0 LDS p00_6, [readOs + 4x< 0*256 + 6*32 + 0*16>];
+--:-:1:Y:1  @P0 LDS p00_7, [readOs + 4x< 0*256 + 7*32 + 0*16>];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+02:-:-:-:1  @P1 LEA    Out04_0.CC, offsetO04, param_O[0], [+ dshiftO() +];
+--:-:-:-:1  @P1 IADD.X Out04_1,           RZ, param_O[1];
+--:-:-:-:1  @P1 LDS p04_0, [readOs + 4x< 4*256 + 0*32 + 1*16>];
+--:-:-:-:1  @P1 LDS p04_1, [readOs + 4x< 4*256 + 1*32 + 1*16>];
+--:-:-:-:1  @P1 LDS p04_2, [readOs + 4x< 4*256 + 2*32 + 1*16>];
+--:-:-:-:1  @P1 LDS p04_3, [readOs + 4x< 4*256 + 3*32 + 1*16>];
+--:-:-:-:1  @P1 LDS p04_4, [readOs + 4x< 4*256 + 4*32 + 1*16>];
+--:-:-:-:1  @P1 LDS p04_5, [readOs + 4x< 4*256 + 5*32 + 1*16>];
+--:-:-:-:1  @P1 LDS p04_6, [readOs + 4x< 4*256 + 6*32 + 1*16>];
+--:-:2:Y:1  @P1 LDS p04_7, [readOs + 4x< 4*256 + 7*32 + 1*16>];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+04:-:-:-:1  @P2 LEA    Out08_0.CC, offsetO08, param_O[0], [+ dshiftO() +];
+--:-:-:-:1  @P2 IADD.X Out08_1,           RZ, param_O[1];
+--:-:-:-:1  @P2 LDS p08_0, [readOs + 4x< 8*256 + 0*32 + 2*16>];
+--:-:-:-:1  @P2 LDS p08_1, [readOs + 4x< 8*256 + 1*32 + 2*16>];
+--:-:-:-:1  @P2 LDS p08_2, [readOs + 4x< 8*256 + 2*32 + 2*16>];
+--:-:-:-:1  @P2 LDS p08_3, [readOs + 4x< 8*256 + 3*32 + 2*16>];
+--:-:-:-:1  @P2 LDS p08_4, [readOs + 4x< 8*256 + 4*32 + 2*16>];
+--:-:-:-:1  @P2 LDS p08_5, [readOs + 4x< 8*256 + 5*32 + 2*16>];
+--:-:-:-:1  @P2 LDS p08_6, [readOs + 4x< 8*256 + 6*32 + 2*16>];
+--:-:3:Y:1  @P2 LDS p08_7, [readOs + 4x< 8*256 + 7*32 + 2*16>];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+08:-:-:-:1  @P3 LEA    Out12_0.CC, offsetO12, param_O[0], [+ dshiftO() +];
+--:-:-:-:1  @P3 IADD.X Out12_1,           RZ, param_O[1];
+--:-:-:-:1  @P3 LDS p12_0, [readOs + 4x<12*256 + 0*32 + 3*16>];
+--:-:-:-:1  @P3 LDS p12_1, [readOs + 4x<12*256 + 1*32 + 3*16>];
+--:-:-:-:1  @P3 LDS p12_2, [readOs + 4x<12*256 + 2*32 + 3*16>];
+--:-:-:-:1  @P3 LDS p12_3, [readOs + 4x<12*256 + 3*32 + 3*16>];
+--:-:-:-:1  @P3 LDS p12_4, [readOs + 4x<12*256 + 4*32 + 3*16>];
+--:-:-:-:1  @P3 LDS p12_5, [readOs + 4x<12*256 + 5*32 + 3*16>];
+--:-:-:-:1  @P3 LDS p12_6, [readOs + 4x<12*256 + 6*32 + 3*16>];
+--:-:4:Y:1  @P3 LDS p12_7, [readOs + 4x<12*256 + 7*32 + 3*16>];
+</SCHEDULE_BLOCK>
+
+<SCHEDULE_BLOCK>
+01:-:-:-:1  @P0 FADD p00_0, p00_0, p00_1;
+--:-:-:-:1  @P0 FADD p00_2, p00_2, p00_3;
+--:-:-:-:1  @P0 FADD p00_4, p00_4, p00_5;
+--:-:-:-:1  @P0 FADD p00_6, p00_6, p00_7;
+
+02:-:-:-:1  @P1 FADD p04_0, p04_0, p04_1;
+--:-:-:-:1  @P1 FADD p04_2, p04_2, p04_3;
+--:-:-:-:1  @P1 FADD p04_4, p04_4, p04_5;
+--:-:-:-:1  @P1 FADD p04_6, p04_6, p04_7;
+
+04:-:-:-:1  @P2 FADD p08_0, p08_0, p08_1;
+--:-:-:-:1  @P2 FADD p08_2, p08_2, p08_3;
+--:-:-:-:1  @P2 FADD p08_4, p08_4, p08_5;
+--:-:-:-:1  @P2 FADD p08_6, p08_6, p08_7;
+
+08:-:-:-:1  @P3 FADD p12_0, p12_0, p12_1;
+--:-:-:-:1  @P3 FADD p12_2, p12_2, p12_3;
+--:-:-:-:1  @P3 FADD p12_4, p12_4, p12_5;
+--:-:-:-:1  @P3 FADD p12_6, p12_6, p12_7;
+
+--:-:-:-:1  @P0 FADD p00_0, p00_0, p00_2;
+--:-:-:-:1  @P0 FADD p00_4, p00_4, p00_6;
+--:-:-:-:1  @P0 FADD s00,   p00_0, p00_4;
+
+--:-:-:-:1  @P1 FADD p04_0, p04_0, p04_2;
+--:-:-:-:1  @P1 FADD p04_4, p04_4, p04_6;
+--:-:-:-:1  @P1 FADD s04,   p04_0, p04_4;
+
+--:-:-:-:1  @P2 FADD p08_0, p08_0, p08_2;
+--:-:-:-:1  @P2 FADD p08_4, p08_4, p08_6;
+--:-:-:-:1  @P2 FADD s08,   p08_0, p08_4;
+
+--:-:-:-:1  @P3 FADD p12_0, p12_0, p12_2;
+--:-:-:-:1  @P3 FADD p12_4, p12_4, p12_6;
+--:-:-:-:1  @P3 FADD s12,   p12_0, p12_4;
+
+[+
+    if (!deterministic())
+    {
+        # If the output channels overlap across blocks we need to atomic add the results.
+        # In the case of fp16 use the top or bottom half of the F16x2 instruction.
+        #   This wastes some throughput to L2 but this isn't the bottleneck.
+        return O16() ? q{
+--:-:1:-:1  @P0 F2F.F16.F32 s00, s00;
+--:-:2:-:1  @P1 F2F.F16.F32 s04, s04;
+--:-:3:-:1  @P2 F2F.F16.F32 s08, s08;
+--:-:4:-:1  @P3 F2F.F16.F32 s12, s12;
+
+--:-:-:-:1      LOP.AND.NZ P5, RZ, Out00_0, 2;
+--:-:-:-:1      LOP.AND.NZ P6, RZ, Out04_0, 2;
+01:-:-:-:1  @P5 XMAD.PSL.CLO s00, s00, 1, RZ; // same as left shift 16
+02:-:-:-:1  @P6 XMAD.PSL.CLO s04, s04, 1, RZ;
+--:-:-:-:2  @P5 LOP32I.AND Out00_0, Out00_0, 0xfffffffc;
+--:-:-:-:2  @P6 LOP32I.AND Out04_0, Out04_0, 0xfffffffc;
+
+--:-:-:-:1      LOP.AND.NZ P5, RZ, Out08_0, 2;
+--:-:-:-:1      LOP.AND.NZ P6, RZ, Out12_0, 2;
+04:-:-:-:1  @P5 XMAD.PSL.CLO s08, s08, 1, RZ;
+08:-:-:-:1  @P6 XMAD.PSL.CLO s12, s12, 1, RZ;
+--:-:-:-:2  @P5 LOP32I.AND Out08_0, Out08_0, 0xfffffffc;
+--:-:-:-:2  @P6 LOP32I.AND Out12_0, Out12_0, 0xfffffffc;
+<ORDERED>
+--:1:-:-:1  @P0 RED.E.ADD.F16x2.FTZ.RN [Out00_0], s00;
+--:2:-:-:1  @P1 RED.E.ADD.F16x2.FTZ.RN [Out04_0], s04;
+--:3:-:-:1  @P2 RED.E.ADD.F16x2.FTZ.RN [Out08_0], s08;
+--:4:-:-:1  @P3 RED.E.ADD.F16x2.FTZ.RN [Out12_0], s12;
+</ORDERED>
+
+        } : q{
+<ORDERED>
+--:1:-:-:1  @P0 RED.E.ADD.F32.FTZ.RN [Out00_0], s00;
+--:2:-:-:1  @P1 RED.E.ADD.F32.FTZ.RN [Out04_0], s04;
+--:3:-:-:1  @P2 RED.E.ADD.F32.FTZ.RN [Out08_0], s08;
+--:4:-:-:1  @P3 RED.E.ADD.F32.FTZ.RN [Out12_0], s12;
+</ORDERED>
+        };
+    }
+    else
+    {
+        return O16() ? q{
+<ORDERED>
+--:-:1:-:1  @P0 F2F.F16.F32 s00, s00;
+--:-:2:-:1  @P1 F2F.F16.F32 s04, s04;
+--:-:3:-:1  @P2 F2F.F16.F32 s08, s08;
+--:-:4:-:1  @P3 F2F.F16.F32 s12, s12;
+01:1:-:-:1  @P0 STG.E.CG.U16 [Out00_0], s00;
+02:2:-:-:1  @P1 STG.E.CG.U16 [Out04_0], s04;
+04:3:-:-:1  @P2 STG.E.CG.U16 [Out08_0], s08;
+08:4:-:-:1  @P3 STG.E.CG.U16 [Out12_0], s12;
+</ORDERED>
+
+        } : q{
+<ORDERED>
+--:1:-:-:1  @P0 STG.E.CG.32 [Out00_0], s00;
+--:2:-:-:1  @P1 STG.E.CG.32 [Out04_0], s04;
+--:3:-:-:1  @P2 STG.E.CG.32 [Out08_0], s08;
+--:4:-:-:1  @P3 STG.E.CG.32 [Out12_0], s12;
+</ORDERED>
+        };
+    }
++]
+</SCHEDULE_BLOCK>
+
+--:-:-:-:5      RET;
