@@ -91,30 +91,58 @@ If your CUDA is not in `/usr/local/cuda` or you have several versions, e.g. both
 
     class BlocksparseMatMul(object)
 
-        def __init__(self, layout, block_size=32, feature_axis=1, name=None)
+        def __init__(self, layout, block_size=32, feature_axis=1)
+        """
+        layout: a 2d array of ones and zeros specifying the block layout
+        block_size: values 32, 16, 8 supported
+        feature_axis: when block_size is less than 32 memory access becomes far more efficient
+                      with a (C,N) activation layout
+        """
 
-        def i_shape(self, N): return (N, self.C) if self.axis else (self.C, N)
-        def o_shape(self, N): return (N, self.K) if self.axis else (self.K, N)
+        # shape helpers for generating tensors (N=minibatch)
+        self.w_shape
+        def i_shape(self, N)
+        def o_shape(self, N)
 
-        # return the coordinate in the layout that corresponds to a given block id
-        def block_coord(self, block): return self.updat_list[block]
+        # return the coordinates (c,k) in the layout that corresponds to a given block id
+        def block_coord(self, block)
 
-
+        # experimental ortho init
         def ortho_init(self)
 
+        # in practice, identity_init + layernorm is all you need for initialization
+        # with gpu=True the init is performed by kernel on the device
         def identity_init(self, gpu=False)
 
-        def l2_normalize(self, W, gain=None, epsilon=1e-12, dtype=np.float32)
+        # To implement weight normalization.  In practice, layernorm works much better.
+        def l2_normalize(self, W, gain=None, epsilon=1e-6, dtype=np.float32)
+
+        def __call__(self, I, W, dw_dtype=tf.float32)
+        """
+        Execute the op.  Note that the weight variable is independant from the bsmm object.
+        This allows multiple weights to be tied to the same bsmm layout.
+
+        dw_dtype: allows control over dw precision format.
+        """
 
 
-        def __call__(self, I, W, dw_dtype=tf.float32, name=None, bench=0)
+    def group_param_grads(param_grad, group_size=8, cast32=True)
+    """
+    param_grad: the tensorflow parameter gradient for a give bsmm weight variable (returned from tf.gradients)
+    group_size: desired group size, up to 8 supported
 
-        def group_param_grads(param_grad, group_size=8, cast32=True)
+    This causes the tf graph to be rewritten so that weight grad matmuls from different time steps
+    (and shared weights across time) are combined into a more efficient single matmul.
+    """
 
 
     class SparseProj(object):
-
-        def __init__(self, nhidden, nproj=None, proj_stride=None, block_size=32, gather_lut=None, name=None)
+        def __init__(self, nhidden, nproj=None, proj_stride=None, block_size=32, gather_lut=None)
+        """
+        Experimental class to support dense-to-sparse and sparse-to-dense projections.
+        Basically the same as the tensorflow ops but faster and support alternate precision formats.
+        They assume a unique 1 to 1 mapping so atomics need not be used on backward ops.
+        """
 
         def gather(self, x)
         def scatter(self, x)
@@ -126,9 +154,10 @@ If your CUDA is not in `/usr/local/cuda` or you have several versions, e.g. both
 ### blocksparse.conv
 
     class BlocksparseConv(object):
+        def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", edge_bias=False)
         """
         BCK: (                                             # block(B)/input(C)/output(K) feature dims
-                 ( (c0, c1, c2, ...), (k0, k1, k2, ...) ), # block 0
+                 ( (c0, c1, c2, ...), (k0, k1, k2, ...) ), # block 0 c,k are indeces into C,K dims
                  ( (c0, c1, c2, ...), (k0, k1, k2, ...) ), # block 1
                  ( (c0, c1, c2, ...), (k0, k1, k2, ...) ), # block 2 ...
              )
@@ -140,30 +169,39 @@ If your CUDA is not in `/usr/local/cuda` or you have several versions, e.g. both
         padding: (1,1,1) or (1,1) or (1,) or "SAME" or "VALID"
         edge_bias: True/False
         """
-        def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", edge_bias=False, debug=False, deconv=False)
 
+        # shape helpers for setting up variables or test tensors
         def edge_bias_shape(self)
-
+        def f_shape(self, block=None)
         def i_shape(self, N)
         def o_shape(self, N)
-        def f_shape(self, block=None)
 
-
+        # execute op passing in param variables and input
         def __call__(self, F, I, edge_bias=None):
 
-        def l2_normalize(self, F, gain=None, epsilon=1e-12, dtype=np.float32):
+        # for implementing weight norm
+        def l2_normalize(self, F, gain=None, epsilon=1e-6, dtype=np.float32):
 
     class BlocksparseDeconv(BlocksparseConv)
-
-        def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", edge_bias=False, debug=False)
-
+        def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", edge_bias=False)
+        """
+        Deconvolution.  Same params as above.
+        """
 
     def cwise_linear(x, a=None, b=None)
+    """
+    In the NCHW tensor format, tensorflow is extremely slow at implementing simple broadcasting ops on the middle C dim.
+    This lets you do:
+        y = a*x + b
+        y = a*x
+        y = x + b
 
-
+    Where a and b are of shape (1,C,1,1)
+    This is useful for ops like weight norm.
 
 ### blocksparse.ew
 
+    # same as tf ops but generally more efficient and allow custom precision formats
     def        add(x, y, name=None)
     def   multiply(x, y, name=None)
     def   subtract(x, y, name=None)
@@ -180,28 +218,39 @@ If your CUDA is not in `/usr/local/cuda` or you have several versions, e.g. both
     def    sigmoid(x,    name=None)
     def       tanh(x,    name=None)
     def       relu(x,    name=None)
+    def       elu (x, alpha=1.0, name=None)
 
-    def elu (x, alpha=1.0, name=None)
-
+    # here args can be the 4 independant gate tensors or
+    # a single merged gate tensor (which gets split in 4 internally)
     def fused_lstm_gates(c, *args, name=None)
 
     def split4(x)
     def concat4(x0, x1, x2, x3)
 
+    # A custom cast op to help explore novel precision formats
     def float_cast(x, dtype, dx_dtype=None)
 
+    # a much faster (and non-deterministic) dropout op
+    # also supports novel precision formats
     def dropout(x, keep_prob=0.8, mask=None)
 
+    # an op to be used in tf.gradients when adding together multiple contributions of a gradient.
+    # note that only 8 inputs are supported as you'd never want a single op to consume all possible inputs
+    # before it starts executing in the graph (and hence reducing the memory footprint)
     def add_n8(xs, name=None)
 
 
 
 ### blocksparse.norms
 
-    def layer_norm(x, g, b, axis=1, epsilon=1e-6, relu=False, bench=0)
+    def layer_norm(x, g, b, axis=1, epsilon=1e-6, relu=False)
+    """
+    Very fast layernorm to support both bsmm feature_axis activation layouts.
+    Also inlcludes optional integrated relu (applied to end)
+    """
 
+    # basic batch norm ops for the NCHW layout
     def batch_norm(x, g, b, epsilon=1e-6)
-
     def batch_norm_inference(x, g, b, m, v, epsilon=1e-6)
 
 
