@@ -96,3 +96,4 @@ logs/
 temp/
 lib/
 build/
+**/.DS_Store
