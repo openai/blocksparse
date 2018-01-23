@@ -159,9 +159,11 @@ lstm_gates_grad_op  = _op_module.lstm_gates_grad
 lstm_gates4_op      = _op_module.lstm_gates4
 lstm_gates4_grad_op = _op_module.lstm_gates4_grad
 
-def fused_lstm_gates(c, *args, name=None):
+def fused_lstm_gates(c, *args, **kwargs):
     # returns c_next, h_next
-
+    
+    assert len(kwargs) <= 1
+    name = kwargs.pop('name', None)    
     # args is h (all four gates fused in single tensor)
     if len(args) == 1:
         return lstm_gates_op(c, args[0], name=name)
