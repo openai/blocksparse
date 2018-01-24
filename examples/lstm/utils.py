@@ -39,8 +39,7 @@ def text8_stream(text, nbatch, nsteps, maxbatches=None):
 
 
 def text_to_npy(path, nbytes=-1):
-    text = open(path).read(nbytes).encode()
-    text = np.fromstring(text, dtype=np.uint8)
+    text = np.fromfile(path, dtype=np.uint8, count=nbytes)
     return text
 
 def wiki3(path):
