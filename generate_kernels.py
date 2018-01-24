@@ -238,7 +238,7 @@ def run_command(cmdlist):
 
 def get_kernel(kernel):
 
-    major, minor = 5, 2
+    major, minor = 5, 0
     arch = "sm_%d%d" % (major, minor)
     libprefix = "PERL5LIB=%s" % maxas_dir
     maxas_i = [libprefix, os.path.join(maxas_dir, "maxas.pl") + " -i -w"]

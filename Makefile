@@ -25,8 +25,16 @@ NV_INC?=$(CUDA_HOME)/include
 NV_LIB?=$(CUDA_HOME)/lib64
 TF_INC=$(shell python -c 'import tensorflow as tf; print(tf.sysconfig.get_include())')
 TF_LIB=$(shell python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')
-NVCCFLAGS=-DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=0 -arch=sm_61 -gencode=arch=compute_35,code=sm_35 -gencode=arch=compute_52,code=sm_52 -gencode=arch=compute_60,code=sm_60 -gencode=arch=compute_61,code=sm_61 -gencode=arch=compute_61,code=compute_61 -O3 -Xcompiler -fPIC
-CCFLAGS=-std=c++11 -O3 -DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=0 -I$(TARGET) -I$(NV_INC) -I$(TF_INC) -I$(TF_INC)/external/nsync/public -fPIC
+TF_ABI=$(shell python -c 'import tensorflow as tf; print(tf.__cxx11_abi_flag__ if "__cxx11_abi_flag__" in tf.__dict__ else 0)')
+CCFLAGS=-std=c++11 -O3 -DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) -I$(TARGET) -I$(NV_INC) -I$(TF_INC) -I$(TF_INC)/external/nsync/public -fPIC
+NVCCFLAGS=-DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) -O3 -Xcompiler -fPIC \
+	-arch=sm_61 \
+	-gencode=arch=compute_35,code=sm_35 \
+	-gencode=arch=compute_50,code=sm_50 \
+	-gencode=arch=compute_52,code=sm_52 \
+	-gencode=arch=compute_60,code=sm_60 \
+	-gencode=arch=compute_61,code=sm_61 \
+	-gencode=arch=compute_61,code=compute_61
 
 OBJS=\
 	$(TARGET)/batch_norm_op.o \
@@ -64,3 +72,5 @@ $(TARGET)/%.cu.o: src/%.cu $(TARGET)/blocksparse_kernels.h
 $(TARGET)/%.o: src/%.cc src/*.h $(TARGET)/blocksparse_kernels.h
 	mkdir -p $(shell dirname $@)
 	g++ $(CCFLAGS) -c $< -o $@
+
+

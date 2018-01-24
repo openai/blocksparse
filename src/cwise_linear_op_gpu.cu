@@ -97,8 +97,8 @@ __global__ void __launch_bounds__(THREADS) cwise_linear_axpb_backward(
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
     {
-        da += __shfl_xor(da, i);
-        db += __shfl_xor(db, i);
+        da += shfl_xor(da, i);
+        db += shfl_xor(db, i);
     }
     // first thread of each warp store to shared
     if ((tid & 31) == 0)
@@ -118,8 +118,8 @@ __global__ void __launch_bounds__(THREADS) cwise_linear_axpb_backward(
         #pragma unroll
         for (int i = (THREADS>>6); i > 0; i >>= 1)
         {
-            da += __shfl_xor(da, i);
-            db += __shfl_xor(db, i);
+            da += shfl_xor(da, i);
+            db += shfl_xor(db, i);
         }
         // single thread outputs final reductions
         if (tid == 0)
@@ -159,7 +159,7 @@ __global__ void __launch_bounds__(THREADS) cwise_linear_xpb_backward(
     // reduce within warp
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-        db += __shfl_xor(db, i);
+        db += shfl_xor(db, i);
 
     // first thread of each warp store to shared
     if ((tid & 31) == 0)
@@ -175,7 +175,7 @@ __global__ void __launch_bounds__(THREADS) cwise_linear_xpb_backward(
         // reduce within this last warp
         #pragma unroll
         for (int i = (THREADS>>6); i > 0; i >>= 1)
-            db += __shfl_xor(db, i);
+            db += shfl_xor(db, i);
 
         // single thread outputs final reductions
         if (tid == 0)
