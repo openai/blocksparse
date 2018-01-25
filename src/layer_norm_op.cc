@@ -56,15 +56,19 @@ REGISTER_OP("LayerNorm")
       int axis; TF_RETURN_IF_ERROR(ctx->GetAttr("axis", &axis));
 
       ShapeHandle x = ctx->input(0);
-      std::vector<DimensionHandle> dims;
-      for (int i = 0; i < ctx->Rank(x); i++)
-        if (i != axis)
-          dims.push_back(ctx->Dim(x, i));
-      ShapeHandle n = ctx->MakeShape(dims);
+      int rank = ctx->Rank(x);
+      if (rank > 0)
+      {
+        std::vector<DimensionHandle> dims;
+        for (int i = 0; i < rank; i++)
+          if (i != axis)
+            dims.push_back(ctx->Dim(x, i));
+        ShapeHandle n = ctx->MakeShape(dims);
 
-      ctx->set_output(0, x);
-      ctx->set_output(1, n);
-      ctx->set_output(2, n);
+        ctx->set_output(0, x);
+        ctx->set_output(1, n);
+        ctx->set_output(2, n);
+      }
       return Status::OK();
     })
     .Doc(R"doc(
@@ -309,13 +313,15 @@ REGISTER_OP("GatherScatter")
       int K; TF_RETURN_IF_ERROR(ctx->GetAttr("K", &K));
 
       ShapeHandle x = ctx->input(0);
-      std::vector<DimensionHandle> shape;
       int rank = ctx->Rank(x);
-      shape.reserve(rank);
-      for (int i = 0; i < rank; i++)
-          shape.push_back(i == 0 ? ctx->MakeDim(K) : ctx->Dim(x, i));
-
-      ctx->set_output(0, ctx->MakeShape(shape));
+      if (rank > 0)
+      {
+        std::vector<DimensionHandle> shape;
+        shape.reserve(rank);
+        for (int i = 0; i < rank; i++)
+            shape.push_back(i == 0 ? ctx->MakeDim(K) : ctx->Dim(x, i));
+        ctx->set_output(0, ctx->MakeShape(shape));
+      }
       return Status::OK();
     })
     .Doc(R"doc(

@@ -269,13 +269,16 @@ Status XpropShape(InferenceContext* ctx)
 
     // C ==> K
     ShapeHandle x = ctx->input(0);
-    std::vector<DimensionHandle> shape;
     int rank = ctx->Rank(x);
-    shape.reserve(rank);
-    for (int i = 0; i < rank; i++)
-        shape.push_back(i == axis ? ctx->MakeDim(K) : ctx->Dim(x, i));
+    if (rank > 0)
+    {
+        std::vector<DimensionHandle> shape;
+        shape.reserve(rank);
+        for (int i = 0; i < rank; i++)
+            shape.push_back(i == axis ? ctx->MakeDim(K) : ctx->Dim(x, i));
 
-    ctx->set_output(0, ctx->MakeShape(shape));
+        ctx->set_output(0, ctx->MakeShape(shape));
+    }
     return Status::OK();
 }
 Status UpdatShape(InferenceContext* ctx)
