@@ -1,9 +1,8 @@
 
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 #include "ew_op_gpu.h"
-
+#include <stdio.h>
 
 // xmean = x - mean(x, axis=1)
 // xvar  = var(x, axis=1)
@@ -18,110 +17,91 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
     const     T* __restrict__ X,
     const     V* __restrict__ G,
     const     V* __restrict__ B,
-    float epsilon, int K, float rcpK, int relu)
+    float epsilon, uint K, float rcpK, int relu)
 {
-    __shared__ float Share[THREADS>>5];
+    uint tid = threadIdx.x;
+    uint n   = blockIdx.x;
 
-    int tid = threadIdx.x;
-    int n   = blockIdx.x;
-
-    int offset = n*K + tid;
+    uint offset = n*K + tid;
 
     // Mean
-    const T* X1 = X + offset;
-    V v_mean;
-    ew_zero(v_mean);
-    for (int k = tid; k < K; k += THREADS)
+    V v_mean1, v_mean2;
+    ew_zero(v_mean1);
+    ew_zero(v_mean2);
+    #pragma unroll 4
+    for (uint k = tid, offsetX = offset; k < K; k += THREADS, offsetX += THREADS)
     {
-        V x = load(X1);
-        v_mean = ew_add(v_mean, x);
-        X1 += THREADS;
+        // Single pass over X to compute mean and variance
+        // var(x) == mean(x**2) - mean(x)**2
+        V x = load(add_ptr_u(X, offsetX));
+        v_mean1 = ew_add(v_mean1, x);
+        v_mean2 = ew_add(v_mean2, ew_sqr(x));
     }
-    float mean = ew_sum(v_mean);
+    float2 mean;
+    mean.x = ew_sum(v_mean1) * rcpK;
+    mean.y = ew_sum(v_mean2) * rcpK;
+
     // reduce within warp
-    #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-        mean += __shfl_xor(mean, i);
-    // first thread of each warp store to shared
-    if ((tid & 31) == 0)
-        Share[tid >> 5] = mean;
-    __syncthreads();
-    if (tid < (THREADS>>5))
     {
-        // first warp loads all prior reductions
-        mean = Share[tid];
-        // reduce within this last warp
-        #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
-            mean += __shfl_xor(mean, i);
-        // outputs final reduction to shared
-        Share[tid] = mean * rcpK;
+        mean.x += shfl_xor(mean.x, i);
+        mean.y += shfl_xor(mean.y, i);
     }
-    __syncthreads();
-    // broadcast result to all threads
-    mean = Share[0];
-
-    // Reciprocal Standard Deviation (rstd)
-    const T* X2 = X + offset;
-    V v_rstd;
-    ew_zero(v_rstd);
-    for (int k = tid; k < K; k += THREADS)
+    // if using more than 1 warp, further reduced with shared memory
+    if (THREADS > 32)
     {
-        V x = load(X2);
-        v_rstd = ew_add(v_rstd, ew_sqr(ew_sub(x, mean)));
-        X2   += THREADS;
-    }
-    float rstd = ew_sum(v_rstd);
-    // reduce within warp
-    #pragma unroll
-    for (int i = 16; i > 0; i >>= 1)
-        rstd += __shfl_xor(rstd, i);
-    // first thread of each warp store to shared
-    if ((tid & 31) == 0)
-        Share[tid >> 5] = rstd;
-    __syncthreads();
-    if (tid < (THREADS>>5))
-    {
-        // first warp loads all prior reductions
-        rstd = Share[tid];
-        // reduce within this last warp
-        #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
-            rstd += __shfl_xor(rstd, i);
+        __shared__ float2 Share[THREADS/32];
 
-        rstd = rsqrtf(rstd*rcpK + epsilon);
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = mean;
 
-        // Outputs final reduction to shared
-        // Also cache reductions for backward pass
-        if (tid == 0)
+        __syncthreads();
+
+        if (tid < THREADS/32)
         {
-            Mean[n]  = mean;
-            Rstd[n]  = rstd;
-            Share[0] = rstd;
+            // first warp loads all prior reductions
+            mean = Share[tid];
+
+            // reduce within this first warp
+            for (int i = THREADS/64; i > 0; i >>= 1)
+            {
+                mean.x += shfl_xor(mean.x, i);
+                mean.y += shfl_xor(mean.y, i);
+            }
+            // outputs final reduction to shared
+            if (tid == 0)
+                Share[0] = mean;
         }
+        __syncthreads();
+
+        // broadcast result to all threads
+        mean = Share[0];
     }
-    __syncthreads();
-    // broadcast result to all threads
-    rstd = Share[0];
+    // var  = avg(x**2) - avg(x)**2
+    // rstd = 1/sqrt(var)
+    float rstd = rsqrtf((mean.y - ew_sqr(mean.x)) + epsilon);
+    if (tid == 0)
+    {
+        Mean[n] = mean.x;
+        Rstd[n] = rstd;
+    }
 
     // Norm/Gain/Bias
-    X += offset;
-    Y += offset;
-    for (int k = tid; k < K; k += THREADS)
+    #pragma unroll 4
+    for (uint k = tid; k < K; k += THREADS, offset += THREADS)
     {
-        V x = load(X);
+        V x = load(add_ptr_u(X, offset));
         V g = load(G, k);
         V b = load(B, k);
 
-        V xhat = ew_mul(ew_sub(x, mean), rstd);
+        V xhat = ew_mul(ew_sub(x, mean.x), rstd);
         V    y = ew_add(ew_mul(xhat, g), b);
 
         if (relu)
             y = ew_relu(y);
 
-        store(Y, y);
-        X += THREADS;
-        Y += THREADS;
+        store(add_ptr_u(Y, offset), y);
     }
 }
 
@@ -144,21 +124,17 @@ bool LayerNormForward_NC(CUstream stream, int SMs,
         const      V* X = (const V*)x;
         const float4* G = (const float4*)g;
         const float4* B = (const float4*)b;
-        //if (K >= 1024)
-        //    layer_norm_NC<V,float4,1024><<<grid,1024,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, K, rcpK);
         if (K >= 256)
-            layer_norm_NC<V,float4, 256><<<grid, 256,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, K, rcpK, relu);
+            layer_norm_NC<V,float4,256><<<grid, 256,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, K, rcpK, relu);
         else
-            layer_norm_NC<V,float4,  64><<<grid,  64,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, K, rcpK, relu);
+            layer_norm_NC<V,float4, 32><<<grid,  32,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, K, rcpK, relu);
     }
     else
     {
-        //if (K >= 1024)
-        //    layer_norm_forward<T,float ,1024><<<grid,1024,0,stream>>>(y, mean, rstd, x, g, b, epsilon, K, rcpK);
         if (K >= 256)
-            layer_norm_NC<T,float , 256><<<grid, 256,0,stream>>>(y, mean, rstd, x, g, b, epsilon, K, rcpK, relu);
+            layer_norm_NC<T,float ,256><<<grid, 256,0,stream>>>(y, mean, rstd, x, g, b, epsilon, K, rcpK, relu);
         else
-            layer_norm_NC<T,float ,  64><<<grid,  64,0,stream>>>(y, mean, rstd, x, g, b, epsilon, K, rcpK, relu);
+            layer_norm_NC<T,float , 32><<<grid,  32,0,stream>>>(y, mean, rstd, x, g, b, epsilon, K, rcpK, relu);
     }
     return true; // TODO
 }
@@ -171,12 +147,12 @@ template bool LayerNormForward_NC<bhalf,bhalf4>(CUstream stream, int SMs, bhalf*
 // dg = sum(dy * xhat(x), axis=0)
 // db = sum(dy, axis=0)
 // Don't use vector loads here as we want to maximize the number of blocks
-template <typename B, typename F, int U>
+template <typename T, int U>
 __global__ void __launch_bounds__(32) layer_norm_dg_db_NC(
           float*              DG,
           float*              DB,
-    const     B* __restrict__ DY,
-    const     F* __restrict__ X,
+    const     T* __restrict__ DY,
+    const     T* __restrict__ X,
     const float* __restrict__ Gain,
     const float* __restrict__ Bias,
     const float* __restrict__ Mean,
@@ -263,8 +239,8 @@ __global__ void __launch_bounds__(32) layer_norm_dg_db_NC(
     #pragma unroll
     for (int i = 16; i > (1 << (4-U)); i >>= 1)
     {
-        dg += __shfl_xor(dg, i);
-        db += __shfl_xor(db, i);
+        dg += shfl_xor(dg, i);
+        db += shfl_xor(db, i);
     }
     store(DG, dg, k, b);
     store(DB, db, k, b);
@@ -278,11 +254,11 @@ __global__ void __launch_bounds__(32) layer_norm_dg_db_NC(
 // sum1  = sum(xhat * dy, axis=1)
 // sum2  = sum(dy, axis=1)
 // dx    = (dy - ((xhat * sum1 + sum2) * rcpK)) * xstdr
-template <typename B, typename F, typename V, int THREADS>
+template <typename T, typename V, int THREADS>
 __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
-              B*              DX,
-    const     B* __restrict__ DY,
-    const     F* __restrict__ X,
+              T*              DX,
+    const     T* __restrict__ DY,
+    const     T* __restrict__ X,
     const     V* __restrict__ Gain,
     const     V* __restrict__ Bias,
     const float* __restrict__ Mean,
@@ -300,8 +276,8 @@ __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
     float mean = Mean[n];
     float rstd = Rstd[n];
 
-    const F* X1 = X  + offset;
-    const B* Y1 = DY + offset;
+    const T* X1 = X  + offset;
+    const T* Y1 = DY + offset;
     V v_sum1, v_sum2;
     ew_zero(v_sum1);
     ew_zero(v_sum2);
@@ -330,8 +306,8 @@ __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
     {
-        sum1 += __shfl_xor(sum1, i);
-        sum2 += __shfl_xor(sum2, i);
+        sum1 += shfl_xor(sum1, i);
+        sum2 += shfl_xor(sum2, i);
     }
     // first thread of each warp store to shared
     if ((tid & 31) == 0)
@@ -349,8 +325,8 @@ __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
         #pragma unroll
         for (int i = (THREADS>>6); i > 0; i >>= 1)
         {
-            sum1 += __shfl_xor(sum1, i);
-            sum2 += __shfl_xor(sum2, i);
+            sum1 += shfl_xor(sum1, i);
+            sum2 += shfl_xor(sum2, i);
         }
         // outputs final reduction to shared
         Share1[tid] = sum1;
@@ -388,13 +364,13 @@ __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
     }
 }
 
-template <typename B, typename F, typename VB, typename VF>
+template <typename T, typename V>
 bool LayerNormBackward_NC(CUstream stream, int SMs,
-              B* dx,
+              T* dx,
           float* dg,
           float* db,
-    const     B* dy,
-    const     F* x,
+    const     T* dy,
+    const     T* x,
     const float* g,
     const float* b,
     const float* mean,
@@ -408,28 +384,28 @@ bool LayerNormBackward_NC(CUstream stream, int SMs,
     if (K32 >= 28*16)
     {
         int gridK = K32 + ((K & 31) != 0);
-        layer_norm_dg_db_NC<B,F,0><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
+        layer_norm_dg_db_NC<T,0><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
     }
     else if (K32 >= 28*8)
     {
         int gridK = (K >> 4) + ((K & 15) != 0);
-        layer_norm_dg_db_NC<B,F,1><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
+        layer_norm_dg_db_NC<T,1><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
     }
     else if (K32 >= 28*4)
     {
         int gridK = (K >> 3) + ((K & 7) != 0);
-        layer_norm_dg_db_NC<B,F,2><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
+        layer_norm_dg_db_NC<T,2><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
     }
     else
     {
         int gridK = (K >> 2) + ((K & 3) != 0);
-        layer_norm_dg_db_NC<B,F,3><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
+        layer_norm_dg_db_NC<T,3><<<gridK, 32, 0, stream>>>(dg, db, dy, x, g, b, mean, rstd, epsilon, K, N, relu);
     }
     if ((K & 3) == 0)
     {
-              VB* DX = (      VB*)dx;
-        const VB* DY = (const VB*)dy; // in place op
-        const VF*  X = (const VF*)x;
+               V* DX = (      V*)dx;
+        const  V* DY = (const V*)dy; // in place op
+        const  V*  X = (const V*)x;
         const float4* Gain = (const float4*)g;
         const float4* Bias = (const float4*)b;
 
@@ -437,28 +413,466 @@ bool LayerNormBackward_NC(CUstream stream, int SMs,
         //if      (K >= 1024)
         //    layer_norm_dx_NC<VB,VF,float4,1024><<<N,1024,0,stream>>>(DX, DY, X, mean, rstd, epsilon, K, rcpK);
         if (K >=  256)
-            layer_norm_dx_NC<VB,VF,float4, 256><<<N, 256,0,stream>>>(DX, DY, X, Gain, Bias, mean, rstd, epsilon, K, rcpK, relu);
+            layer_norm_dx_NC<V,float4, 256><<<N, 256,0,stream>>>(DX, DY, X, Gain, Bias, mean, rstd, epsilon, K, rcpK, relu);
         else
-            layer_norm_dx_NC<VB,VF,float4,  64><<<N,  64,0,stream>>>(DX, DY, X, Gain, Bias, mean, rstd, epsilon, K, rcpK, relu);
+            layer_norm_dx_NC<V,float4,  64><<<N,  64,0,stream>>>(DX, DY, X, Gain, Bias, mean, rstd, epsilon, K, rcpK, relu);
     }
     else
     {
         //if      (K >= 1024)
         //    layer_norm_dx_NC<B,F,float,1024><<<N,1024,0,stream>>>(dx, (const B*)dx, x, mean, rstd, epsilon, K, rcpK);
         if (K >=  256)
-            layer_norm_dx_NC<B,F,float, 256><<<N, 256,0,stream>>>(dx, (const B*)dy, x, g, b, mean, rstd, epsilon, K, rcpK, relu);
+            layer_norm_dx_NC<T,float, 256><<<N, 256,0,stream>>>(dx, dy, x, g, b, mean, rstd, epsilon, K, rcpK, relu);
         else
-            layer_norm_dx_NC<B,F,float,  64><<<N,  64,0,stream>>>(dx, (const B*)dy, x, g, b, mean, rstd, epsilon, K, rcpK, relu);
+            layer_norm_dx_NC<T,float,  64><<<N,  64,0,stream>>>(dx, dy, x, g, b, mean, rstd, epsilon, K, rcpK, relu);
     }
     return true; // TODO
 }
 
-template bool LayerNormBackward_NC<float,float,float4,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormBackward_NC<ehalf,ehalf,ehalf4,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormBackward_NC<bhalf,bhalf,bhalf4,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormBackward_NC<float,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormBackward_NC<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormBackward_NC<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
 
-template bool LayerNormBackward_NC<float,ehalf,float4,ehalf4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormBackward_NC<float,bhalf,float4,bhalf4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+
+// xmean = x - mean(x, axis=1)
+// xvar  = var(x, axis=1)
+// xstdr = rcp(sqrt(xvar + epsilon))
+// xhat  = xmean * xstdr
+// y     = xhat*g + b
+template <typename T, typename V, int U>
+__global__ void layer_norm_segmented_nc(
+              T*              Y,
+          float*              Mean,
+          float*              Rstd,
+    const     T* __restrict__ X,
+    const     V* __restrict__ G,
+    const     V* __restrict__ B,
+    float epsilon, uint N, uint SK, uint K, float rcpK, int relu, int thread2)
+{
+    __shared__ float2 Share[32];
+
+    uint tid = threadIdx.x;
+
+    if (blockDim.x > 32)
+    {
+        // Allows non-power of 2 threads to work
+        float2 zero = {0.0f, 0.0f};
+        if (tid < 32)
+            Share[tid] = zero;
+        __syncthreads();
+    }
+    uint s = blockIdx.x;
+    uint n = blockIdx.y;
+    uint t = (tid & 0x3e0)*U + (tid & 31); // 0x3e0 = -32 & 1023
+    uint k = s*K + t;
+    uint m = s*N + n;
+
+    uint offset = n*SK + k;
+
+    // Load X
+    V xval[U];
+    X = add_ptr_u(X, offset);
+    for (int i = 0; i < U; i++)
+        xval[i] = load(X, i*32, t + i*32 < K);
+
+    // Begin mean/variance reductions
+    V mean1[U], mean2[U];
+    for (int i = 0; i < U; i++)
+    {
+        mean1[i] = xval[i];
+        mean2[i] = ew_sqr(xval[i]);
+    }
+
+    // reduce within thread
+    for (int j = U >> 1; j > 0; j >>= 1)
+        for (int i = 0; i < j; i++)
+        {
+            mean1[i] = ew_add(mean1[i], mean1[i+j]);
+            mean2[i] = ew_add(mean2[i], mean2[i+j]);
+        }
+    float2 stats;
+    stats.x = ew_sum(mean1[0]) * rcpK;
+    stats.y = ew_sum(mean2[0]) * rcpK;
+
+    // reduce within warp
+    for (int i = 16; i > 0; i >>= 1)
+        stats = ew_warp_sum(stats, i);
+
+    // reduce across warps
+    if (blockDim.x > 32)
+    {
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = stats;
+        __syncthreads();
+
+        if (tid < 32)
+        {
+            // first warp loads all prior reductions
+            stats = Share[tid];
+            // reduce within this last warp
+            #pragma unroll 1
+            for (int i = thread2/64; i > 0; i >>= 1)
+                stats = ew_warp_sum(stats, i);
+            // final reduction to shared
+            Share[tid] = stats;
+        }
+        __syncthreads();
+        stats = Share[0];
+    }
+
+    // var  = avg(x**2) - avg(x)**2
+    // rstd = 1/sqrt(var)
+    float mean = stats.x;
+    float rstd = rsqrtf((stats.y - mean*mean) + epsilon);
+    if (tid == 0)
+    {
+        __stg(add_ptr_u(Mean, m), mean);
+        __stg(add_ptr_u(Rstd, m), rstd);
+    }
+
+    // Load Gain/Bias
+    G = add_ptr_u(G, k);
+    B = add_ptr_u(B, k);
+
+    V gain[U], bias[U];
+    for (int i = 0; i < U; i++)
+    {
+        bool  b = t + i*32 < K;
+        gain[i] = load(G, i*32, b);
+        bias[i] = load(B, i*32, b);
+    }
+
+    // Compute and output norm
+    Y = add_ptr_u(Y, offset);
+    for (int i = 0; i < U; i++)
+    {
+        V xhat = ew_mul(ew_sub(xval[i], mean), rstd);
+        V    y = ew_add(ew_mul(xhat, gain[i]), bias[i]);
+        if (relu)
+            y = ew_relu(y);
+
+        store(Y, y, i*32, t + i*32 < K);
+    }
+}
+template <typename T, typename V>
+bool LayerNormSegmentedForward_NC(CUstream stream, int SMs,
+              T* y,
+          float* mean,
+          float* rstd,
+    const     T* x,
+    const float* g,
+    const float* b,
+    float epsilon, uint N, uint S, uint K, float rcpK, int relu)
+{
+    dim3 grid(S, N, 1);
+
+    if ((K & 3) == 0)
+    {
+                   V* Y = (V*)y;
+        const      V* X = (const V*)x;
+        const float4* G = (const float4*)g;
+        const float4* B = (const float4*)b;
+
+        if (K >= 256)
+        {
+            uint threads = CEIL_DIV(K, 32*8) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            K >>= 2;
+            layer_norm_segmented_nc<V,float4,2><<<grid,threads,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, N, S*K, K, rcpK, relu, thread2);
+        }
+        else
+        {
+            uint threads = CEIL_DIV(K, 32*4) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            K >>= 2;
+            layer_norm_segmented_nc<V,float4,1><<<grid,threads,0,stream>>>(Y, mean, rstd, X, G, B, epsilon, N, S*K, K, rcpK, relu, thread2);
+        }
+    }
+    else
+    {
+        if (K >= 256)
+        {
+            uint threads = CEIL_DIV(K, 32*8) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            layer_norm_segmented_nc<T,float,8><<<grid,threads,0,stream>>>(y, mean, rstd, x, g, b, epsilon, N, S*K, K, rcpK, relu, thread2);
+        }
+        else
+        {
+            uint threads = CEIL_DIV(K, 32*4) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            layer_norm_segmented_nc<T,float,4><<<grid,threads,0,stream>>>(y, mean, rstd, x, g, b, epsilon, N, S*K, K, rcpK, relu, thread2);
+        }
+    }
+    return true; // TODO
+}
+template bool LayerNormSegmentedForward_NC<float,float4>(CUstream stream, int SMs, float* y, float* mean, float* rstd, const float* x, const float* g, const float* b, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+template bool LayerNormSegmentedForward_NC<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* y, float* mean, float* rstd, const ehalf* x, const float* g, const float* b, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+template bool LayerNormSegmentedForward_NC<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* y, float* mean, float* rstd, const bhalf* x, const float* g, const float* b, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+
+
+// Sum across N axis requries separtate kernel.
+// dg = sum(dy * xhat(x), axis=0)
+// db = sum(dy, axis=0)
+// Don't use vector loads here as we want to maximize the number of blocks
+template <typename T>
+__global__ void __launch_bounds__(32) layer_norm_segmented_dg_db_nc(
+          float*              DG,
+          float*              DB,
+    const     T* __restrict__ DY,
+    const     T* __restrict__ X,
+    const float* __restrict__ Gain,
+    const float* __restrict__ Bias,
+    const float* __restrict__ Mean,
+    const float* __restrict__ Rstd,
+    uint N, uint SK, uint SKz, uint K, int relu)
+{
+    uint tid = threadIdx.x;
+    uint bk  = blockIdx.x;
+    uint bs  = blockIdx.y;
+    uint bn  = blockIdx.z;
+
+    uint t = bk*32 + tid;
+    uint k = bs*K + t;
+    bool b = t < K;
+
+    float gain = 1.0f, bias = 0.0f, dg = 0.0f, db = 0.0f;
+    if (b && relu)
+    {
+        gain = __ldg(add_ptr_u(Gain, k));
+        bias = __ldg(add_ptr_u(Bias, k));
+    }
+    #pragma unroll 1
+    for (uint n = bn, m = bs*N + bn, nk = bn*SK + k; n < N; n += gridDim.z, m += gridDim.z, nk += SKz)
+    {
+        float    x = load(add_ptr_u(X,  nk), 0, b);
+        float   dy = load(add_ptr_u(DY, nk), 0, b);
+        float mean = load(add_ptr_u(Mean, m));
+        float rstd = load(add_ptr_u(Rstd, m));
+        float xhat = (x - mean) * rstd;
+        if (relu)
+            dy = ew_relu_grad(dy, xhat * gain + bias);
+
+        dg += dy * xhat;
+        db += dy;
+    }
+    if (b)
+    {
+        DG = add_ptr_u(DG, k);
+        DB = add_ptr_u(DB, k);
+        if (gridDim.z == 1)
+        {
+            __stg(DG, dg);
+            __stg(DB, db);
+        }
+        else
+        {
+            atomicRed(DG, dg);
+            atomicRed(DB, db);
+        }
+    }
+}
+
+// xmean = x - mean(x, axis=1)
+// xvar  = var(x, axis=1)
+// xstdr = rcp(sqrt(xvar + epsilon))
+// xhat  = xmean * xstdr
+// dy    = dy * g
+// sum1  = sum(xhat * dy, axis=1)
+// sum2  = sum(dy, axis=1)
+// dx    = (dy - ((xhat * sum1 + sum2) * rcpK)) * xstdr
+template <typename T, typename V, int U>
+__global__ void layer_norm_segmented_dx_nc(
+              T*              DX,
+    const     T* __restrict__ DY,
+    const     T* __restrict__ X,
+    const     V* __restrict__ Gain,
+    const     V* __restrict__ Bias,
+    const float* __restrict__ Mean,
+    const float* __restrict__ Rstd,
+    uint N, uint SK, uint K, float rcpK, int relu, int thread2)
+{
+    __shared__ float2 Share[32];
+
+    uint tid = threadIdx.x;
+
+    if (blockDim.x > 32)
+    {
+        // Allows non-power of 2 threads to work
+        float2 zero = {0.0f, 0.0f};
+        if (tid < 32)
+            Share[tid] = zero;
+        __syncthreads();
+    }
+    uint s = blockIdx.x;
+    uint n = blockIdx.y;
+    uint t = (tid & 0x3e0)*U + (tid & 31); // 0x3e0 = -32 & 1023
+    uint k = s*K + t;
+    uint m = s*N + n;
+
+    uint offset = n*SK + k;
+
+    float mean = __ldg(add_ptr_u(Mean, m));
+    float rstd = __ldg(add_ptr_u(Rstd, m));
+
+    X    = add_ptr_u(X,  offset);
+    DY   = add_ptr_u(DY, offset);
+    Gain = add_ptr_u(Gain,    k);
+    V x[U], dy[U], gain[U];
+    for (int i = 0; i < U; i++)
+    {
+        bool  b = t + i*32 < K;
+        x[i]    = load(X,    i*32, b);
+        dy[i]   = load(DY,   i*32, b);
+        gain[i] = load(Gain, i*32, b);
+    }
+    V xhat[U];
+    if (relu)
+    {
+        Bias = add_ptr_u(Bias, k);
+        for (int i = 0; i < U; i++)
+        {
+            V bias  = load(Bias, i*32, t + i*32 < K);
+            xhat[i] = ew_mul(ew_sub(x[i], mean), rstd);
+            dy[i]   = ew_relu_grad(dy[i], ew_add(ew_mul(xhat[i], gain[i]), bias));
+        }
+    }
+    else
+    {
+        for (int i = 0; i < U; i++)
+            xhat[i] = ew_mul(ew_sub(x[i], mean), rstd);
+    }
+    V sum1[U], sum2[U];
+    for (int i = 0; i < U; i++)
+    {
+        dy[i]   = ew_mul(dy[i], gain[i]);
+        sum1[i] = ew_mul(dy[i], xhat[i]);
+        sum2[i] = dy[i];
+    }
+
+    // reduce within thread
+    for (int j = U >> 1; j > 0; j >>= 1)
+        for (int i = 0; i < j; i++)
+        {
+            sum1[i] = ew_add(sum1[i], sum1[i+j]);
+            sum2[i] = ew_add(sum2[i], sum2[i+j]);
+        }
+    float2 sums;
+    sums.x = ew_sum(sum1[0]);
+    sums.y = ew_sum(sum2[0]);
+
+    // reduce within warp
+    for (int i = 16; i > 0; i >>= 1)
+        sums = ew_warp_sum(sums, i);
+
+    // reduce across warps
+    if (blockDim.x > 32)
+    {
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = sums;
+        __syncthreads();
+
+        if (tid < 32)
+        {
+            // first warp loads all prior reductions
+            sums = Share[tid];
+            // reduce within this last warp
+            #pragma unroll 1
+            for (int i = thread2/64; i > 0; i >>= 1)
+                sums = ew_warp_sum(sums, i);
+            // final reduction to shared
+            Share[tid] = sums;
+        }
+        __syncthreads();
+        sums = Share[0];
+    }
+    // Compute and store dx
+    DX = add_ptr_u(DX, offset);
+    for (int i = 0; i < U; i++)
+    {
+        // dx = (dy - ((xhat * sum1 + sum2) * rcpK)) * rstd;
+        V dx = ew_mul(ew_sub(dy[i], ew_mul(ew_add(ew_mul(xhat[i], sums.x), sums.y), rcpK)), rstd);
+        store(DX, dx, i*32, t + i*32 < K);
+    }
+}
+
+
+template <typename T, typename V>
+bool LayerNormSegmentedBackward_NC(CUstream stream, int SMs,
+              T* dx,
+          float* dg,
+          float* db,
+    const     T* dy,
+    const     T* x,
+    const float* g,
+    const float* b,
+    const float* mean,
+    const float* rstd,
+    float epsilon, uint N, uint S, uint K, float rcpK, int relu)
+{
+    uint gridK = CEIL_DIV(K, 32);
+    uint gridN = 1;
+    uint blocksK = gridK * S;
+    while (gridN < (N>>3) && gridN * blocksK < 32*SMs) gridN += 1;
+    if (gridN * blocksK > 32*SMs && gridN > 1) gridN -= 1;
+    if (gridN > 1)
+    {
+        cuMemsetD32Async((CUdeviceptr)dg, 0, S*K, stream);
+        cuMemsetD32Async((CUdeviceptr)db, 0, S*K, stream);
+    }
+    layer_norm_segmented_dg_db_nc<T><<<dim3(gridK,S,gridN),32,0,stream>>>(dg, db, dy, x, g, b, mean, rstd, N, S*K, S*K*gridN, K, relu);
+
+    dim3 grid(S, N, 1);
+    if ((K & 3) == 0 && K >= 512)
+    {
+                   V* DX = (      V*)dx;
+        const      V* DY = (const V*)dy; // in place op
+        const      V*  X = (const V*)x;
+        const float4*  G = (const float4*)g;
+        const float4*  B = (const float4*)b;
+
+        if (K > 4096)
+        {
+            uint threads = CEIL_DIV(K, 32*8) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            K >>= 2;
+            layer_norm_segmented_dx_nc<V,float4,2><<<grid,threads,0,stream>>>(DX, DY, X, G, B, mean, rstd, N, S*K, K, rcpK, relu, thread2);
+        }
+        else
+        {
+            uint threads = CEIL_DIV(K, 32*4) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            K >>= 2;
+            layer_norm_segmented_dx_nc<V,float4,1><<<grid,threads,0,stream>>>(DX, DY, X, G, B, mean, rstd, N, S*K, K, rcpK, relu, thread2);
+        }
+    }
+    else
+    {
+        if (K > 4096)
+        {
+            uint threads = CEIL_DIV(K, 32*8) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            layer_norm_segmented_dx_nc<T,float ,8><<<grid,threads,0,stream>>>(dx, dy, x, g, b, mean, rstd, N, S*K, K, rcpK, relu, thread2);
+        }
+        else if (K >= 512)
+        {
+            uint threads = CEIL_DIV(K, 32*4) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            layer_norm_segmented_dx_nc<T,float ,4><<<grid,threads,0,stream>>>(dx, dy, x, g, b, mean, rstd, N, S*K, K, rcpK, relu, thread2);
+        }
+        else
+        {
+            uint threads = CEIL_DIV(K, 32*1) * 32;
+            int  thread2 = THREAD_POW2(threads);
+            layer_norm_segmented_dx_nc<T,float ,1><<<grid,threads,0,stream>>>(dx, dy, x, g, b, mean, rstd, N, S*K, K, rcpK, relu, thread2);
+        }
+    }
+    return true; // TODO
+}
+template bool LayerNormSegmentedBackward_NC<float,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+template bool LayerNormSegmentedBackward_NC<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+template bool LayerNormSegmentedBackward_NC<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
 
 
 #endif // GOOGLE_CUDA

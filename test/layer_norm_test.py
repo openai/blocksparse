@@ -13,14 +13,55 @@ import blocksparse.ewops as ew
 np.set_printoptions(threshold=8193, linewidth=600, formatter={'int':lambda x: "%4d" % x,'float':lambda x: "%8.6f" % x})
 
 dtypes = [
-    (tf.float32,  tf.float32),
-    (tf.float16,  tf.float16),
-    # (tf.bfloat16, tf.bfloat16),
+    tf.float32,
+    tf.float16,
+    # tf.bfloat16,
+]
+
+shapes = [
+    # (1024*32, 64),
+    # (1024*4 , 64),
+    # (3584   , 64),
+    # ( 112*8,  64),
+
+    # (1024*32, 128),
+    # (1024*4 , 128),
+    # (3584   , 128),
+    # ( 112*8,  128),
+
+    # (1024*32, 256),
+    # (1024*4 , 256),
+    # (3584   , 256),
+    # ( 112*8,  256),
+
+    # (1024*32, 512),
+    # (1024*4 , 512),
+    # (3584   , 512),
+    # ( 112*8,  512),
+
+    # (32,64),
+
+    # (1024*8, 1024*2 ),
+    (512, 1024*8 ),
+    (512, 1024*4 ),
+    (512, 1024*1 ),
+    (512,  112*8 ),
+
+    (512, 1024*8-4 ),
+    (512, 1024*4-4 ),
+    (512, 1024*1-4 ),
+    (512,  112*8-4 ),
+
+    # (128, 1024*32),
+    # (128, 1024*4 ),
+    # (128, 1024*1 ),
+    # (128,  112*8 ),
 ]
 
 one = 0
 out = 0
 bench = 0
+segments = 4
 class LayerNormTest(tf.test.TestCase):
 
     def testLayerNorm(self):
@@ -30,9 +71,9 @@ class LayerNormTest(tf.test.TestCase):
             inter_op_parallelism_threads=1)
 
         with self.test_session(config=conf) as sess, tf.device("/gpu:0"):
-            for shape in [ (1024*32, 64), (64,1024*32) ]: # (64,1024*16)
+            for shape in shapes:
                 # assume bigger axis is feature axis
-                axis = 0 if shape[0] > shape[1] else 1
+                axis = 1 # 0 if shape[0] > shape[1] else 1
 
                 K = shape[  axis]
                 N = shape[1-axis]
@@ -55,51 +96,53 @@ class LayerNormTest(tf.test.TestCase):
                 g = tf.constant(G)
                 b = tf.constant(B)
 
-                for dtF, dtB in dtypes:
+                for dtype in dtypes:
 
                     # just test relu on floats (it's hard to match low precision relu with high precision behavior)
-                    relu = dtF is tf.float32 and dtB is tf.float32
+                    relu = dtype is tf.float32
 
-                    print("K:%d N:%d Axis:%d Relu:%d F:%s B:%s" % (K, N, axis, relu, dtF.name, dtB.name))
+                    print("K:%d N:%d Axis:%d Relu:%d dtype:%s" % (K, N, axis, relu, dtype.name))
 
-                    Y          = layer_norm_test(X, G, B, axis=axis, relu=relu)
-                    DX, DG, DB = layer_norm_grad_test(E, X, G, B, axis=axis, relu=relu)
+                    Y          = layer_norm_test(X, G, B, axis=axis, segments=segments, relu=relu)
+                    DX, DG, DB = layer_norm_grad_test(E, X, G, B, axis=axis, segments=segments, relu=relu)
 
-                    y = ew.float_cast(x, dtype=dtF)
-                    y = layer_norm(y, g, b, axis=axis, relu=relu, bench=bench)
-                    y = ew.float_cast(y, dtype=tf.float32, dx_dtype=dtB)
+                    y = ew.float_cast(x, dtype=dtype)
+                    y = layer_norm(y, g, b, axis=axis, segments=segments, relu=relu, bench=bench)
+                    y = ew.float_cast(y, dtype=tf.float32, dx_dtype=dtype)
 
                     d = tf.gradients(y, [x, g, b], e)
 
-                    if bench: sess.run(y) #warmup
+                    #if bench: sess.run(y) #warmup
 
                     y, (dx, dg, db) = sess.run( [y, d] )
+                    #y, = sess.run( [y,] )
 
-                    for op, cpuA, devA in (
-                        (" y:",  Y,  y),
-                        ("dx:", DX, dx),
-                        ("dg:", DG, dg),
-                        ("db:", DB, db),):
+                    if bench == 0:
+                        for op, cpuA, devA in (
+                            (" y:",  Y,  y),
+                            ("dx:", DX, dx),
+                            ("dg:", DG, dg),
+                            ("db:", DB, db),):
 
-                        difA = abs(cpuA - devA)
+                            difA = abs(cpuA - devA)
 
-                        avgval  = np.average(abs(cpuA))
-                        maxdif  = difA.max()
-                        max_err = maxdif if avgval == 0 else maxdif / avgval
+                            avgval  = np.average(abs(cpuA))
+                            maxdif  = difA.max()
+                            max_err = maxdif if avgval == 0 else maxdif / avgval
 
-                        l2_err = np.sqrt(np.square(difA).sum()) / np.sqrt(np.square(cpuA).sum())
+                            l2_err = np.sqrt(np.square(difA).sum()) / np.sqrt(np.square(cpuA).sum())
 
-                        #print("max_err: %5.3f, max_val: %7.3f, l1_err: %7.5f, l2_err: %7.5f" % (difO.max(), cpuO.max(), l1_err, l2_err))
+                            #print("max_err: %5.3f, max_val: %7.3f, l1_err: %7.5f, l2_err: %7.5f" % (difO.max(), cpuO.max(), l1_err, l2_err))
 
-                        print("%s max_err%%:%10.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
+                            print("%s max_err%%:%10.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
 
-                        # rtol = 1e-4 if dtF is tf.float32 else 1e-1
-                        # self.assertAllClose(devA, cpuA, rtol=rtol, atol=rtol)
-                        if out:
-                            np.savetxt("out.txt",  difA.reshape((-1,N)), fmt='%5.1f')
-                            np.savetxt("outC.txt", cpuA.reshape((-1,N)), fmt='%5.1f')
-                            np.savetxt("outD.txt", devA.reshape((-1,N)), fmt='%5.1f')
-                            exit()
+                            # rtol = 1e-4 if dtype is tf.float32 else 1e-1
+                            # self.assertAllClose(devA, cpuA, rtol=rtol, atol=rtol)
+                            if out:
+                                np.savetxt("out.txt",  difA.reshape((-1,N)), fmt='%7.3f')
+                                np.savetxt("outC.txt", cpuA.reshape((-1,N)), fmt='%7.3f')
+                                np.savetxt("outD.txt", devA.reshape((-1,N)), fmt='%7.3f')
+                                exit()
                     print("")
 
 if __name__ == "__main__":

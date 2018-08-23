@@ -1,6 +1,5 @@
 
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 #include "ew_op_gpu.h"
 
@@ -141,7 +140,7 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
     // reduce within warp
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-        mean += __shfl_xor(mean, i);
+        mean += shfl_xor(mean, i);
     // first thread of each warp store to shared
     if ((tid & 31) == 0)
         Share[tid >> 5] = mean;
@@ -153,7 +152,7 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
         // reduce within this last warp
         #pragma unroll
         for (int i = (THREADS>>6); i > 0; i >>= 1)
-            mean += __shfl_xor(mean, i);
+            mean += shfl_xor(mean, i);
         // outputs final reduction to shared
         Share[tid] = mean * rcpNDHW;
     }
@@ -176,7 +175,7 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
     // reduce within warp
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-        var += __shfl_xor(var, i);
+        var += shfl_xor(var, i);
     // first thread of each warp store to shared
     if ((tid & 31) == 0)
         Share[tid >> 5] = var;
@@ -188,7 +187,7 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
         // reduce within this last warp
         #pragma unroll
         for (int i = (THREADS>>6); i > 0; i >>= 1)
-            var += __shfl_xor(var, i);
+            var += shfl_xor(var, i);
 
         // outputs final reduction to shared
         if (tid == 0)
@@ -311,8 +310,8 @@ __global__ void __launch_bounds__(THREADS) batchnorm_backward_ncdhw(
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
     {
-        dg += __shfl_xor(dg, i);
-        db += __shfl_xor(db, i);
+        dg += shfl_xor(dg, i);
+        db += shfl_xor(db, i);
     }
     // first thread of each warp store to shared
     if ((tid & 31) == 0)
@@ -330,8 +329,8 @@ __global__ void __launch_bounds__(THREADS) batchnorm_backward_ncdhw(
         #pragma unroll
         for (int i = (THREADS>>6); i > 0; i >>= 1)
         {
-            dg += __shfl_xor(dg, i);
-            db += __shfl_xor(db, i);
+            dg += shfl_xor(dg, i);
+            db += shfl_xor(db, i);
         }
         // outputs final reduction to shared
         if (tid == 0)

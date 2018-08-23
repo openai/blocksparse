@@ -13,6 +13,12 @@ cudaError_t BsmmXprop_CN(const TX* X, const TW* W, TY* Y, bsmm_params* params);
 template <CTYPE3(TX, TE, TU)>
 cudaError_t BsmmUpdat_CN(const TX* X, const TE* E, TU* U, bsmm_params* params);
 
+template <bool Fprop, CTYPE3(TX, TW, TY)>
+cudaError_t BsmmGatedXprop_CN(const TX* X, const TW* W, TY* Y, bsmm_params* params);
+
+template <CTYPE3(TX, TE, TU)>
+cudaError_t BsmmGatedUpdat_CN(const TX* X, const TE* E, TU* U, bsmm_params* params);
+
 template <CTYPE3(TA,TB,TC)>
 class BlocksparseMatmul
 {
@@ -35,7 +41,12 @@ public:
 
     virtual Status Compute(const TA* A, const TB* B, TC* C)
     {
-        cudaError_t res = BsmmXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        cudaError_t res;
+        if (this->params_->Gate == NULL)
+            res = BsmmXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        else
+            res = BsmmGatedXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+
         if (cudaSuccess != res)
             return errors::Internal(cudaGetErrorString(res));
         return Status::OK();
@@ -50,7 +61,12 @@ public:
 
     virtual Status Compute(const TA* A, const TB* B, TC* C)
     {
-        cudaError_t res = BsmmXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        cudaError_t res;
+        if (this->params_->Gate == NULL)
+            res = BsmmXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        else
+            res = BsmmGatedXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+
         if (cudaSuccess != res)
             return errors::Internal(cudaGetErrorString(res));
         return Status::OK();
@@ -65,7 +81,12 @@ public:
 
     virtual Status Compute(const TA* A, const TB* B, TC* C)
     {
-        cudaError_t res = BsmmUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        cudaError_t res;
+        if (this->params_->Gate == NULL)
+            res = BsmmUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        else
+            res = BsmmGatedUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+
         if (cudaSuccess != res)
             return errors::Internal(cudaGetErrorString(res));
         return Status::OK();

@@ -8,7 +8,7 @@ import sys
 import numpy as np
 import tensorflow as tf
 import blocksparse.ewops as ew
-from tensorflow.python.ops import gradient_checker
+#from tensorflow.python.ops import gradient_checker
 
 ones = 0
 out  = 0
@@ -51,18 +51,19 @@ class EwOpsTest(tf.test.TestCase):
 
                         tests = list()
 
-                        xx = tf.ones(shape, dtype=tf.float16)
-                        ee = tf.ones(shape)
+                        xx = tf.ones(shape, dtype=tf.float32)
+                        ee = tf.ones(shape, dtype=tf.float32)
 
-                        ew_op1 = ew.dropout(xx, keep_prob=0.5)
-                        ew_op2 = ew.dropout(xx, mask=ew_op1[1])
+                        ew_op1 = ew.dropout(xx, keep_prob=0.5,  scale=2.0)
+                        ew_op2 = ew.dropout(xx, mask=ew_op1[1], scale=2.0)
                         dx_op  = tf.gradients(ew_op1[0], [xx], ee)
                         (z1, m), z2, (dx,) = sess.run( [ew_op1, ew_op2, dx_op] )
+                        #print(dx[0,0:8])
                         print(z1.sum()/z1.size, dx.sum()/dx.size, (z1 - z2).sum(), (z1 - dx).sum())
 
-                        z = sess.run( ew.sparse_relu(x) )
-                        Z = ew.sparse_relu_test(np_X)
-                        tests.append(("sps_relu: Z ",  Z,  z))
+                        # z = sess.run( ew.sparse_relu(x) )
+                        # Z = ew.sparse_relu_test(np_X)
+                        # tests.append(("sps_relu: Z ",  Z,  z))
 
                         # Non-Broadcast Binary Ops
                         for name, tf_op, ew_op in (
@@ -122,60 +123,6 @@ class EwOpsTest(tf.test.TestCase):
                             tests.append((name+": Z ",  Z,  z))
                             tests.append((name+": DX", DX, dx))
                             tests.append((name+": DB", DB, db))
-
-                        if (shape[1] % 4) == 0:
-
-                            # Split 4
-                            e4 = [ tf.constant(x.astype(dtypeB)) for x in np.split(np_E, 4, 1) ]
-                            E4 = [ tf.constant(x)                for x in np.split(np_E, 4, 1) ]
-
-                            tf_op  = tf.split(X, 4, 1)
-                            ew_op  = ew.split4(x)
-                            Z, z = sess.run( [tf_op, ew_op] )
-                            DX, = sess.run( tf.gradients(list(tf_op), [X], E4) )
-                            dx, = sess.run( tf.gradients(list(ew_op), [x], e4) )
-                            tests.append(("  split4: Z0",  Z[0],  z[0]))
-                            tests.append(("  split4: Z1",  Z[1],  z[1]))
-                            tests.append(("  split4: Z2",  Z[2],  z[2]))
-                            tests.append(("  split4: Z3",  Z[3],  z[3]))
-                            tests.append(("  split4: DX",  DX,    dx  ))
-
-                            # LSTM Gates:
-                            K4 = shape[1] // 4
-                            c  = tf.constant(np_Y[:, 0:K4  ].astype(dtypeF))
-                            ec = tf.constant(np_E[:, 0:K4  ].astype(dtypeB))
-                            eh = tf.constant(np_E[:,K4:K4*2].astype(dtypeB))
-
-                            i, f, o, u = ew.split4(x)
-                            i = ew.sigmoid(i)
-                            f = ew.sigmoid(f)
-                            o = ew.sigmoid(o)
-                            u = ew.tanh(u)
-                            cn = ew.add(ew.multiply(f, c), ew.multiply(i, u))
-                            hn = ew.multiply(o, ew.tanh(cn))
-
-                            ew_op  = ew.fused_lstm_gates(c, x)
-                            ew_op4 = ew.fused_lstm_gates(c, *ew.split4(x))
-
-                            C_next, H_next = sess.run( [cn, hn] )
-                            c_next, h_next = sess.run( ew_op )
-                            c_next4, h_next4 = sess.run( ew_op4 )
-
-                            # gradient_checker tests are insanely slow
-                            # error = gradient_checker.compute_gradient_error(c, (shape[0],K4), ew_op4[0], (shape[0],K4))
-                            # assert error < 0.01
-                            # error = gradient_checker.compute_gradient_error(x,  shape,        ew_op4[1], (shape[0],K4))
-                            # assert error < 0.01
-
-                            # DC, DH = sess.run( tf.gradients(   [cn, hn], [c, x], [ec, eh]) )
-                            # dc, dh = sess.run( tf.gradients(list(ew_op), [c, x], [ec, eh]) )
-
-                            tests.append(("    LSTM:  C", C_next, c_next ))
-                            tests.append(("    LSTM:  H", H_next, h_next ))
-                            tests.append(("    LSTM: C4", C_next, c_next4 ))
-                            tests.append(("    LSTM: H4", H_next, h_next4 ))
-                            # tests.append(("    LSTM: DC", DC, dc ))
-                            # tests.append(("    LSTM: DH", DH, dh ))
 
 
                         # Up Cast

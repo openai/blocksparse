@@ -24,26 +24,53 @@ batch_norm_grad_ncdhw_op = _op_module.batch_norm_grad_ncdhw
 
 
 
-def layer_norm(x, g, b, axis=1, epsilon=1e-6, relu=False, bench=0):
+def layer_norm(x, g, b, axis=1, segments=1, epsilon=1e-6, relu=False, bench=0, use_tf=False):
 
-    K = x.get_shape()[axis].value
-    #assert K % 8 == 0
-    assert g.get_shape().num_elements() == K
-    assert b.get_shape().num_elements() == K
-    y, m, v = layer_norm_op(x, g, b, K=K, axis=axis, epsilon=epsilon, relu=relu, bench=bench)
+    dev = g.op.device.lower()
+    if use_tf or not dev or "cpu" in dev:
+
+        if axis < 0:
+            axis += len(x.shape)
+
+        K = x.shape[axis].value
+        assert g.shape.num_elements() == K
+        assert b.shape.num_elements() == K
+        assert K % segments == 0
+        assert axis != 0 or segments == 1, "Segments only implemented on axis=1 for now"
+        K //= segments
+
+        ys = list()
+        for s in range(segments):
+
+            segK = slice(s*K, s*K+K)
+            segX = [segK if d == axis else slice(None) for d in range(x.shape.ndims)]
+
+            mean, var = tf.nn.moments(x[segX], [axis], keep_dims=True)
+            # mean = tf.reduce_mean(x[segX], axis=[axis], keepdims=True)
+            # var  = tf.reduce_mean(tf.square(x[segX] - mean), axis=[axis], keepdims=True)
+            norm = (x[segX] - mean) * tf.rsqrt(var + epsilon)
+            ys.append(norm * g[segK] + b[segK])
+
+        y = tf.concat(ys, axis) if segments > 1 else ys[0]
+        if relu:
+            y = tf.nn.relu(y)
+    else:
+        y, m, v, _, _ = layer_norm_op(x, g, b, S=segments, axis=axis, epsilon=epsilon, relu=relu, bench=bench)
+
     return y
 
 @ops.RegisterGradient("LayerNorm")
-def layer_norm_grad(op, dy, mean, rstd):
-    K       = op.get_attr("K")
+def layer_norm_grad(op, dy, mean, rstd, p1, p2):
+    S       = op.get_attr("S")
     epsilon = op.get_attr("epsilon")
     relu    = op.get_attr("relu")
     axis    = op.get_attr("axis")
     bench   = op.get_attr("bench")
-    return layer_norm_grad_op(dy, op.inputs[0], op.inputs[1], op.inputs[2], op.outputs[1], op.outputs[2], K=K, axis=axis, epsilon=epsilon, relu=relu, bench=bench)
+    dx, dg, db, _, _ = layer_norm_grad_op(dy, op.inputs[0], op.inputs[1], op.inputs[2], op.outputs[1], op.outputs[2], S=S, axis=axis, epsilon=epsilon, relu=relu, bench=bench)
+    return dx, dg, db
 
 def batch_norm_inference(x, g, b, m, v, epsilon=1e-6):
-    shape = x.get_shape()
+    shape = x.shape
     C     = int(shape[1])
     DHW   = int(shape[2:].num_elements())
     assert g.get_shape().num_elements() == C
@@ -58,7 +85,7 @@ def batch_norm_inf_grad(op, dy):
 
 
 def batch_norm(x, g, b, epsilon=1e-6):
-    shape = x.get_shape()
+    shape = x.shape
     C     = int(shape[1])
     DHW   = int(shape[2:].num_elements())
     magic = _magic64u(DHW)
@@ -76,7 +103,7 @@ def batch_norm_grad(op, dy, mean, var):
 
 
 
-def layer_norm_test(x, g, b, axis=1, epsilon=1e-6, relu=False):
+def layer_norm_test(x, g, b, axis=1, segments=1, epsilon=1e-6, relu=False):
 
     x_shape = x.shape
     K = x_shape[axis]
@@ -89,19 +116,26 @@ def layer_norm_test(x, g, b, axis=1, epsilon=1e-6, relu=False):
         x = x.reshape(-1, K)
         g = g.reshape( 1, K)
         b = b.reshape( 1, K)
+    K //= segments
 
-    mean = np.mean(x, axis=axis, keepdims=True)
-    var  = np.var(x, axis=axis, keepdims=True)
-    rstd = np.reciprocal(np.sqrt(var + epsilon))
-    xhat = (x - mean) * rstd
+    y = np.empty_like(x)
+    for s in range(segments):
 
-    y = xhat*g + b
-    if relu:
-        y = np.maximum(y, 0.0)
+        segK = slice(s*K, s*K+K)
+        seg  = (segK, slice(None)) if axis == 0 else (slice(None), segK)
+
+        mean = np.mean(x[seg], axis=axis, keepdims=True)
+        var  = np.var(x[seg], axis=axis, keepdims=True)
+        rstd = np.reciprocal(np.sqrt(var + epsilon))
+        xhat = (x[seg] - mean) * rstd
+
+        y[seg] = xhat*g[seg] + b[seg]
+        if relu:
+            y[seg] = np.maximum(y[seg], 0.0)
 
     return y.reshape(x_shape)
 
-def layer_norm_grad_test(dy, x, g, b, axis=1, epsilon=1e-6, relu=False):
+def layer_norm_grad_test(dy, x, g, b, axis=1, segments=1, epsilon=1e-6, relu=False):
 
     x_shape = x.shape
     K = x_shape[axis]
@@ -116,25 +150,35 @@ def layer_norm_grad_test(dy, x, g, b, axis=1, epsilon=1e-6, relu=False):
         x  =  x.reshape(-1, K)
         g  =  g.reshape( 1, K)
         b  =  b.reshape( 1, K)
+    K //= segments
 
-    mean  = np.mean(x, axis=axis, keepdims=True)
-    xmean = x - mean
-    xvar  = np.var(x, axis=axis, keepdims=True)
-    xstdr = np.reciprocal(np.sqrt(xvar + epsilon))
-    xhat  = xmean * xstdr
+    dy = dy.copy()
+    dx = np.empty_like(dy)
+    dg = np.empty_like(g)
+    db = np.empty_like(b)
+    for s in range(segments):
 
-    if relu:
-        dy = dy * ((xhat*g + b) > 0.0)
+        segK  = slice(s*K, s*K+K)
+        seg   = (segK, slice(None)) if axis == 0 else (slice(None), segK)
 
-    #print("x:%.2f, mean:%.2f, rstd:%.2f, xhat:%.2f, dy:%.2f\n" % (x[0,0], mean[0,0], xstdr[0,0], xhat[0,0], dy[0,0]));
+        mean  = np.mean(x[seg], axis=axis, keepdims=True)
+        xmean = x[seg] - mean
+        xvar  = np.var(x[seg], axis=axis, keepdims=True)
+        xstdr = np.reciprocal(np.sqrt(xvar + epsilon))
+        xhat  = xmean * xstdr
 
-    dg = np.sum(dy * xhat, axis=1-axis)
-    db = np.sum(dy,        axis=1-axis)
-    dy = dy * g
+        if relu:
+            dy[seg] = dy[seg] * ((xhat*g[seg] + b[seg]) > 0.0)
 
-    sum1 = np.sum(xhat * dy, axis=axis, keepdims=True)
-    sum2 = np.sum(dy,        axis=axis, keepdims=True)
-    dx   = (dy - ((xhat * sum1 + sum2) / float(K))) * xstdr
+        #print("x:%.2f, mean:%.2f, rstd:%.2f, xhat:%.2f, dy:%.2f\n" % (x[0,0], mean[0,0], xstdr[0,0], xhat[0,0], dy[0,0]));
+
+        dg[seg] = np.sum(dy[seg] * xhat, axis=1-axis)
+        db[seg] = np.sum(dy[seg],        axis=1-axis)
+        dy[seg] = dy[seg] * g[seg]
+
+        sum1 = np.sum(xhat * dy[seg], axis=axis, keepdims=True)
+        sum2 = np.sum(dy[seg],        axis=axis, keepdims=True)
+        dx[seg]   = (dy[seg] - ((xhat * sum1 + sum2) / float(K))) * xstdr
 
     return dx.reshape(x_shape), dg, db
 

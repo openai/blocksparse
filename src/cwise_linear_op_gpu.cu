@@ -1,318 +1,247 @@
 
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 #include "ew_op_gpu.h"
 
-
-__device__ __forceinline__ int div64(int value, int magic, int shift)
-{
-    // if the divisor is a power of 2 the magic will be 1 and it's just a simple right shift
-    // Otherwise multiply by magic and right shift just the high bits
-    int result;
-    asm("{\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .u64 res64;\n\t"
-        ".reg .u32 lo32, hi32;\n\t"
-        "setp.ne.s32 p, %2, 1;\n\t"
-        "mul.wide.u32 res64, %1, %2;\n\t"
-        "mov.b64 {lo32, hi32}, res64;\n\t"
-        "selp.u32 hi32, hi32, %1, p;\n\t"
-        "shr.u32 %0, hi32, %3;\n\t"
-        "}" : "=r"(result) : "r"(value), "r"(magic), "r"(shift));
-    return result;
-}
-
-//  y = a*x + b
-template <typename T, int THREADS>
-__global__ void __launch_bounds__(THREADS) cwise_linear_axpb_forward(
+//  y = a*x + b   or    a*(x + b)
+template <typename T>
+__global__ void cwise_linear_axpb_forward(
               T*              Y,
     const     T* __restrict__ X,
     const float* __restrict__ A,
     const float* __restrict__ B,
-    int CDHW, int DHW, bool bA, bool bB)
+    uint CDHW, uint DHW, int bA, int bB, int relu, int swap)
 {
-    const int tid = threadIdx.x;
-    const int c   = blockIdx.x;
-    const int n   = blockIdx.y;
+    uint tid = threadIdx.x;
+    uint c   = blockIdx.x;
+    uint n   = blockIdx.y;
 
-    int  image_offset = n * CDHW + c * DHW;
-    X += image_offset;
-    Y += image_offset;
+    uint offset = n * CDHW + c * DHW + tid;
 
     float a = bA ? A[c] : 1.0f;
     float b = bB ? B[c] : 0.0f;
 
-    for (int i = tid; i < DHW; i += THREADS)
+    #pragma unroll 1
+    for (uint i = tid; i < DHW; i += blockDim.x, offset += blockDim.x)
     {
-        float x = load(X, i);
-        store(Y, a*x + b, i);
+        float x = load(add_ptr_u(X, offset));
+        float y = swap ? a*(x + b) : a*x + b;
+        if (relu)
+            y = ew_relu(y);
+
+        store(add_ptr_u(Y, offset), y);
     }
 }
 
-
-// dx = a * dy
+// y  = a*x + b
+// dx = dy * a
 // da = sum(dy * x)
 // db = sum(dy)
-template <typename TX, typename TY, int THREADS>
-__global__ void __launch_bounds__(THREADS) cwise_linear_axpb_backward(
-             TY*              DX,
+
+// y  = a*(x + b)
+// dx = dy * a
+// da = sum(dy*(x + b))
+// db = sum(dy * a)
+template <typename T>
+__global__ void cwise_linear_axpb_backward(
+              T*              DX,
           float*              DA,
           float*              DB,
-    const    TY* __restrict__ DY,
-    const    TX* __restrict__ X,
+    const     T* __restrict__ DY,
+    const     T* __restrict__ X,
     const float* __restrict__ A,
-    int CDHW, int NDHW, int DHW, int magic_DHW, int shift_DHW, bool bDB)
+    const float* __restrict__ B,
+    uint CDHW, uint NDHW, uint DHW, int bDB, int relu, int swap)
 {
-    __shared__ float shareDA[THREADS>>5];
-    __shared__ float shareDB[THREADS>>5];
-
-    const int tid = threadIdx.x;
-    const int c   = blockIdx.x;
-
-    int   image_offset = c * DHW;
-    DX += image_offset;
-    DY += image_offset;
-    X  += image_offset;
+    __shared__ float2 Share[32];
+    uint tid = threadIdx.x;
+    if (blockDim.x > 32)
+    {
+        float2 zero = {0.0f, 0.0f};
+        if (tid < 32)
+            Share[tid] = zero;
+        __syncthreads();
+    }
+    uint c = blockIdx.x;
+    uint offsetC = c * DHW;
 
     float a = A[c];
+    float b = (relu || swap) && bDB ? B[c] : 0.0f;
 
-    float da = 0.0f;
-    float db = 0.0f;
-    for (int ndhw = tid; ndhw < NDHW; ndhw += THREADS)
+    float da = 0.0f, db = 0.0f;
+    #pragma unroll 1
+    for (int ndhw = tid; ndhw < NDHW; ndhw += blockDim.x)
     {
-        int n   = div64(ndhw, magic_DHW, shift_DHW);
-        int dhw = ndhw - n*DHW;
-        int i   = n * CDHW + dhw;
+        uint   n = ndhw / DHW;
+        uint dhw = ndhw % DHW;
+        uint offset = offsetC + n * CDHW + dhw;
 
-        float dy = load(DY, i);
-        float  x = load( X, i);
+        float dy = load(add_ptr_u(DY, offset));
+        float  x = load(add_ptr_u( X, offset));
 
-        da += dy * x;
-        db += dy;
+        if (relu)
+            dy = ew_relu_grad(dy, swap ? a*(x + b) : a*x + b);
 
-        store(DX, a*dy, i);
+        float dx = dy * a;
+        da += swap ? dy * (x + b) : dy * x;
+        db += swap ? dx : dy;
+
+        store(add_ptr_u(DX, offset), dx);
     }
+    float2 stats = {da, db};
+
     // reduce within warp
-    #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-    {
-        da += shfl_xor(da, i);
-        db += shfl_xor(db, i);
-    }
-    // first thread of each warp store to shared
-    if ((tid & 31) == 0)
-    {
-        shareDA[tid >> 5] = da;
-        shareDB[tid >> 5] = db;
-    }
-    __syncthreads();
+        stats = ew_warp_sum(stats, i);
 
-    if (tid < (THREADS>>5))
+    if (blockDim.x > 32)
     {
-        // first warp loads all prior reductions
-        da = shareDA[tid];
-        db = shareDB[tid];
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = stats;
+        __syncthreads();
 
-        // reduce within this last warp
-        #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
+        if (tid < 32)
         {
-            da += shfl_xor(da, i);
-            db += shfl_xor(db, i);
+            // first warp loads all prior reductions
+            stats = Share[tid];
+            // reduce within this last warp
+            #pragma unroll 1
+            for (int i = blockDim.x/64; i > 0; i >>= 1)
+                stats = ew_warp_sum(stats, i);
         }
-        // single thread outputs final reductions
-        if (tid == 0)
-        {
-            DA[c] = da;
-            if (bDB)
-                DB[c] = db;
-        }
+    }
+    // single thread outputs final reductions
+    if (tid == 0)
+    {
+        DA[c] = stats.x;
+        if (bDB)
+            DB[c] = stats.y;
     }
 }
 
 // db = sum(dy)
-template <typename T, int THREADS>
-__global__ void __launch_bounds__(THREADS) cwise_linear_xpb_backward(
+template <typename T>
+__global__ void cwise_linear_xpb_backward(
+              T*              DX,
           float*              DB,
     const     T* __restrict__ DY,
-    int CDHW, int NDHW, int DHW, int magic_DHW, int shift_DHW)
+    const     T* __restrict__ Y,
+    uint CDHW, uint NDHW, uint DHW, int relu)
 {
-    __shared__ float shareDB[THREADS>>5];
-
-    const int tid = threadIdx.x;
-    const int c   = blockIdx.x;
-
-    DY += c * DHW;
+    __shared__ float Share[32];
+    uint tid = threadIdx.x;
+    if (blockDim.x > 32)
+    {
+        if (tid < 32)
+            Share[tid] = 0.0f;
+        __syncthreads();
+    }
+    uint c = blockIdx.x;
+    uint offsetC = c * DHW;
 
     float db = 0.0f;
-    for (int ndhw = tid; ndhw < NDHW; ndhw += THREADS)
+    #pragma unroll 1
+    for (int ndhw = tid; ndhw < NDHW; ndhw += blockDim.x)
     {
-        int n   = div64(ndhw, magic_DHW, shift_DHW);
-        int dhw = ndhw - n*DHW;
-        int i   = n * CDHW + dhw;
+        uint   n = ndhw / DHW;
+        uint dhw = ndhw % DHW;
+        uint offset = offsetC + n * CDHW + dhw;
 
-        float dy = load(DY, i);
-
+        float dy = load(add_ptr_u(DY, offset));
+        if (relu)
+        {
+            float y = load(add_ptr_u(Y, offset));
+            dy = ew_relu_grad(dy, y);
+            store(add_ptr_u(DX, offset), dy);
+        }
         db += dy;
     }
     // reduce within warp
-    #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
         db += shfl_xor(db, i);
 
-    // first thread of each warp store to shared
-    if ((tid & 31) == 0)
-        shareDB[tid >> 5] = db;
-
-    __syncthreads();
-
-    if (tid < (THREADS>>5))
+    if (blockDim.x > 32)
     {
-        // first warp loads all prior reductions
-        db = shareDB[tid];
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = db;
+        __syncthreads();
 
-        // reduce within this last warp
-        #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
-            db += shfl_xor(db, i);
+        if (tid < 32)
+        {
+            // first warp loads all prior reductions
+            db = Share[tid];
+            // reduce within this last warp
+            #pragma unroll 1
+            for (int i = blockDim.x/64; i > 0; i >>= 1)
+                db += shfl_xor(db, i);
 
-        // single thread outputs final reductions
-        if (tid == 0)
-            DB[c] = db;
+        }
     }
+    // single thread outputs final reductions
+    if (tid == 0)
+        DB[c] = db;
 }
 
 template <typename T>
-bool CWiseLinearAXPB_Forward(CUstream stream,
+bool CWiseLinear_Forward(CUstream stream,
               T* y,
     const     T* x,
     const float* a,
     const float* b,
-    int N, int C, int DHW)
+    uint N, uint C, uint DHW, bool relu, bool swap)
 {
-    dim3 grid(C, N, 1);
-    if      (DHW < 128*8)
-        cwise_linear_axpb_forward<T, 32><<<grid,  32, 0, stream>>>(y, x, a, b, C*DHW, DHW, a!=0, b!=0);
-    else if (DHW < 512*8)
-        cwise_linear_axpb_forward<T,128><<<grid, 128, 0, stream>>>(y, x, a, b, C*DHW, DHW, a!=0, b!=0);
-    else
-        cwise_linear_axpb_forward<T,512><<<grid, 512, 0, stream>>>(y, x, a, b, C*DHW, DHW, a!=0, b!=0);
+    // target 4 loops per block
+    uint threads =
+        DHW <=  4*32 ?  32 :
+        DHW <=  8*32 ?  64 :
+        DHW <= 16*32 ? 128 :
+        DHW <= 32*32 ? 256 :
+        DHW <= 64*32 ? 512 : 1024;
+
+    cwise_linear_axpb_forward<T><<<dim3(C, N, 1),threads,0,stream>>>(y, x, a, b, C*DHW, DHW, a!=0, b!=0, relu, swap);
     return true; // TODO
 }
 
-
-template <typename TX, typename TY>
-bool CWiseLinearAXPB_Backward(CUstream stream,
-             TY* dx,
-          float* da,
-          float* db,
-    const    TY* dy,
-    const    TX* x,
-    const float* a,
-    int C, int NDHW, int DHW, int magic_DHW, int shift_DHW)
-{
-    dim3 grid(C, 1, 1);
-    if      (NDHW <  256*8)
-        cwise_linear_axpb_backward<TX,TY,  64><<<grid,   64, 0, stream>>>(dx, da, db, dy, x, a, C*DHW, NDHW, DHW, magic_DHW, shift_DHW, db!=0);
-    else if (NDHW < 1024*8)
-        cwise_linear_axpb_backward<TX,TY, 256><<<grid,  256, 0, stream>>>(dx, da, db, dy, x, a, C*DHW, NDHW, DHW, magic_DHW, shift_DHW, db!=0);
-    else
-        cwise_linear_axpb_backward<TX,TY,1024><<<grid, 1024, 0, stream>>>(dx, da, db, dy, x, a, C*DHW, NDHW, DHW, magic_DHW, shift_DHW, db!=0);
-    return true; // TODO
-}
 
 template <typename T>
-bool CWiseLinearXPB_Backward(CUstream stream,
+bool CWiseLinear_Backward(CUstream stream,
+              T* dx,
+          float* da,
           float* db,
     const     T* dy,
-    int C, int NDHW, int DHW, int magic_DHW, int shift_DHW)
+    const     T* xy,
+    const float* a,
+    const float* b,
+    uint N, uint C, uint DHW, bool relu, bool swap)
 {
     dim3 grid(C, 1, 1);
-    if      (NDHW <  256*8)
-        cwise_linear_xpb_backward<T,  64><<<grid,   64, 0, stream>>>(db, dy, C*DHW, NDHW, DHW, magic_DHW, shift_DHW);
-    else if (NDHW < 1024*8)
-        cwise_linear_xpb_backward<T, 256><<<grid,  256, 0, stream>>>(db, dy, C*DHW, NDHW, DHW, magic_DHW, shift_DHW);
+    uint NDHW = N*DHW;
+    uint CDHW = C*DHW;
+
+    // target 4 loops per block
+    uint threads =
+        NDHW <=  4*32 ?  32 :
+        NDHW <=  8*32 ?  64 :
+        NDHW <= 16*32 ? 128 :
+        NDHW <= 32*32 ? 256 :
+        NDHW <= 64*32 ? 512 : 1024;
+
+    if (da != NULL)
+        cwise_linear_axpb_backward<T><<<grid,threads,0,stream>>>(dx, da, db, dy, xy, a, b, CDHW, NDHW, DHW, db!=0, relu, swap);
     else
-        cwise_linear_xpb_backward<T,1024><<<grid, 1024, 0, stream>>>(db, dy, C*DHW, NDHW, DHW, magic_DHW, shift_DHW);
+        cwise_linear_xpb_backward<T><<<grid,threads,0,stream>>>(dx, db, dy, xy, CDHW, NDHW, DHW, relu);
     return true; // TODO
 }
 
-template bool CWiseLinearAXPB_Forward<float>(CUstream stream,
-          float* y,
-    const float* x,
-    const float* a,
-    const float* b,
-    int N, int C, int DHW);
+template bool CWiseLinear_Forward<float>(CUstream stream, float* y, const float* x, const float* a, const float* b, uint N, uint C, uint DHW, bool relu, bool swap);
+template bool CWiseLinear_Forward<ehalf>(CUstream stream, ehalf* y, const ehalf* x, const float* a, const float* b, uint N, uint C, uint DHW, bool relu, bool swap);
+template bool CWiseLinear_Forward<bhalf>(CUstream stream, bhalf* y, const bhalf* x, const float* a, const float* b, uint N, uint C, uint DHW, bool relu, bool swap);
 
-template bool CWiseLinearAXPB_Forward<ehalf>(CUstream stream,
-          ehalf* y,
-    const ehalf* x,
-    const float* a,
-    const float* b,
-    int N, int C, int DHW);
-
-template bool CWiseLinearAXPB_Forward<bhalf>(CUstream stream,
-          bhalf* y,
-    const bhalf* x,
-    const float* a,
-    const float* b,
-    int N, int C, int DHW);
-
-template bool CWiseLinearAXPB_Backward<float,float>(CUstream stream,
-          float* dx,
-          float* da,
-          float* db,
-    const float* dy,
-    const float* x,
-    const float* a,
-    int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
-
-template bool CWiseLinearAXPB_Backward<ehalf,ehalf>(CUstream stream,
-          ehalf* dx,
-          float* da,
-          float* db,
-    const ehalf* dy,
-    const ehalf* x,
-    const float* a,
-   int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
-
-template bool CWiseLinearAXPB_Backward<bhalf,bhalf>(CUstream stream,
-          bhalf* dx,
-          float* da,
-          float* db,
-    const bhalf* dy,
-    const bhalf* x,
-    const float* a,
-   int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
-
-template bool CWiseLinearAXPB_Backward<ehalf,float>(CUstream stream,
-          float* dx,
-          float* da,
-          float* db,
-    const float* dy,
-    const ehalf* x,
-    const float* a,
-   int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
-
-
-template bool CWiseLinearXPB_Backward<float>(CUstream stream,
-          float* db,
-    const float* dy,
-    int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
-
-template bool CWiseLinearXPB_Backward<ehalf>(CUstream stream,
-          float* db,
-    const ehalf* dy,
-   int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
-
-template bool CWiseLinearXPB_Backward<bhalf>(CUstream stream,
-          float* db,
-    const bhalf* dy,
-   int C, int NDHW, int DHW, int magic_DHW, int shift_DHW);
+template bool CWiseLinear_Backward<float>(CUstream stream, float* dx, float* da, float* db, const float* dy, const float* xy, const float* a, const float* b, uint N, uint C, uint DHW, bool relu, bool swap);
+template bool CWiseLinear_Backward<ehalf>(CUstream stream, ehalf* dx, float* da, float* db, const ehalf* dy, const ehalf* xy, const float* a, const float* b, uint N, uint C, uint DHW, bool relu, bool swap);
+template bool CWiseLinear_Backward<bhalf>(CUstream stream, bhalf* dx, float* da, float* db, const bhalf* dy, const bhalf* xy, const float* a, const float* b, uint N, uint C, uint DHW, bool relu, bool swap);
 
 #endif
-
-
-
 

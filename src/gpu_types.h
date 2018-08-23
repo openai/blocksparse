@@ -3,6 +3,8 @@
 #include <vector_types.h>
 #include <cuda_runtime.h>
 
+#define FLT_MAX 3.402823466E+38F
+
 // Eigen::half - IEEE half floating point memory format support (not used for compute)
 // 5 bits expoenent, 10 bits mantissa, 1 bit sign
 typedef struct __align__(2) ehalf {
@@ -120,6 +122,7 @@ struct plist8 {
 typedef struct bsmm_params
 {
     const int* Lut;
+    const float* Gate;
     int* Lock;
     //float4* Scratch;
     int blocks;
@@ -138,15 +141,30 @@ typedef struct bsmm_params
 
 
 int GetCountSMs();
+int GetCountSMsVersion(int* major, int* minor);
 
 class Benchmark
 {
   public:
-    Benchmark(const char* name, float mem_size, float num_flops, int repeat, bool isgpu=true);
+    Benchmark(CUstream stream, const char* name, float mem_size, float num_flops, int repeat, bool isgpu=true);
     ~Benchmark();
+    CUstream stream_;
     const char* name_;
     float mem_size_, num_flops_, repeat_;
     CUevent hStart_, hStop_;
     bool isgpu_;
     double us_start_;
 };
+
+#define CEIL_DIV(x, y) (((x) + (y) -   1) / (y))
+#define LOG2(x)        (x==1?0: x==2?1: x<=4?2: x<=8?3: x<=16?4: x<=32?5: x<=64?6: x<=128?7: x<=256?8: x<=512?9 : x<=1024?10 : x<=2048?11 : 12)
+#define THREAD_POW2(x) (x<=32?32: x<=64?64: x<=128?128: x<=256?256: x<=512?512: 1024)
+
+typedef struct QuantStats
+{
+    float mean;
+    float stdv;
+    float sat_pct;
+    float ftz_pct;
+    float max_val;
+} QuantStats;

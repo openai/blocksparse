@@ -4,15 +4,15 @@
 #include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
-// #include "tensorflow/core/platform/stream_executor.h"
-// #include "tensorflow/stream_executor/cuda/cuda_stream.h"
+#include "tensorflow/core/platform/stream_executor.h"
+#include "tensorflow/stream_executor/cuda/cuda_stream.h"
 
 using namespace tensorflow;
 
 using shape_inference::DimensionHandle;
 using shape_inference::InferenceContext;
 using shape_inference::ShapeHandle;
-// using perftools::gputools::cuda::AsCUDAStreamValue;
+using perftools::gputools::cuda::CUDAStream;
 
 #include "gpu_types.h"
 #include "blocksparse_matmul.h"
@@ -34,6 +34,7 @@ public:
         OP_REQUIRES_OK(ctx, ctx->GetAttr("shared",   &params_.shared  ));
         OP_REQUIRES_OK(ctx, ctx->GetAttr("alpha",    &params_.alpha   ));
         OP_REQUIRES_OK(ctx, ctx->GetAttr("beta",     &params_.beta    ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("gated_dw", &gated_dw_       ));
         OP_REQUIRES_OK(ctx, ctx->GetAttr("axis",     &axis_ ));
         OP_REQUIRES_OK(ctx, ctx->GetAttr("bench",    &bench_));
         repeat_ = bench_ ? bench_ : 1;
@@ -67,6 +68,9 @@ public:
         const Tensor& B = ctx->input(1);
         const Tensor& L = ctx->input(2);
 
+        OpInputList gate;
+        ctx->input_list("gate", &gate);
+
         TensorShape shapeC;
         int N     = 1;
         int rankA = A.dims();
@@ -78,6 +82,8 @@ public:
             }
             else
                 shapeC.AddDim(params_.K);
+
+        //printf("shapeC: %d, %d\n", (int)shapeC.dim_size(0), (int)shapeC.dim_size(1));
 
         Tensor* C;
         Status s = ctx->allocate_output(0, shapeC, &C);
@@ -103,24 +109,26 @@ public:
         // else
         //     params_.Scratch = nullptr;
 
-        params_.N   = N;
-        params_.Lut = L.flat<int32>().data();
+        params_.N    = N;
+        params_.Lut  = L.flat<int32>().data();
+        params_.Gate = gate.size() > 0 ? gate[0].flat<float>().data() : NULL;
 
               TC1* pC = (      TC1*)C->flat<TC>().data();
         const TA1* pA = (const TA1*)A.flat<TA>().data();
         const TB1* pB = (const TB1*)B.flat<TB>().data();
 
         if (is_gpu_)
-            params_.stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+            params_.stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
         return this->Op_Compute(pA, pB, pC);
     }
     Status Updat_Compute(OpKernelContext* ctx)
     {
-        OpInputList x, dy;
+        OpInputList x, dy, gate;
 
-        ctx->input_list( "x",  &x);
-        ctx->input_list("dy", &dy);
+        ctx->input_list(   "x", &x);
+        ctx->input_list(  "dy", &dy);
+        ctx->input_list("gate", &gate);
 
         params_.pcount = x.size();
 
@@ -143,7 +151,7 @@ public:
         TC1* DW;
         if (params_.beta == 0.0f)
         {
-            if (ctx->num_inputs() != params_.pcount*2 + 1)
+            if (ctx->num_inputs() != params_.pcount*2 + 1 + gate.size())
                 return errors::Internal("with beta=0.0, use BlocksparseMatmulDW ", ctx->num_inputs());
 
             int bsize = 1 << params_.bshift;
@@ -155,7 +163,7 @@ public:
         }
         else
         {
-            if (ctx->num_inputs() != params_.pcount*2 + 2)
+            if (ctx->num_inputs() != params_.pcount*2 + 2 + gate.size())
                 return errors::Internal("with beta!=0.0, use BlocksparseMatmulDWA ", ctx->num_inputs());
 
             // accumulate to C in place
@@ -163,17 +171,18 @@ public:
             ctx->set_output(0, C);
             DW = (TC1*)C.flat<TC>().data();
         }
-        params_.Lut = ctx->input(params_.pcount*2).flat<int32>().data();
+        params_.Lut  = ctx->input(params_.pcount*2).flat<int32>().data();
+        params_.Gate = gated_dw_ && gate.size() > 0 ? gate[0].flat<float>().data() : NULL;
 
         if (is_gpu_)
-            params_.stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+            params_.stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
         return this->Op_Compute((const TA1*)&X, (const TB1*)&DY, DW);
     }
     Status Op_Compute(const TA1* pA, const TB1* pB, TC1* pC)
     {
         Benchmark* bench = nullptr;
-        if (bench_) bench = new Benchmark(bench_string_, 0, flops_ * params_.N * params_.pcount, repeat_, is_gpu_);
+        if (bench_) bench = new Benchmark(params_.stream, bench_string_, 0, flops_ * params_.N * params_.pcount, repeat_, is_gpu_);
 
         Status status;
         for (int r = 0; r < repeat_; r++)
@@ -188,7 +197,7 @@ public:
     bsmm_params params_;
     int   axis_, bench_, repeat_;
     float flops_;
-    bool  is_gpu_;
+    bool  gated_dw_, is_gpu_;
     char  bench_string_[256];
 };
 
@@ -299,6 +308,7 @@ REGISTER_OP("BlocksparseMatmul")
     .Input("lut: int32")
     .Input("lut_dx: int32")
     .Input("lut_dw: int32")
+    .Input("gate: ngate * float")
     .Output("y: dtype_y")
     .Output("temp: int32")
     //.Output("temp2: float")
@@ -319,7 +329,9 @@ REGISTER_OP("BlocksparseMatmul")
     .Attr("shared_dx: int = 0")
     .Attr("alpha: float = 1.0")
     .Attr("beta: float = 0.0")
+    .Attr("gated_dw: bool")
     .Attr("bench: int = 0")
+    .Attr("ngate: int >= 0")
     .SetShapeFn(XpropShape)
     .Doc(R"doc(
 Multiply the matrix "a" by the blocksparse matrix "b".
@@ -338,6 +350,7 @@ REGISTER_OP("BlocksparseMatmulDX")
     .Input("dy: dtype_dy")
     .Input("w: dtype_w")
     .Input("lut: int32")
+    .Input("gate: ngate * float")
     .Output("dx: dtype_dx")
     .Output("temp: int32")
     //.Output("temp2: float")
@@ -354,7 +367,9 @@ REGISTER_OP("BlocksparseMatmulDX")
     .Attr("shared: int = 0")
     .Attr("alpha: float = 1.0")
     .Attr("beta: float = 0.0")
+    .Attr("gated_dw: bool")
     .Attr("bench: int = 0")
+    .Attr("ngate: int >= 0")
     .SetShapeFn(XpropShape)
     .Doc(R"doc(
 Multiply the matrix "a" by the blocksparse matrix "b".
@@ -372,6 +387,7 @@ REGISTER_OP("BlocksparseMatmulDW")
     .Input("x: params * dtype_x")
     .Input("dy: params * dtype_dy")
     .Input("lut: int32")
+    .Input("gate: ngate * float")
     .Output("dw: dtype_dw")
     .Attr("dtype_x: {half, float, bfloat16}")
     .Attr("dtype_dy: {half, float, bfloat16}")
@@ -387,7 +403,9 @@ REGISTER_OP("BlocksparseMatmulDW")
     .Attr("shared: int = 0")
     .Attr("alpha: float = 1.0")
     .Attr("beta: float = 0.0")
+    .Attr("gated_dw: bool")
     .Attr("bench: int = 0")
+    .Attr("ngate: int >= 0")
     .SetShapeFn(UpdatShape)
     .Doc(R"doc(
 Multiply the matrix "a" by the blocksparse matrix "b".
@@ -410,7 +428,8 @@ REGISTER_OP("BlocksparseMatmulDWA")
     .Input("x: params * dtype_x")
     .Input("dy: params * dtype_dy")
     .Input("lut: int32")
-    .Input("dwi: dtype_dw")
+    .Input("dwi: dtype_dw")  // dw input to accumulate on top of
+    .Input("gate: ngate * float")
     .Output("dw: dtype_dw")
     .Attr("dtype_x: {half, float, bfloat16}")
     .Attr("dtype_dy: {half, float, bfloat16}")
@@ -426,7 +445,9 @@ REGISTER_OP("BlocksparseMatmulDWA")
     .Attr("shared: int = 0")
     .Attr("alpha: float = 1.0")
     .Attr("beta: float = 1.0")
+    .Attr("gated_dw: bool")
     .Attr("bench: int = 0")
+    .Attr("ngate: int >= 0")
     .SetShapeFn([](InferenceContext* ctx) {
       ctx->set_output(0, ctx->input(ctx->num_inputs()-1) );
       return Status::OK();
@@ -485,9 +506,9 @@ class BlocksparseMatmulIdentityInitOp : public OpKernel {
         float*   w_ptr = w->flat<float>().data();
     const int* lut_ptr = ctx->input(0).flat<int32>().data();
 
-    CUstream cu_stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
-    IdentityInitCK(cu_stream, w_ptr, lut_ptr, CB_, KB_, blocks_, bshift_);
+    IdentityInitCK(stream, w_ptr, lut_ptr, CB_, KB_, blocks_, bshift_);
   }
  private:
 

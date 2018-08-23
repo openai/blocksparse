@@ -4,8 +4,8 @@
 #include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
-// #include "tensorflow/core/platform/stream_executor.h"
-// #include "tensorflow/stream_executor/cuda/cuda_stream.h"
+#include "tensorflow/core/platform/stream_executor.h"
+#include "tensorflow/stream_executor/cuda/cuda_stream.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,7 +20,7 @@ using namespace tensorflow;
 using shape_inference::DimensionHandle;
 using shape_inference::InferenceContext;
 using shape_inference::ShapeHandle;
-// using perftools::gputools::cuda::AsCUDAStreamValue;
+using perftools::gputools::cuda::CUDAStream;
 
 Status GetKernel(std::string& kernel_name, CUfunction* kernel);
 
@@ -319,7 +319,7 @@ class BlocksparseConvOp : public OpKernel {
 
     OP_REQUIRES_OK(ctx, GetKernel(kernel_name_, &kernel_));
 
-    CUstream cu_stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
     void *args[] = {
       &grid_ptr, &mpq_ptr, &ck_ptr, &c_ptr, &a_ptr, &b_ptr, &alpha,
@@ -329,7 +329,7 @@ class BlocksparseConvOp : public OpKernel {
     CUresult res;
     if (zero > 0)
     {
-      res = cuMemsetD8Async(c_ptr, 0, zero, cu_stream);
+      res = cuMemsetD8Async(c_ptr, 0, zero, stream);
       if (res != CUDA_SUCCESS)
       {
         const char* errstr;
@@ -337,7 +337,7 @@ class BlocksparseConvOp : public OpKernel {
         OP_REQUIRES(ctx, false, errors::Internal("cuMemsetD8Async Error: ", errstr, " bytes: ", zero));
       }
     }
-    res = cuLaunchKernel(kernel_, gridX, gridY, 1, threads_, 1, 1, share_, cu_stream, args, NULL);
+    res = cuLaunchKernel(kernel_, gridX, gridY, 1, threads_, 1, 1, share_, stream, args, NULL);
     if (res != CUDA_SUCCESS)
     {
       const char* errstr;
@@ -353,7 +353,7 @@ class BlocksparseConvOp : public OpKernel {
     }
     if (debug_)
     {
-      res = cuStreamSynchronize(cu_stream);
+      res = cuStreamSynchronize(stream);
       if (res != CUDA_SUCCESS)
       {
         const char* errstr;

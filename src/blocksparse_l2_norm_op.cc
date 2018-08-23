@@ -4,8 +4,8 @@
 #include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
-// #include "tensorflow/core/platform/stream_executor.h"
-// #include "tensorflow/stream_executor/cuda/cuda_stream.h"
+#include "tensorflow/core/platform/stream_executor.h"
+#include "tensorflow/stream_executor/cuda/cuda_stream.h"
 #include "gpu_types.h"
 
 
@@ -14,8 +14,7 @@ using namespace tensorflow;
 using shape_inference::DimensionHandle;
 using shape_inference::InferenceContext;
 using shape_inference::ShapeHandle;
-
-// using perftools::gputools::cuda::AsCUDAStreamValue;
+using perftools::gputools::cuda::CUDAStream;
 
 template <typename TY, typename TX> bool L2NormalizeKCTRS(CUstream stream, TY* y, float* sum_sqr_x, const TX* x, const float* g, const int* lut, float epsilon, int K);
 template <typename TY, typename TX> bool L2NormalizeCKTRS(CUstream stream, TY* y, float* sum_sqr_x, const TX* x, const float* g, const int* lut, float epsilon, int K, int TRS, int magic_TRS, int shift_TRS);
@@ -105,7 +104,7 @@ class L2NormalizeKCTRSOp : public OpKernel {
     const    VX*     x_ptr = (const VX*)x.flat<TX>().data();
     const   int*   lut_ptr = lut.flat<int32>().data();
 
-    CUstream stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
     this->L2Normalize(stream, y_ptr, sum_x_ptr, x_ptr, lut_ptr, epsilon_, K_);
   }
@@ -241,7 +240,7 @@ class L2NormalizeGainKCTRSOp : public OpKernel {
     const float*     g_ptr = g.flat<float>().data();
     const   int*   lut_ptr = lut.flat<int32>().data();
 
-    CUstream stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
     this->L2Normalize(stream, y_ptr, sum_x_ptr, x_ptr, g_ptr, lut_ptr, epsilon_, K_);
   }
@@ -386,7 +385,7 @@ class L2NormalizeGradKCTRSOp : public OpKernel {
     const   int*    lut_ptr = lut.flat<int32>().data();
              VX* grad_x_ptr = (VX*)grad_x->flat<TX>().data();
 
-    CUstream stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
     this->L2NormalizeGrad(stream, grad_x_ptr, grad_y_ptr, x_ptr, sum_x_ptr, lut_ptr, epsilon_, K_);
   }
@@ -535,7 +534,7 @@ class L2NormalizeGainGradKCTRSOp : public OpKernel {
              VX* grad_x_ptr = (VX*)grad_x->flat<TX>().data();
           float* grad_g_ptr = grad_g->flat<float>().data();
 
-    CUstream stream = NULL; // AsCUDAStreamValue(ctx->op_device_context()->stream());
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
     this->L2NormalizeGrad(stream, grad_x_ptr, grad_g_ptr, grad_y_ptr, x_ptr, g_ptr, sum_x_ptr, lut_ptr, epsilon_, K_);
   }

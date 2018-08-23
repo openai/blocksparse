@@ -4,111 +4,106 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import sys
 import numpy as np
 import tensorflow as tf
-from operator import mul
-
-if sys.version_info >= (3, 0):
-    from functools import reduce
-
-from blocksparse.conv import cwise_linear, cwise_linear_test, cwise_linear_grad_test
+from time import time
+from blocksparse.conv  import cwise_linear
+from blocksparse.ewops import float_cast
 
 ones = 0
 out  = 0
+shapes = [
+    [  1, 32, 32        ],
+    [ 64, 64, 32        ],
+    [  8, 64,  4,  4    ],
+    [  8, 64, 16, 16    ],
+    [  8, 64, 32, 32    ],
+    [  8, 64,  8,  8, 8 ],
+]
 
-class BlocksparseConvTest(tf.test.TestCase):
+class CWiseLinearTest(tf.test.TestCase):
 
-    def testBlocksparseConv(self):
+    def testCWiseLinear(self):
 
-        config = tf.ConfigProto()
-        config.gpu_options.allow_growth=True
+        config = tf.ConfigProto(
+            intra_op_parallelism_threads=1,
+            inter_op_parallelism_threads=1)
         with self.test_session(config=config) as sess:
-            with tf.device("/gpu:0"):
 
-                for i, shape in enumerate( ((1,32,32),(64,64,32),(8,64,4,4),(8,64,16,16),(8,64,32,32),(8,64,8,8,8),) ):
+            for shape in (shapes):
 
-                    DHW = reduce(mul, shape[2:], 1)
+                bshape    = [1] * len(shape)
+                bshape[1] = shape[1]
 
-                    for dtypeF, dtypeB in ((np.float32, np.float32), (np.float16, np.float16),  ): #, (np.float16, np.float16), (np.float16, np.float32),
-                        dtypeF = np.dtype(dtypeF) # Forward + Normalized Weights
-                        dtypeB = np.dtype(dtypeB) # Backwards
+                if ones:
+                    cpuX = np.ones(shape,  dtype=np.float32)
+                    cpuE = np.ones(shape,  dtype=np.float32)
+                    cpuG = np.ones(bshape, dtype=np.float32)
+                    cpuB = np.ones(bshape, dtype=np.float32)
+                else:
+                    np.random.seed(int(time()))
+                    cpuX = np.random.uniform(-1.0, 1.0, shape).astype(np.float32)
+                    cpuE = np.random.uniform(-1.0, 1.0, shape).astype(np.float32)
+                    cpuG = np.random.uniform(-1.0, 1.0, bshape).astype(np.float32)
+                    cpuB = np.random.uniform(-1.0, 1.0, bshape).astype(np.float32)
 
-                        rtol = 1e-4 if dtypeF.type is np.float32 else 1e-1
+                for dtype in (tf.float32, tf.float16, ):  # tf.float32, tf.float16, tf.bfloat16
+                    relus = (True, False) if dtype is tf.float32 else (False,)
+                    for relu in relus:
 
-                        with tf.variable_scope("F%dB%d" % (dtypeF.itemsize, dtypeB.itemsize)):
+                        results = []
+                        for device in ("gpu", "cpu"):
 
-                            if ones:
-                                cpuX = np.ones(shape)
-                                cpuE = np.ones(shape)
-                                cpuA = np.ones(shape[1])
-                                cpuB = np.ones(shape[1])
-                            else:
-                                cpuX = np.random.uniform(-1.0, 1.0, shape)
-                                cpuE = np.random.uniform(-1.0, 1.0, shape)
-                                cpuA = np.random.uniform(-1.0, 1.0, shape[1])
-                                cpuB = np.random.uniform(-1.0, 1.0, shape[1])
+                            cast = device == "gpu" and dtype is not tf.float32
 
-                            devX = tf.constant(cpuX.astype(dtypeF))
-                            devE = tf.constant(cpuE.astype(dtypeB))
-                            devA = tf.constant(cpuA.astype(np.float32))
-                            devB = tf.constant(cpuB.astype(np.float32))
+                            with tf.device("/%s:0" % device), tf.name_scope(device):
 
-                            # compute in numpy
-                            cpuY0 = cwise_linear_test(cpuX, a=cpuA, b=cpuB)
-                            cpuDX0, cpuDA0, cpuDB0 = cwise_linear_grad_test(cpuE, cpuX, a=cpuA)
+                                x = tf.placeholder(tf.float32, cpuX.shape, name="x")
+                                e = tf.placeholder(tf.float32, cpuE.shape, name="e")
+                                g = tf.placeholder(tf.float32, cpuG.shape, name="g")
+                                b = tf.placeholder(tf.float32, cpuB.shape, name="b")
 
-                            cpuY1 = cwise_linear_test(cpuX, a=cpuA)
-                            cpuDX1, cpuDA1, _ = cwise_linear_grad_test(cpuE, cpuX, a=cpuA)
+                                feed_dict = {
+                                    x : cpuX,
+                                    e : cpuE,
+                                    g : cpuG,
+                                    b : cpuB,
+                                }
 
-                            cpuY2 = cwise_linear_test(cpuX, b=cpuB)
-                            cpuDX2, _, cpuDB2 = cwise_linear_grad_test(cpuE, cpuX)
+                                xf = float_cast(x, dtype=dtype) if cast else x
 
-                            # compute in tensorflow
-                            fprop0 = cwise_linear(devX, a=devA, b=devB)
-                            devY0 = sess.run( fprop0 )
-                            devDX0, devDA0, devDB0 = sess.run( tf.gradients(fprop0, [devX, devA, devB], devE) )
+                                y0 = cwise_linear(xf, gain=g, bias=b, relu=relu)
+                                y1 = cwise_linear(xf, gain=g,         relu=relu)
+                                y2 = cwise_linear(xf,         bias=b, relu=relu)
 
-                            fprop1 = cwise_linear(devX, a=devA)
-                            devY1 = sess.run( fprop1 )
-                            devDX1, devDA1 = sess.run( tf.gradients(fprop1, [devX, devA], devE) )
+                                if cast:
+                                    y0 = float_cast(y0, dtype=tf.float32)
+                                    y1 = float_cast(y1, dtype=tf.float32)
+                                    y2 = float_cast(y2, dtype=tf.float32)
 
-                            fprop2 = cwise_linear(devX, b=devB)
-                            devY2 = sess.run( fprop2 )
-                            devDX2, devDB2 = sess.run( tf.gradients(fprop2, [devX, devB], devE) )
+                                dx0, dg0, db0 = tf.gradients(y0, [ x, g, b ], e)
+                                dx1, dg1      = tf.gradients(y1, [ x, g    ], e)
+                                dx2,      db2 = tf.gradients(y2, [ x,    b ], e)
 
-                            for op, devT, cpuT, reshape in (
-                                (" devY0", devY0,  cpuY0,  (-1, DHW)),
-                                ("devDX0", devDX0, cpuDX0, (-1, DHW)),
-                                ("devDA0", devDA0, cpuDA0, shape[1]),
-                                ("devDB0", devDB0, cpuDB0, shape[1]),
-                                (" devY1", devY1,  cpuY1,  (-1, DHW)),
-                                ("devDX1", devDX1, cpuDX1, (-1, DHW)),
-                                ("devDA1", devDA1, cpuDA1, shape[1]),
-                                (" devY2", devY2,  cpuY2,  (-1, DHW)),
-                                ("devDX2", devDX2, cpuDX2, (-1, DHW)),
-                                ("devDB2", devDB2, cpuDB2, shape[1]),):
+                                results.append( sess.run( [ y0, y1, y2, dx0, dg0, db0, dx1, dg1, dx2, db2 ], feed_dict ) )
+                                labels = ["y0", "y1", "y2", "dx0", "dg0", "db0", "dx1", "dg1", "dx2", "db2"]
 
-                                devT = np.array(devT)
-                                difA = cpuT - devT
+                        for op, dev, cpu in zip(labels, results[0], results[1]):
 
-                                avgval = abs(cpuT).sum() / cpuT.size
-                                maxdif = abs(difA).max()
-                                ratio  = maxdif / avgval
+                            dif     = np.abs(cpu - dev)
+                            avgval  = np.average(abs(cpu))
+                            maxdif  = dif.max()
+                            max_err = maxdif if avgval == 0 else maxdif / avgval
+                            l2_err  = np.sqrt(np.square(dif).sum()) / np.sqrt(np.square(cpu).sum())
 
-                                print("dtypeF:f%d, dtypeB:f%d, shape:%s, op:%s err:%17.12f" % (dtypeF.itemsize, dtypeB.itemsize, str(shape), op, ratio))
+                            print("%s, shape:%16s, op: %3s, relu:%d, err:%17.12f, l2_err:%17.12f" % (dtype.name, str(cpu.shape), op, int(relu), max_err, l2_err))
 
-                                # print(devT[0,0,:,:])
-                                # print(cpuT[0,0,:,:])
-                                # exit()
+                            # if out:
+                            #     np.savetxt("out.txt",  difA.reshape(reshape), fmt='%5.2f')
+                            #     np.savetxt("outC.txt", cpuT.reshape(reshape), fmt='%5.2f')
+                            #     np.savetxt("outD.txt", devT.reshape(reshape), fmt='%5.2f')
+                            #     exit()
 
-                                if out:
-                                    np.savetxt("out.txt",  difA.reshape(reshape), fmt='%5.2f')
-                                    np.savetxt("outC.txt", cpuT.reshape(reshape), fmt='%5.2f')
-                                    np.savetxt("outD.txt", devT.reshape(reshape), fmt='%5.2f')
-                                    exit()
-
-                                self.assertAllClose(devT, cpuT, rtol=rtol, atol=rtol)
 
 
 if __name__ == "__main__":

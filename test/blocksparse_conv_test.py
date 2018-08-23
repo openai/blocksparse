@@ -43,15 +43,15 @@ BCK_overlap  =  [
                 ]
 
 configs = [
-    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,1), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,1), padding="VALID", edge_bias=False),
-    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME",  edge_bias=True),
-    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,5), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME",  edge_bias=True),
-    dict(clss=BlocksparseConv,   BCK=BCK_overlap,  TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,2), strides=(1,1,1), padding="SAME",  edge_bias=True),
-    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME",  edge_bias=True),
-    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,3,3), DHW=(1,8, 8), dilates=(1,1,1), strides=(1,1,1), padding="SAME",  edge_bias=True),
-    dict(clss=BlocksparseConv,   BCK=BCK_overlap,  TRS=(1,3,3), DHW=(1,8, 8), dilates=(1,1,1), strides=(1,1,1), padding="VALID", edge_bias=False),
-    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(3,3,3), DHW=(4,4, 4), dilates=(1,1,1), strides=(1,1,1), padding="SAME",  edge_bias=True),
-    dict(clss=BlocksparseDeconv, BCK=BCK_diagonal, TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME",  edge_bias=True),
+    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,1), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,1), padding="VALID",),
+    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME", ),
+    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,5), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME", ),
+    dict(clss=BlocksparseConv,   BCK=BCK_overlap,  TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,2), strides=(1,1,1), padding="SAME", ),
+    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME", ),
+    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(1,3,3), DHW=(1,8, 8), dilates=(1,1,1), strides=(1,1,1), padding="SAME", ),
+    dict(clss=BlocksparseConv,   BCK=BCK_overlap,  TRS=(1,3,3), DHW=(1,8, 8), dilates=(1,1,1), strides=(1,1,1), padding="VALID",),
+    dict(clss=BlocksparseConv,   BCK=BCK_diagonal, TRS=(3,3,3), DHW=(4,4, 4), dilates=(1,1,1), strides=(1,1,1), padding="SAME", ),
+    dict(clss=BlocksparseDeconv, BCK=BCK_diagonal, TRS=(1,1,3), DHW=(1,1,32), dilates=(1,1,1), strides=(1,1,2), padding="SAME", ),
 ]
 #def batch_norm_inf_test(x, g, b, m, v, epsilon=1e-12):
 #def batch_norm_inference(x, g, b, m, v, epsilon=1e-12):
@@ -101,15 +101,6 @@ class BlocksparseConvTest(tf.test.TestCase):
                                 devG  = tf.constant(cpuG)
                                 devB  = tf.constant(cpuB)
 
-                                if bs_conv_op.edgeBiasDim:
-                                    if ones:
-                                        cpuEB = np.ones(bs_conv_op.edge_bias_shape(), dtype=np.float32)
-                                    else:
-                                        cpuEB = np.random.uniform(-1.0, 1.0, bs_conv_op.edge_bias_shape()).astype(np.float32)
-                                    devEB = tf.constant(cpuEB)
-                                else:
-                                    cpuEB = devEB = None
-
                                 for N in [1,2,28,]: #
                                     with tf.name_scope("N%d" % N):
                                         if ones:
@@ -128,23 +119,17 @@ class BlocksparseConvTest(tf.test.TestCase):
                                     tests = list()
 
                                     # Conv and edge bias
-                                    cpuO        = bs_conv_op.fprop_test(cpuF, cpuI, edge_bias=cpuEB)
-                                    cpuZ        = bs_conv_op.bprop_test(cpuF, cpuE)
-                                    cpuU, cpuDB = bs_conv_op.updat_test(cpuE, cpuI)
+                                    cpuO = bs_conv_op.fprop_test(cpuF, cpuI)
+                                    cpuZ = bs_conv_op.bprop_test(cpuF, cpuE)
+                                    cpuU = bs_conv_op.updat_test(cpuE, cpuI)
 
-                                    op   = bs_conv_op(devF, devI, edge_bias=devEB)
+                                    op   = bs_conv_op(devF, devI)
                                     devO = sess.run( op )
-                                    if cpuEB is None:
-                                        devZ, devU        = sess.run( tf.gradients(op, [devI, devF       ], devE) )
-                                    else:
-                                        devZ, devU, devDB = sess.run( tf.gradients(op, [devI, devF, devEB], devE) )
+                                    devZ, devU = sess.run( tf.gradients(op, [devI, devF], devE) )
 
                                     tests.append( ("conv fprop", devO, cpuO, N*K) )
                                     tests.append( ("conv bprop", devZ, cpuZ, N*C) )
                                     tests.append( ("conv updat", devU, cpuU, 1) )
-                                    if cpuEB is not None:
-                                        tests.append( ("edge dbias", devDB, cpuDB, K) )
-
 
                                     # L2 Norm without Gain
                                     if bs_conv_op.overlapK:

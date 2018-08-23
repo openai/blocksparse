@@ -13,12 +13,14 @@ from blocksparse.matmul import BlocksparseMatMul, SparseProj, group_param_grads
 import blocksparse.ewops as ew
 import networkx
 
+ew.replace_add_n()
+
 np.set_printoptions(threshold=8193, linewidth=600, formatter={'int':lambda x: "%4d" % x,'float':lambda x: "%8.6f" % x})
 
 dtypes = [
     (tf.float32,  tf.float32),
-    # (tf.float16,  tf.float16),
-    #(tf.bfloat16, tf.bfloat16),
+    #(tf.float16,  tf.float16),
+    (tf.bfloat16, tf.bfloat16),
     #(tf.float16,  tf.float32),
     #(tf.bfloat16, tf.float32),
 ]
@@ -110,8 +112,7 @@ class BlocksparseMatMulTest(tf.test.TestCase):
                 max_err = maxdif if avgval == 0 else maxdif / avgval
 
                 l2_err = np.sqrt(np.square(difA).sum()) / np.sqrt(np.square(cpuA).sum())
-
-                print("%s max_err%%:%10.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
+                print("%s max_err%%:%11.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
 
                 if out:
                     np.savetxt("out.txt",  difA, fmt='%5.1f')
@@ -160,7 +161,114 @@ class BlocksparseMatMulTest(tf.test.TestCase):
 
                 l2_err = np.sqrt(np.square(difY).sum()) / np.sqrt(np.square(Y).sum())
 
-                print("cpu max_err%%: %10.8f L2_err: %12.10f" % (100*max_err, l2_err))
+                print("cpu max_err%%: %11.8f L2_err: %12.10f" % (100*max_err, l2_err))
+
+    def atestBlocksparseMatMulGated(self):
+
+        with self.test_session(config=conf) as sess, tf.device("/gpu:0"):
+
+            N = 128
+            K = 8*56*2*4
+            n = K//8
+            m = 30
+            dtype = tf.bfloat16
+            repeat = 10000
+
+            layout = networkx.generators.barabasi_albert_graph(n, m)
+            layout = networkx.adjacency_matrix(layout).toarray().astype(np.int32) + np.eye(n, dtype=np.int32)
+            layout[0:m,0:m] = 1
+
+            blocks = layout.sum()
+            n = layout.shape[0]
+            print(100 * blocks / n**2)
+            print(layout.sum(axis=0).max())
+
+            # layout = np.ones((112,32), dtype=np.int32)
+            bsmm = BlocksparseMatMul(layout, block_size=8, feature_axis=0, name="test")
+
+            if one:
+                X = np.ones(bsmm.i_shape(N), dtype=np.float32)
+                E = np.ones(bsmm.o_shape(N), dtype=np.float32)
+                W = np.ones(bsmm.w_shape   , dtype=np.float32)
+                G = np.ones(bsmm.blocks    , dtype=np.float32)
+            else:
+                X = np.random.uniform(-1.0, 1.0, bsmm.i_shape(N)).astype(np.float32)
+                E = np.random.uniform(-1.0, 1.0, bsmm.o_shape(N)).astype(np.float32)
+                W = np.random.uniform(-1.0, 1.0, bsmm.w_shape   ).astype(np.float32)
+                G = np.random.uniform( 0.0, 1.0, bsmm.blocks    ).astype(np.float32)
+
+            G = np.ones(bsmm.blocks, dtype=np.float32)
+            # for w, (c, k) in enumerate(bsmm.updat_list):
+            #     G[w] = (c & 1) ^ (k & 1) ^ 1
+
+            #G[::2] = 0.0
+
+            # block = dict()
+            # for w, (c, k) in enumerate(bsmm.updat_list):
+            #     block[(c,k)] = w
+
+            # grid = []
+            # for c in range(bsmm.CB):
+            #     row = []
+            #     for k in range(bsmm.KB):
+            #         row.append(G[block[(c,k)]])
+            #     grid.append(row)
+
+            # for row in grid:
+            #     print(row)
+
+            # exit()
+
+
+            x = tf.constant(X)
+            e = tf.constant(E)
+            w = tf.constant(W)
+            g = tf.constant(G)
+
+            w2 = ew.float_cast(w, dtype=dtype)
+            y  = ew.float_cast(x, dtype=dtype)
+
+            y = bsmm(y, w2, gate=g, bench=repeat)
+
+            y = ew.float_cast(y, dtype=tf.float32, dx_dtype=dtype)
+
+            d = tf.gradients(y, [x, w], e)
+
+            y, (dx, dw) = sess.run( [y, d] )
+
+            # gpu kernel doesn't touch zero gate blocks
+            # for b in range(bsmm.blocks):
+            #     if G[b] == 0.0:
+            #         dw[b,:,:] = 0.0
+
+            Y  = bsmm.fprop_test(X, W, gate=G)
+            DX = bsmm.bprop_test(E, W, gate=G)
+            DW = bsmm.updat_test(X, E, gate=G)
+
+            #print(Y.shape, dtype)
+
+            for op, cpuA, devA in (
+                (" y:",  Y,  y),
+                ("dx:", DX, dx),
+                ("dw:", DW, dw),):
+
+                difA = abs(cpuA - devA)
+
+                avgval  = np.average(abs(cpuA))
+                maxdif  = difA.max()
+                max_err = maxdif if avgval == 0 else maxdif / avgval
+
+                l2_err = np.sqrt(np.square(difA).sum()) / np.sqrt(np.square(cpuA).sum() + 1e-12)
+
+                print("%s max_err%%:%11.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
+
+                if out:
+                    dim = K if op == "dw:" else N
+                    np.savetxt("out.txt",  difA.reshape((-1,dim)), fmt='%5.1f')
+                    np.savetxt("outC.txt", cpuA.reshape((-1,dim)), fmt='%5.1f')
+                    np.savetxt("outD.txt", devA.reshape((-1,dim)), fmt='%5.1f')
+                    exit()
+
 
 
     def testBlocksparseMatMul(self):
@@ -175,9 +283,9 @@ class BlocksparseMatMulTest(tf.test.TestCase):
         layout[0:m,0:m] = 1
 
         #layout[0:60,0:60] = 1
-        #layout = np.ones((112,112), dtype=np.int32)
+        #layout = np.zeros((4,4), dtype=np.int32)
         #layout = np.ones((28*12,28*12), dtype=np.int32)
-        # layout[0,0] = 1
+        #layout[0,0] = 1
 
         blocks = layout.sum()
         n = layout.shape[0]
@@ -187,7 +295,7 @@ class BlocksparseMatMulTest(tf.test.TestCase):
 
         with self.test_session(config=conf) as sess, tf.device("/gpu:0"):
 
-            for bsize, axis in ( (32,1), (32,0), (16,0), (8,0), ): # (32,0), (16,0), (8,0)
+            for bsize, axis in ( (32,1), (32,0), (16,0), (8,0), ): # (32,1), (32,0), (16,0), (8,0)
 
                 bsmm = BlocksparseMatMul(layout, block_size=bsize, feature_axis=axis, name="test")
 
@@ -293,7 +401,7 @@ class BlocksparseMatMulTest(tf.test.TestCase):
 
                                 #print("max_err: %5.3f, max_val: %7.3f, l1_err: %7.5f, l2_err: %7.5f" % (difO.max(), cpuO.max(), l1_err, l2_err))
 
-                                print("%s max_err%%:%10.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
+                                print("%s max_err%%:%11.8f L2_err: %12.10f" % (op, 100*max_err, l2_err))
 
                                 # rtol = 1e-4 if dtF is tf.float32 else 1e-1
                                 # self.assertAllClose(devA, cpuA, rtol=rtol, atol=rtol)

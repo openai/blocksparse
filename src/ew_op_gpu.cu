@@ -1,7 +1,7 @@
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 #include "ew_op_gpu.h"
+#include <stdio.h>
 
 // Forward Kernels
 #define OP_Z_XY(func, op)                   \
@@ -395,7 +395,7 @@ bool EW_Backward(CUstream stream,
     const float* g,
     float alpha, int size, int N, int op)
 {
-    if ((size & 3) == 0 && size >= 256)
+    if ((size & 3) == 0 && size >= 16384)
     {
         size >>= 2; // use vector loads
         int grid64 = (size >> 6) + ((size & 63) != 0); // 1 warp with 2 unrolls
@@ -467,17 +467,17 @@ bool EW_Backward<float,float,float4,float4>(CUstream stream,
     const float* g,
     float alpha, int size, int N, int op);
 
-template
-bool EW_Backward<float,ehalf,float4,ehalf4>(CUstream stream,
-          float* dx,
-          float* dy,
-          float* db,
-    const float* dz,
-    const ehalf* x,
-    const ehalf* y,
-    const ehalf* z,
-    const float* g,
-    float alpha, int size, int N, int op);
+// template
+// bool EW_Backward<float,ehalf,float4,ehalf4>(CUstream stream,
+//           float* dx,
+//           float* dy,
+//           float* db,
+//     const float* dz,
+//     const ehalf* x,
+//     const ehalf* y,
+//     const ehalf* z,
+//     const float* g,
+//     float alpha, int size, int N, int op);
 
 template
 bool EW_Backward<ehalf,ehalf,ehalf4,ehalf4>(CUstream stream,
@@ -503,438 +503,17 @@ bool EW_Backward<bhalf,bhalf,bhalf4,bhalf4>(CUstream stream,
     const float* g,
     float alpha, int size, int N, int op);
 
-template
-bool EW_Backward<float,bhalf,float4,bhalf4>(CUstream stream,
-          float* dx,
-          float* dy,
-          float* db,
-    const float* dz,
-    const bhalf* x,
-    const bhalf* y,
-    const bhalf* z,
-    const float* g,
-    float alpha, int size, int N, int op);
-
-template <typename T, typename V>
-__global__ void __launch_bounds__(32) LSTM_Forward(
-          T*              C_next,
-          T*              H_next,
-    const T* __restrict__ C_prev,
-    const T* __restrict__ H_prev,
-    int K, int K4)
-{
-    int tid = threadIdx.x;
-    int k   = blockIdx.x;
-    int n   = blockIdx.y;
-
-    int k4 = k*32 + tid;
-    int x0 = n*K + k4;
-    int x1 = x0 + K4;
-    int x2 = x1 + K4;
-    int x3 = x2 + K4;
-    int  z = n*K4 + k4;
-    bool b = k4 < K4;
-
-    V c = load(C_prev,  z, b);
-    V i = load(H_prev, x0, b);
-    V f = load(H_prev, x1, b);
-    V o = load(H_prev, x2, b);
-    V u = load(H_prev, x3, b);
-
-    V sig_i = ew_sig(i);
-    V sig_f = ew_sig(f);
-    V sig_o = ew_sig(o);
-    V tan_u = ew_tanh(u);
-
-    V c_nxt = ew_add(ew_mul(sig_f, c), ew_mul(sig_i, tan_u));
-    V c_act = ew_tanh(c_nxt);
-    V h_nxt = ew_mul(sig_o, c_act);
-
-    store_f(C_next, c_nxt, z, b);
-    store_f(H_next, h_nxt, z, b);
-}
-template <typename T, typename V>
-__global__ void __launch_bounds__(32) LSTM4_Forward(
-          T*              C_next,
-          T*              H_next,
-    const T* __restrict__ C,
-    const T* __restrict__ I,
-    const T* __restrict__ F,
-    const T* __restrict__ O,
-    const T* __restrict__ U,
-    int size)
-{
-    int tid = threadIdx.x;
-    int   x = blockIdx.x*32 + tid;
-    bool  b = x < size;
-
-    V c = load(C, x, b);
-    V i = load(I, x, b);
-    V f = load(F, x, b);
-    V o = load(O, x, b);
-    V u = load(U, x, b);
-
-    V sig_i = ew_sig(i);
-    V sig_f = ew_sig(f);
-    V sig_o = ew_sig(o);
-    V tan_u = ew_tanh(u);
-
-    V c_nxt = ew_add(ew_mul(sig_f, c), ew_mul(sig_i, tan_u));
-    V c_act = ew_tanh(c_nxt);
-    V h_nxt = ew_mul(sig_o, c_act);
-
-    store_f(C_next, c_nxt, x, b);
-    store_f(H_next, h_nxt, x, b);
-}
-template <typename B, typename F, typename V>
-__global__ void __launch_bounds__(32) LSTM_Backward(
-          B*              DC,
-          B*              DH,
-    const B* __restrict__ EC,
-    const B* __restrict__ EH,
-    const F* __restrict__ C_prev,
-    const F* __restrict__ H_prev,
-    int K, int K4, int ec_valid)
-{
-    int tid = threadIdx.x;
-    int k   = blockIdx.x;
-    int n   = blockIdx.y;
-
-    int k4 = k*32 + tid;
-    int x0 = n*K + k4;
-    int x1 = x0 + K4;
-    int x2 = x1 + K4;
-    int x3 = x2 + K4;
-    int  z = n*K4 + k4;
-    bool b = k4 < K4;
-
-    V  i = load(H_prev, x0, b);
-    V  f = load(H_prev, x1, b);
-    V  o = load(H_prev, x2, b);
-    V  u = load(H_prev, x3, b);
-    V  c = load(C_prev,  z, b);
-    V eh = load(EH, z, b);
-    V ec = load(EC, z, b && ec_valid);
-
-    V sig_i = ew_sig(i);
-    V sig_f = ew_sig(f);
-    V sig_o = ew_sig(o);
-    V tan_u = ew_tanh(u);
-
-    V c_nxt = ew_add(ew_mul(sig_f, c), ew_mul(sig_i, tan_u));
-    V c_act = ew_tanh(c_nxt);
-
-    V dC = ew_add(ew_tanh_grad(ew_mul(eh, sig_o), c_act), ec);
-    V dI = ew_sig_grad(ew_mul(dC, tan_u), sig_i);
-    V dF = ew_sig_grad(ew_mul(dC,     c), sig_f);
-    V dO = ew_sig_grad(ew_mul( eh, c_act), sig_o);
-    V dU = ew_tanh_grad(ew_mul(dC, sig_i), tan_u);
-    dC = ew_mul(dC, sig_f);
-
-    store_g(DC, dC,  z, b);
-    store_g(DH, dI, x0, b);
-    store_g(DH, dF, x1, b);
-    store_g(DH, dO, x2, b);
-    store_g(DH, dU, x3, b);
-}
-template <typename B, typename A, typename V>
-__global__ void __launch_bounds__(32) LSTM4_Backward(
-          B*              DC,
-          B*              DI,
-          B*              DF,
-          B*              DO,
-          B*              DU,
-    const B* __restrict__ EC,
-    const B* __restrict__ EH,
-    const A* __restrict__ C,
-    const A* __restrict__ I,
-    const A* __restrict__ F,
-    const A* __restrict__ O,
-    const A* __restrict__ U,
-    int size, int ec_valid)
-{
-    int tid = threadIdx.x;
-    int   x = blockIdx.x*32 + tid;
-    bool  b = x < size;
-
-    V  c = load(C, x, b);
-    V  i = load(I, x, b);
-    V  f = load(F, x, b);
-    V  o = load(O, x, b);
-    V  u = load(U, x, b);
-    V eh = load(EH, x, b);
-    V ec = load(EC, x, b && ec_valid);
-
-    V sig_i = ew_sig(i);
-    V sig_f = ew_sig(f);
-    V sig_o = ew_sig(o);
-    V tan_u = ew_tanh(u);
-
-    V c_nxt = ew_add(ew_mul(sig_f, c), ew_mul(sig_i, tan_u));
-    V c_act = ew_tanh(c_nxt);
-
-    V dC = ew_add(ew_tanh_grad(ew_mul(eh, sig_o), c_act), ec);
-    V dI = ew_sig_grad(ew_mul(dC, tan_u), sig_i);
-    V dF = ew_sig_grad(ew_mul(dC,     c), sig_f);
-    V dO = ew_sig_grad(ew_mul( eh, c_act), sig_o);
-    V dU = ew_tanh_grad(ew_mul(dC, sig_i), tan_u);
-    dC = ew_mul(dC, sig_f);
-
-    store_g(DC, dC, x, b);
-    store_g(DI, dI, x, b);
-    store_g(DF, dF, x, b);
-    store_g(DO, dO, x, b);
-    store_g(DU, dU, x, b);
-}
-
-template <typename T, typename V>
-bool LSTM_Gates_Forward(CUstream stream, T* c_next, T* h_next, const T* c_prev, const T* h_prev, int N, int K)
-{
-    int K4 = K >> 2;
-    if ((K4 & 3) == 0)
-    {
-        K  >>= 2; // use vector loads
-        K4 >>= 2;
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-
-        V* C_next = (V*)c_next;
-        V* H_next = (V*)h_next;
-        const V* C_prev = (const V*)c_prev;
-        const V* H_prev = (const V*)h_prev;
-        LSTM_Forward<V,float4><<<grid,32,0,stream>>>(C_next, H_next, C_prev, H_prev, K, K4);
-    }
-    else
-    {
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-        LSTM_Forward<T,float ><<<grid,32,0,stream>>>(c_next, h_next, c_prev, h_prev, K, K4);
-    }
-    return true;
-}
-template <typename T, typename V>
-bool LSTM4_Gates_Forward(CUstream stream, T* c_next, T* h_next, const T* c, const T* i, const T* f, const T* o, const T* u, int N, int K)
-{
-    int size = N * K;
-    if ((size & 3) == 0)
-    {
-        size >>= 2; // use vector loads
-        int grid = (size >> 5) + ((size & 31) != 0);
-
-        V* C_next = (V*)c_next;
-        V* H_next = (V*)h_next;
-        const V* C = (const V*)c;
-        const V* I = (const V*)i;
-        const V* F = (const V*)f;
-        const V* O = (const V*)o;
-        const V* U = (const V*)u;
-        LSTM4_Forward<V,float4><<<grid,32,0,stream>>>(C_next, H_next, C, I, F, O, U, size);
-    }
-    else
-    {
-        int grid = (size >> 5) + ((size & 31) != 0);
-        LSTM4_Forward<T,float ><<<grid,32,0,stream>>>(c_next, h_next, c, i, f, o, u, size);
-    }
-    return true;
-}
-template <typename B, typename F, typename VB, typename VF>
-bool LSTM_Gates_Backward(CUstream stream, B* dc, B* dh, const B* ec, const B* eh, const F* c_prev, const F* h_prev, int N, int K)
-{
-    int K4 = K >> 2;
-    if ((K4 & 3) == 0)
-    {
-        K  >>= 2; // use vector loads
-        K4 >>= 2;
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-
-              VB* DC     = (      VB*)dc;
-              VB* DH     = (      VB*)dh;
-        const VB* EC     = (const VB*)ec;
-        const VB* EH     = (const VB*)eh;
-        const VF* C_prev = (const VF*)c_prev;
-        const VF* H_prev = (const VF*)h_prev;
-
-        LSTM_Backward<VB,VF,float4><<<grid,32,0,stream>>>(DC, DH, EC, EH, C_prev, H_prev, K, K4, ec != 0);
-    }
-    else
-    {
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-        LSTM_Backward< B, F,float ><<<grid,32,0,stream>>>(dc, dh, ec, eh, c_prev, h_prev, K, K4, ec != 0);
-    }
-    return true;
-}
-template <typename B, typename A, typename VB, typename VA>
-bool LSTM4_Gates_Backward(CUstream stream, B* dc, B* di, B* df, B* doo, B* du, const B* ec, const B* eh, const A* c, const A* i, const A* f, const A* o, const A* u, int N, int K)
-{
-    int size = N * K;
-    if ((size & 3) == 0)
-    {
-        size >>= 2; // use vector loads
-        int grid = (size >> 5) + ((size & 31) != 0);
-
-              VB* DC = (      VB*)dc;
-              VB* DI = (      VB*)di;
-              VB* DF = (      VB*)df;
-              VB* DO = (      VB*)doo;
-              VB* DU = (      VB*)du;
-        const VB* EC = (const VB*)ec;
-        const VB* EH = (const VB*)eh;
-        const VA* C  = (const VA*)c;
-        const VA* I  = (const VA*)i;
-        const VA* F  = (const VA*)f;
-        const VA* O  = (const VA*)o;
-        const VA* U  = (const VA*)u;
-
-        LSTM4_Backward<VB,VA,float4><<<grid,32,0,stream>>>(DC, DI, DF, DO, DU, EC, EH, C, I, F, O, U, size, ec != 0);
-    }
-    else
-    {
-        int grid = (size >> 5) + ((size & 31) != 0);
-        LSTM4_Backward< B, A,float ><<<grid,32,0,stream>>>(dc, di, df, doo, du, ec, eh, c, i, f, o, u, size, ec != 0);
-    }
-    return true;
-}
-
-template bool LSTM_Gates_Forward <float,float4>(CUstream stream, float* c_next, float* h_next, const float* c_prev, const float* h_prev, int N, int K);
-template bool LSTM_Gates_Forward <ehalf,ehalf4>(CUstream stream, ehalf* c_next, ehalf* h_next, const ehalf* c_prev, const ehalf* h_prev, int N, int K);
-template bool LSTM_Gates_Forward <bhalf,bhalf4>(CUstream stream, bhalf* c_next, bhalf* h_next, const bhalf* c_prev, const bhalf* h_prev, int N, int K);
-
-template bool LSTM_Gates_Backward<float,float,float4,float4>(CUstream stream, float* dc, float* dh, const float* ec, const float* eh, const float* c_prev, const float* h_prev, int N, int K);
-template bool LSTM_Gates_Backward<ehalf,ehalf,ehalf4,ehalf4>(CUstream stream, ehalf* dc, ehalf* dh, const ehalf* ec, const ehalf* eh, const ehalf* c_prev, const ehalf* h_prev, int N, int K);
-template bool LSTM_Gates_Backward<float,ehalf,float4,ehalf4>(CUstream stream, float* dc, float* dh, const float* ec, const float* eh, const ehalf* c_prev, const ehalf* h_prev, int N, int K);
-template bool LSTM_Gates_Backward<bhalf,bhalf,bhalf4,bhalf4>(CUstream stream, bhalf* dc, bhalf* dh, const bhalf* ec, const bhalf* eh, const bhalf* c_prev, const bhalf* h_prev, int N, int K);
-template bool LSTM_Gates_Backward<float,bhalf,float4,bhalf4>(CUstream stream, float* dc, float* dh, const float* ec, const float* eh, const bhalf* c_prev, const bhalf* h_prev, int N, int K);
-
-template bool LSTM4_Gates_Forward <float,float4>(CUstream stream, float* c_next, float* h_next, const float* c, const float* i, const float* f, const float* o, const float* u, int N, int K);
-template bool LSTM4_Gates_Forward <ehalf,ehalf4>(CUstream stream, ehalf* c_next, ehalf* h_next, const ehalf* c, const ehalf* i, const ehalf* f, const ehalf* o, const ehalf* u, int N, int K);
-template bool LSTM4_Gates_Forward <bhalf,bhalf4>(CUstream stream, bhalf* c_next, bhalf* h_next, const bhalf* c, const bhalf* i, const bhalf* f, const bhalf* o, const bhalf* u, int N, int K);
-
-template bool LSTM4_Gates_Backward<float,float,float4,float4>(CUstream stream, float* dc, float* di, float* df, float* doo, float* du, const float* ec, const float* eh, const float* c, const float* i, const float* f, const float* o, const float* u, int N, int K);
-template bool LSTM4_Gates_Backward<ehalf,ehalf,ehalf4,ehalf4>(CUstream stream, ehalf* dc, ehalf* di, ehalf* df, ehalf* doo, ehalf* du, const ehalf* ec, const ehalf* eh, const ehalf* c, const ehalf* i, const ehalf* f, const ehalf* o, const ehalf* u, int N, int K);
-template bool LSTM4_Gates_Backward<float,ehalf,float4,ehalf4>(CUstream stream, float* dc, float* di, float* df, float* doo, float* du, const float* ec, const float* eh, const ehalf* c, const ehalf* i, const ehalf* f, const ehalf* o, const ehalf* u, int N, int K);
-template bool LSTM4_Gates_Backward<bhalf,bhalf,bhalf4,bhalf4>(CUstream stream, bhalf* dc, bhalf* di, bhalf* df, bhalf* doo, bhalf* du, const bhalf* ec, const bhalf* eh, const bhalf* c, const bhalf* i, const bhalf* f, const bhalf* o, const bhalf* u, int N, int K);
-template bool LSTM4_Gates_Backward<float,bhalf,float4,bhalf4>(CUstream stream, float* dc, float* di, float* df, float* doo, float* du, const float* ec, const float* eh, const bhalf* c, const bhalf* i, const bhalf* f, const bhalf* o, const bhalf* u, int N, int K);
-
-
-template <typename T, typename V>
-__global__ void __launch_bounds__(32) Split4(
-          T*              Z0,
-          T*              Z1,
-          T*              Z2,
-          T*              Z3,
-    const T* __restrict__ X,
-    int K, int K4)
-{
-    int tid = threadIdx.x;
-    int k   = blockIdx.x;
-    int n   = blockIdx.y;
-
-    int k4 = k*32 + tid;
-    int i0 = n*K + k4;
-    int i1 = i0 + K4;
-    int i2 = i1 + K4;
-    int i3 = i2 + K4;
-    int  z = n*K4 + k4;
-    bool b = k4 < K4;
-
-    V x0 = load(X, i0, b);
-    V x1 = load(X, i1, b);
-    V x2 = load(X, i2, b);
-    V x3 = load(X, i3, b);
-
-    store(Z0, x0, z, b);
-    store(Z1, x1, z, b);
-    store(Z2, x2, z, b);
-    store(Z3, x3, z, b);
-}
-template <typename T, typename V>
-__global__ void __launch_bounds__(32) Concat4(
-          T*              DX,
-    const T* __restrict__ DZ0,
-    const T* __restrict__ DZ1,
-    const T* __restrict__ DZ2,
-    const T* __restrict__ DZ3,
-    int K, int K4)
-{
-    int tid = threadIdx.x;
-    int k   = blockIdx.x;
-    int n   = blockIdx.y;
-
-    int k4 = k*32 + tid;
-    int i0 = n*K + k4;
-    int i1 = i0 + K4;
-    int i2 = i1 + K4;
-    int i3 = i2 + K4;
-    int  z = n*K4 + k4;
-    bool b = k4 < K4;
-
-    V dx0 = load(DZ0, z, b);
-    V dx1 = load(DZ1, z, b);
-    V dx2 = load(DZ2, z, b);
-    V dx3 = load(DZ3, z, b);
-
-    store(DX, dx0, i0, b);
-    store(DX, dx1, i1, b);
-    store(DX, dx2, i2, b);
-    store(DX, dx3, i3, b);
-}
-
-
-template <typename T, typename V>
-bool Split4_Forward(CUstream stream, T* z0, T* z1, T* z2, T* z3, const T* x, int N, int K)
-{
-    int K4 = K >> 2;
-    if ((K4 & 3) == 0)
-    {
-        K  >>= 2; // use vector loads
-        K4 >>= 2;
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-
-        V* Z0 = (V*)z0;
-        V* Z1 = (V*)z1;
-        V* Z2 = (V*)z2;
-        V* Z3 = (V*)z3;
-        const V* X = (const V*)x;
-        Split4<V,float4><<<grid,32,0,stream>>>(Z0, Z1, Z2, Z3, X, K, K4);
-    }
-    else
-    {
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-        Split4<T,float ><<<grid,32,0,stream>>>(z0, z1, z2, z3, x, K, K4);
-    }
-    return true;
-}
-
-template <typename T, typename V>
-bool Concat4_Forward(CUstream stream, T* dx, const T* z0, const T* z1, const T* z2, const T* z3, int N, int K)
-{
-    int K4 = K >> 2;
-    if ((K4 & 3) == 0)
-    {
-        K  >>= 2; // use vector loads
-        K4 >>= 2;
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-
-        V* DX = (V*)dx;
-        const V* Z0 = (const V*)z0;
-        const V* Z1 = (const V*)z1;
-        const V* Z2 = (const V*)z2;
-        const V* Z3 = (const V*)z3;
-        Concat4<V,float4><<<grid,32,0,stream>>>(DX, Z0, Z1, Z2, Z3, K, K4);
-    }
-    else
-    {
-        dim3 grid((K4 >> 5) + ((K4 & 31) != 0), N);
-        Concat4<T,float ><<<grid,32,0,stream>>>(dx, z0, z1, z2, z3, K, K4);
-    }
-    return true;
-}
-
-template bool Split4_Forward <float,float4>(CUstream stream, float* z0, float* z1, float* z2, float* z3, const float* x, int N, int K);
-template bool Split4_Forward <ehalf,ehalf4>(CUstream stream, ehalf* z0, ehalf* z1, ehalf* z2, ehalf* z3, const ehalf* x, int N, int K);
-template bool Split4_Forward <bhalf,bhalf4>(CUstream stream, bhalf* z0, bhalf* z1, bhalf* z2, bhalf* z3, const bhalf* x, int N, int K);
-
-template bool Concat4_Forward<float,float4>(CUstream stream, float* dx, const float* z0, const float* z1, const float* z2, const float* z3, int N, int K);
-template bool Concat4_Forward<ehalf,ehalf4>(CUstream stream, ehalf* dx, const ehalf* z0, const ehalf* z1, const ehalf* z2, const ehalf* z3, int N, int K);
-template bool Concat4_Forward<bhalf,bhalf4>(CUstream stream, bhalf* dx, const bhalf* z0, const bhalf* z1, const bhalf* z2, const bhalf* z3, int N, int K);
+// template
+// bool EW_Backward<float,bhalf,float4,bhalf4>(CUstream stream,
+//           float* dx,
+//           float* dy,
+//           float* db,
+//     const float* dz,
+//     const bhalf* x,
+//     const bhalf* y,
+//     const bhalf* z,
+//     const float* g,
+//     float alpha, int size, int N, int op);
 
 
 template <typename TY, typename TX, typename V, int U>
@@ -979,146 +558,6 @@ template bool FloatCast<float,bhalf,float4,bhalf4>(CUstream stream, float* y, co
 template bool FloatCast<bhalf,float,bhalf4,float4>(CUstream stream, bhalf* y, const float* x, int size);
 
 
-
-// mean   = mean(x, axis=1)
-// std    = std(x, axis=1)
-// cutoff = mean + alpha*std
-// y      = fmaxf(x, cutoff) - cutoff;
-template <typename T, typename V, int THREADS>
-__global__ void __launch_bounds__(THREADS) sparse_relu_forward(
-              T*              Y,
-    const     T* __restrict__ X,
-    float alpha, int K, float rcpK)
-{
-    __shared__ float Share[THREADS>>5];
-
-    int tid = threadIdx.x;
-    int n   = blockIdx.x;
-
-    int offset = n*K + tid;
-
-    // Mean
-    const T* X1 = X + offset;
-    V v_mean;
-    ew_zero(v_mean);
-    for (int k = tid; k < K; k += THREADS)
-    {
-        V x = load(X1);
-        v_mean = ew_add(v_mean, x);
-        X1 += THREADS;
-    }
-    float mean = ew_sum(v_mean);
-    // reduce within warp
-    #pragma unroll
-    for (int i = 16; i > 0; i >>= 1)
-        mean += __shfl_xor(mean, i);
-    // first thread of each warp store to shared
-    if ((tid & 31) == 0)
-        Share[tid >> 5] = mean;
-    __syncthreads();
-    if (tid < (THREADS>>5))
-    {
-        // first warp loads all prior reductions
-        mean = Share[tid];
-        // reduce within this last warp
-        #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
-            mean += __shfl_xor(mean, i);
-        // outputs final reduction to shared
-        Share[tid] = mean * rcpK;
-    }
-    __syncthreads();
-    // broadcast result to all threads
-    mean = Share[0];
-
-    // Standard Deviation (std)
-    const T* X2 = X + offset;
-    V v_std;
-    ew_zero(v_std);
-    for (int k = tid; k < K; k += THREADS)
-    {
-        V x = load(X2);
-        v_std = ew_add(v_std, ew_sqr(ew_sub(x, mean)));
-        X2   += THREADS;
-    }
-    float std = ew_sum(v_std);
-    // reduce within warp
-    #pragma unroll
-    for (int i = 16; i > 0; i >>= 1)
-        std += __shfl_xor(std, i);
-    // first thread of each warp store to shared
-    if ((tid & 31) == 0)
-        Share[tid >> 5] = std;
-    __syncthreads();
-    if (tid < (THREADS>>5))
-    {
-        // first warp loads all prior reductions
-        std = Share[tid];
-        // reduce within this last warp
-        #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
-            std += __shfl_xor(std, i);
-
-        std = sqrtf(std*rcpK);
-
-        // Outputs final reduction to shared
-        // Also cache reductions for backward pass
-        if (tid == 0)
-            Share[0] = std;
-    }
-    __syncthreads();
-    // broadcast result to all threads
-    std = Share[0];
-
-    // Norm/Gain/Bias
-    X += offset;
-    Y += offset;
-    for (int k = tid; k < K; k += THREADS)
-    {
-        float cutoff = mean + alpha*std;
-        V x = load(X);
-        V y = ew_sub(ew_maximum(x, cutoff), cutoff);
-        store(Y, y, 0, true);
-        X += THREADS;
-        Y += THREADS;
-    }
-}
-
-template <typename T, typename V>
-bool SparseReluForward(CUstream stream, T* y, const T* x, float alpha, int K, int N)
-{
-    dim3 grid(N, 1, 1);
-    float rcpK = 1.0f / (float)K;
-
-    if ((K & 3) == 0)
-    {
-        K >>= 2; // use vector loads
-                   V* Y = (V*)y;
-        const      V* X = (const V*)x;
-        // if (K >= 1024)
-        //     sparse_relu_forward<V,float4,1024><<<grid,1024,0,stream>>>(Y, X, alpha, K, rcpK);
-        if (K >= 256)
-            sparse_relu_forward<V,float4, 256><<<grid, 256,0,stream>>>(Y, X, alpha, K, rcpK);
-        else
-            sparse_relu_forward<V,float4,  64><<<grid,  64,0,stream>>>(Y, X, alpha, K, rcpK);
-    }
-    else
-    {
-        // if (K >= 1024)
-        //     sparse_relu_forward<T,float ,1024><<<grid,1024,0,stream>>>(y, x, alpha, K, rcpK);
-        if (K >= 256)
-            sparse_relu_forward<T,float , 256><<<grid, 256,0,stream>>>(y, x, alpha, K, rcpK);
-        else
-            sparse_relu_forward<T,float ,  64><<<grid,  64,0,stream>>>(y, x, alpha, K, rcpK);
-    }
-    return true; // TODO
-}
-template bool SparseReluForward<float,float4>(CUstream stream, float* y, const float* x,float alpha, int K, int N);
-template bool SparseReluForward<ehalf,ehalf4>(CUstream stream, ehalf* y, const ehalf* x,float alpha, int K, int N);
-template bool SparseReluForward<bhalf,bhalf4>(CUstream stream, bhalf* y, const bhalf* x,float alpha, int K, int N);
-
-
-
 __device__ __forceinline__ uint float4_to_uint(float4 v)
 {
     uint ret;
@@ -1148,12 +587,12 @@ __device__ __forceinline__ float4 uint_to_float4(uint val)
         "}" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(val) );
     return v;
 }
-__device__ __forceinline__ float rand_mask(float keep_prob, unsigned& lfsr0, unsigned& lfsr1, unsigned& lfsr2)
+__device__ __forceinline__ float rand_mask(float keep_prob, uint& lfsr0, uint& lfsr1, uint& lfsr2)
 {
     lfsr0 = ((lfsr0 & 0xfffffffe) << 12) ^ (((lfsr0 << 13) ^ lfsr0) >> 19);
     lfsr1 = ((lfsr1 & 0xfffffff8) <<  4) ^ (((lfsr1 << 2)  ^ lfsr1) >> 25);
     lfsr2 = ((lfsr2 & 0xfffffff0) << 11) ^ (((lfsr2 << 3)  ^ lfsr2) >> 11);
-    unsigned urand = lfsr0 ^ lfsr1 ^ lfsr2;
+    uint urand = lfsr0 ^ lfsr1 ^ lfsr2;
     // (float)urand * 2**-32 > keep_prob ? 0.0f : 1.0f;
     float val;
     asm("cvt.rn.f32.u32 %0, %1;\n\t"
@@ -1163,145 +602,117 @@ __device__ __forceinline__ float rand_mask(float keep_prob, unsigned& lfsr0, uns
 }
 
 
-template <typename T, int U>
-__global__ void __launch_bounds__(32) dropout_forward(
-    T* Y, uint* Mask, const T* __restrict__ X, int size, float keep_prob)
+template <typename T, uint THREADS>
+__global__ void __launch_bounds__(THREADS) dropout_forward(
+    T* Y, uint* Mask, const T* __restrict__ X, uint size, float keep_prob, float scale)
 {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
 
-    unsigned lfsr0, lfsr1, lfsr2;
-    unsigned idx = bid * 32 + tid;
+    uint lfsr0, lfsr1, lfsr2;
+    uint idx = bid * THREADS + tid;
     asm("mov.b32 %0, %%clock_hi;"       : "=r"(lfsr0) :);
     asm("mov.b32 %0, %%clock;"          : "=r"(lfsr1) :);
     asm("mov.b32 %0, %%globaltimer_lo;" : "=r"(lfsr2) :);
-    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr0) : "r"((lfsr0 & 31)^tid));
-    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr1) : "r"((lfsr1 & 31)^tid));
-    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr2) : "r"((lfsr2 & 31)^tid));
+    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr0) : "r"((lfsr0 ^ tid) & 31));
+    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr1) : "r"((lfsr1 ^ tid) & 31));
+    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr2) : "r"((lfsr2 ^ tid) & 31));
     lfsr0 ^= idx ^ (idx << 5)  ^ (idx << 11) ^ (idx << 17) ^ (idx << 23);
 
-    int i = bid * U*32 + tid;
-    for (int j = 0; j < U; j++)
+    for (uint offset = idx; offset < size; offset += gridDim.x*THREADS)
     {
-        bool b = i < size;
-        float4 x = load(X, i, b);
+        float4 x = load(add_ptr_u(X, offset));
 
         float4 mask;
         mask.x = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
         mask.y = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
         mask.z = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
         mask.w = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
-        float4 y = ew_mul(x, mask);
-        store(Y, y, i, b);
+        float4 y = ew_mul(ew_mul(x, mask), scale);
+        store(add_ptr_u(Y, offset), y);
 
-        uint mask_out = float4_to_uint(mask);
-        if (b) Mask[i] = mask_out;
-
-        i += 32;
+        Mask[offset] = float4_to_uint(mask);
     }
 }
 
 // Forward pass with existing mask (when forward pass needs to be recomputed)
-template <typename T, int U>
-__global__ void __launch_bounds__(32) dropout_mask_forward(
-    T* Y, const uint* __restrict__ Mask, const T* __restrict__ X, int size)
+template <typename T, uint THREADS>
+__global__ void __launch_bounds__(THREADS) dropout_mask_forward(
+    T* Y, const uint* __restrict__ Mask, const T* __restrict__ X, uint size, float scale)
 {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
 
-    int i = bid * U*32 + tid;
-    for (int j = 0; j < U; j++)
+    for (uint offset = bid*THREADS + tid; offset < size; offset += gridDim.x*THREADS)
     {
-        bool b = i < size;
-        float4 x = load(X, i, b);
-
-        uint mask;
-        if (b) mask = Mask[i];
-
-        float4 y = ew_mul(x, uint_to_float4(mask));
-        store(Y, y, i, b);
-
-        i += 32;
+        float4 x = load(add_ptr_u(X, offset));
+        float4 y = ew_mul(ew_mul(x, uint_to_float4(Mask[offset])), scale);
+        store(add_ptr_u(Y, offset), y);
     }
 }
 
-template <typename T, int U>
-__global__ void __launch_bounds__(32) dropout_backward(
-    T* DX, const uint* __restrict__ Mask, const T* __restrict__ DY, int size)
+template <typename T, uint THREADS>
+__global__ void __launch_bounds__(THREADS) dropout_backward(
+    T* DX, const uint* __restrict__ Mask, const T* __restrict__ DY, uint size, float scale)
 {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
 
-    int i = bid * U*32 + tid;
-    for (int j = 0; j < U; j++)
+    for (uint offset = bid*THREADS + tid; offset < size; offset += gridDim.x*THREADS)
     {
-        bool b = i < size;
-        float4 dy = load(DY, i, b);
-
-        uint mask;
-        if (b) mask = Mask[i];
-
-        float4 dx = ew_mul(dy, uint_to_float4(mask));
-        store(DX, dx, i, b);
-
-        i += 32;
+        float4 dy = load(add_ptr_u(DY, offset));
+        float4 dx = ew_mul(ew_mul(dy, uint_to_float4(Mask[offset])), scale);
+        store(add_ptr_u(DX, offset), dx);
     }
 }
 
 template <typename T, typename V>
-bool DropoutForward(CUstream stream,
+bool DropoutForward(CUstream stream, uint SMs,
           T* y,
        char* m,
     const T* x,
-    int size, float keep_prob)
+    uint size, float keep_prob, float scale)
 {
     size >>= 2; // use vector loads
-    int grid = (size >> 6) + ((size & 63) != 0); // 1 warp with 2 unrolls
-
-    dropout_forward<V,2><<<grid,32,0,stream>>>((V*)y, (uint*)m, (const V*)x, size, keep_prob);
-
+    dropout_forward<V,512><<<SMs,512,0,stream>>>((V*)y, (uint*)m, (const V*)x, size, keep_prob, scale);
     return true;
 }
-template bool DropoutForward<float,float4>(CUstream stream, float* y, char* m, const float* x, int size, float keep_prob);
-template bool DropoutForward<ehalf,ehalf4>(CUstream stream, ehalf* y, char* m, const ehalf* x, int size, float keep_prob);
-template bool DropoutForward<bhalf,bhalf4>(CUstream stream, bhalf* y, char* m, const bhalf* x, int size, float keep_prob);
+template bool DropoutForward<float,float4>(CUstream stream, uint SMs, float* y, char* m, const float* x, uint size, float keep_prob, float scale);
+template bool DropoutForward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, char* m, const ehalf* x, uint size, float keep_prob, float scale);
+template bool DropoutForward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, char* m, const bhalf* x, uint size, float keep_prob, float scale);
 
 template <typename T, typename V>
-bool DropoutMaskForward(CUstream stream,
+bool DropoutMaskForward(CUstream stream, uint SMs,
              T* y,
     const char* m,
     const    T* x,
-    int size)
+    uint size, float scale)
 {
     size >>= 2; // use vector loads
-    int grid = (size >> 6) + ((size & 63) != 0); // 1 warp with 2 unrolls
-
-    dropout_mask_forward<V,2><<<grid,32,0,stream>>>((V*)y, (const uint*)m, (const V*)x, size);
-
+    uint grid = size > SMs*1024 ? SMs*2 : SMs;
+    dropout_mask_forward<V,1024><<<grid,1024,0,stream>>>((V*)y, (const uint*)m, (const V*)x, size, scale);
     return true;
 }
-template bool DropoutMaskForward<float,float4>(CUstream stream, float* y, const char* m, const float* x, int size);
-template bool DropoutMaskForward<ehalf,ehalf4>(CUstream stream, ehalf* y, const char* m, const ehalf* x, int size);
-template bool DropoutMaskForward<bhalf,bhalf4>(CUstream stream, bhalf* y, const char* m, const bhalf* x, int size);
+template bool DropoutMaskForward<float,float4>(CUstream stream, uint SMs, float* y, const char* m, const float* x, uint size, float scale);
+template bool DropoutMaskForward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, const char* m, const ehalf* x, uint size, float scale);
+template bool DropoutMaskForward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, const char* m, const bhalf* x, uint size, float scale);
 
 
 template <typename T, typename V>
-bool DropoutBackward(CUstream stream,
+bool DropoutBackward(CUstream stream, uint SMs,
              T* dx,
     const char* m,
     const    T* dy,
-    int size)
+    uint size, float scale)
 {
     size >>= 2; // use vector loads
-    int grid = (size >> 6) + ((size & 63) != 0); // 1 warp with 2 unrolls
-
-    dropout_backward<V,2><<<grid,32,0,stream>>>((V*)dx, (const uint*)m, (const V*)dy, size);
-
+    uint grid = size > SMs*1024 ? SMs*2 : SMs;
+    dropout_backward<V,1024><<<grid,1024,0,stream>>>((V*)dx, (const uint*)m, (const V*)dy, size, scale);
     return true;
 }
-template bool DropoutBackward<float,float4>(CUstream stream, float* dx, const char* m, const float* dy, int size);
-template bool DropoutBackward<ehalf,ehalf4>(CUstream stream, ehalf* dx, const char* m, const ehalf* dy, int size);
-template bool DropoutBackward<bhalf,bhalf4>(CUstream stream, bhalf* dx, const char* m, const bhalf* dy, int size);
+template bool DropoutBackward<float,float4>(CUstream stream, uint SMs, float* dx, const char* m, const float* dy, uint size, float scale);
+template bool DropoutBackward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* dx, const char* m, const ehalf* dy, uint size, float scale);
+template bool DropoutBackward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* dx, const char* m, const bhalf* dy, uint size, float scale);
 
 
 
@@ -1349,5 +760,492 @@ bool AddN(CUstream stream, struct plist8<T>* x, T* z, int size, int params)
 template bool AddN<float,float4>(CUstream stream, struct plist8<float>* x, float* z, int size, int params);
 template bool AddN<ehalf,ehalf4>(CUstream stream, struct plist8<ehalf>* x, ehalf* z, int size, int params);
 template bool AddN<bhalf,bhalf4>(CUstream stream, struct plist8<bhalf>* x, bhalf* z, int size, int params);
+
+
+template <typename T, typename V>
+__global__ void __launch_bounds__(256) bias_relu(
+          T*              Y,
+    const T* __restrict__ X,
+    const V* __restrict__ B,
+    uint N, uint K, uint relu)
+{
+    uint nk = blockIdx.x*256 + threadIdx.x;
+
+    uint n = nk / K;
+    uint k = nk % K;
+
+    if (n < N)
+    {
+        V b = load(add_ptr_u(B,  k));
+        V x = load(add_ptr_u(X, nk));
+        V y = ew_add(x, b);
+        if (relu)
+            y = ew_relu(y);
+
+        store(add_ptr_u(Y, nk), y);
+    }
+}
+
+template <typename T, typename V>
+bool EW_Bias_Relu(CUstream stream,
+              T* y,
+    const     T* x,
+    const float* b,
+    uint N, uint K, bool relu)
+{
+    if ((K & 3) == 0)
+    {
+                   V* Y = (           V*)y;
+        const      V* X = (const      V*)x;
+        const float4* B = (const float4*)b;
+
+        K >>= 2;
+        uint grid = (N*K >> 8) + ((N*K & 255) != 0);
+        bias_relu<V,float4><<<grid,256,0,stream>>>(Y, X, B, N, K, relu);
+    }
+    else
+    {
+        uint grid = (N*K >> 8) + ((N*K & 255) != 0);
+        bias_relu<T,float ><<<grid,256,0,stream>>>(y, x, b, N, K, relu);
+    }
+    return true;
+}
+
+template bool EW_Bias_Relu<float,float4>(CUstream stream, float* y, const float* x, const float* b, uint N, uint K, bool relu);
+template bool EW_Bias_Relu<ehalf,ehalf4>(CUstream stream, ehalf* y, const ehalf* x, const float* b, uint N, uint K, bool relu);
+template bool EW_Bias_Relu<bhalf,bhalf4>(CUstream stream, bhalf* y, const bhalf* x, const float* b, uint N, uint K, bool relu);
+
+
+// db = sum(dy, axis=0)
+// dx = dy * (y > 0)
+template <typename T, typename V, uint THREADS, uint WIDTH>
+__global__ void __launch_bounds__(THREADS) bias_relu_grad(
+          V*              DB,
+          T*              DX,
+    const T* __restrict__ DY,
+    const T* __restrict__ Y,
+    uint N, uint K, uint relu, uint partials)
+{
+    // Stripe the reduction lines with tid and block_n
+    uint tid      = threadIdx.x;
+    uint block_k  = blockIdx.x;
+    uint block_n  = blockIdx.y;
+    uint blocks_n = gridDim.y;
+
+    uint warps = THREADS / 32;
+    uint lines = THREADS / WIDTH;
+    uint line  = tid     / WIDTH;
+
+    uint k = block_k*WIDTH + (tid % WIDTH);
+    uint n = block_n * lines + line;
+
+    uint nk = n*K + k;
+    bool bk = k < K;
+
+    uint inc_n  = blocks_n * lines;
+    uint inc_nk = inc_n*K;
+
+    V db;
+    ew_zero(db);
+    while (n < N)
+    {
+        V dy = load(add_ptr_u(DY, nk), 0, bk);
+
+        if (relu)
+        {
+            V  y = load(add_ptr_u(Y, nk), 0, bk);
+            dy = ew_relu_grad(dy, y);
+            store(add_ptr_u(DX, nk), dy, 0, bk);
+        }
+        db = ew_add(db, dy);
+
+        nk += inc_nk;
+        n  += inc_n;
+    }
+    // if the line width is less than a warp, reduce the lines within a warp
+    for (int i = 16; i >= WIDTH; i >>= 1)
+        db = ew_warp_sum(db, i);
+
+    if (THREADS > 32)
+    {
+        __shared__ V Share[THREADS];
+        if (tid >= 32)
+            Share[tid] = db;
+
+        __syncthreads();
+
+        if (tid < WIDTH)
+            for (uint i = 1; i < warps; i++)
+                db = ew_add(db, Share[tid + i*32]);
+    }
+    // if blocks_n==0 then this is the final result
+    // otherwise output a partial sum to be reduced with bias_grad2
+    if (tid < WIDTH && bk)
+    {
+        if (gridDim.y == 1 || partials)
+            store(add_ptr_u(DB, block_n*K + k), db);
+        else
+            atomicRed(add_ptr_u(DB, k), db);
+    }
+}
+
+// Reduce partial sums for bias gradient
+__global__ void __launch_bounds__(256) bias_grad2(
+          float*              DB,
+    const float* __restrict__ DB_Partial,
+    uint N, uint K)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    // load in 8 units of k wide to allow efficient transpose in L1 cache
+    uint k = bid*8 + tid/32;
+    uint n = tid & 31;
+
+    uint nk = n*K + k;
+    bool bk = k < K;
+
+    uint K1 = K*32;
+    uint K2 = K*32*2;
+    uint K3 = K2 + K1;
+    uint K4 = K*32*4;
+
+    float db = 0.0f;
+    // We should generally have 128 or fewer partials per bias unit.
+    // So pull them all in at once for lowest latency of this tiny kernel.
+    #pragma unroll 1
+    while (n < N)
+    {
+        float db0 = load(add_ptr_u(DB_Partial, nk +  0), 0, bk);
+        float db1 = load(add_ptr_u(DB_Partial, nk + K1), 0, bk && (n+32*1 < N));
+        float db2 = load(add_ptr_u(DB_Partial, nk + K2), 0, bk && (n+32*2 < N));
+        float db3 = load(add_ptr_u(DB_Partial, nk + K3), 0, bk && (n+32*3 < N));
+
+        db += (db0 + db1) + (db2 + db3);
+
+        nk += K4;
+        n  += 32*4;
+    }
+    for (uint i = 16; i > 0; i >>= 1)
+        db += shfl_xor(db, i);
+
+    store(add_ptr_u(DB, k), db, 0, bk & (tid & 31) == 0);
+}
+
+// This is just a rough tuning of the parameter space.  Ideally this would just be autotuned.
+void EW_Bias_Relu_Grad_Partial(bool partials, uint N, uint K, uint *gridN, uint *gridK, uint *vec, uint *width)
+{
+    uint vshift = (K & 3) == 0 && K >= 8 && (partials || N <= 768) ? 2 : 0;
+    uint wshift = 0;
+    uint K_vec  = K >> vshift;
+    uint SMs    = GetCountSMs();
+
+    // narrow and deep reductions
+    if (K_vec < 128)
+    {
+        uint K_vec_32 = K_vec & 31;
+        uint K_vec_16 = K_vec & 15;
+        uint K_vec_08 = K_vec &  7;
+
+             if (K_vec_32 == 0 || K_vec_32 > 16) wshift = 5;
+        else if (K_vec_16 == 0 || K_vec_16 >  8) wshift = 4;
+        else if (K_vec_08 == 0 || K_vec_08 >  4) wshift = 3;
+        else if (K_vec < 16)                     wshift = 2;
+    }
+    // wide and shallow reductions (with vector loads)
+    else if (vshift && N <= 768)
+    {
+        uint K_vec_32 = K_vec >> 5;
+        uint K_vec_16 = K_vec >> 4;
+        uint K_vec_08 = K_vec >> 3;
+             if (K_vec_32 >= SMs && K_vec_32 <= SMs*2) wshift = 5;
+        else if (K_vec_16 >= SMs && K_vec_16 <= SMs*2) wshift = 4;
+        else if (K_vec_08 >= SMs && K_vec_08 <= SMs*2) wshift = 3;
+    }
+    // anything else
+    if (wshift == 0)
+        wshift = K_vec < 128 ? 4 : 5;
+
+    uint gk = (K_vec >> wshift) + ((K_vec & ((1 << wshift) - 1)) != 0);
+    uint gn = 1;
+    // Break up the reduction into blocks if needed
+    if (N > 768 && gk < SMs)
+    {
+        // use 256 or 1024 thread blocks depending on vector loads
+        uint tshift = vshift == 2 ? 8 : 10;
+        // target as close to full occpancy as possible
+        while (gn * gk <= SMs * (2048 >> tshift)) gn += 1;
+        gn -= 1;
+        if (gn == 0) gn = 1;
+    }
+    *gridN = gn;
+    *gridK = gk;
+    *vec   = 1 << vshift;
+    *width = 1 << wshift;
+}
+
+template <typename T, typename V>
+bool EW_Bias_Relu_Grad(CUstream stream,
+          float* db,
+          float* db_partial,
+              T* dx,
+    const     T* dy,
+    const     T* y,
+    uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials)
+{
+    if (gridN > 1 && !partials)
+        cuMemsetD32Async((CUdeviceptr)db, 0, K, stream);
+
+    //printf("%d %d %d %d %d %d %d\n", gridN, gridK, vec, width, N, K, relu);
+    if (vec == 4)
+    {
+        const V* DY = (const V*)dy;
+        const V* Y  = (const V*)y;
+              V* DX = (      V*)dx;
+        float4* DB = gridN > 1 && partials ? (float4*)db_partial : (float4*)db;
+
+        if      (width == 32)
+            bias_relu_grad<V,float4,256,32><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
+        else if (width == 16)
+            bias_relu_grad<V,float4,256,16><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
+        else if (width == 8)
+            bias_relu_grad<V,float4,256, 8><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
+        else if (width == 4)
+            bias_relu_grad<V,float4,256, 4><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
+    }
+    else
+    {
+        float* DB = gridN > 1 && partials ? db_partial : db;
+
+        if      (width == 32)
+            bias_relu_grad<T,float,1024,32><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
+        else if (width == 16)
+            bias_relu_grad<T,float,1024,16><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
+        else if (width == 8)
+            bias_relu_grad<T,float,1024, 8><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
+        else if (width == 4)
+            bias_relu_grad<T,float,1024, 4><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
+    }
+    if (gridN > 1 && partials)
+    {
+        gridK = (K >> 3) + ((K & 7) != 0);
+
+        bias_grad2<<<gridK,256,0,stream>>>(db, (const float*)db_partial, gridN, K);
+    }
+    return true;
+}
+
+template bool EW_Bias_Relu_Grad<float,float4>(CUstream stream, float* db, float* db_partial, float* dx, const float* dy, const float* y, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials);
+template bool EW_Bias_Relu_Grad<ehalf,ehalf4>(CUstream stream, float* db, float* db_partial, ehalf* dx, const ehalf* dy, const ehalf* y, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials);
+template bool EW_Bias_Relu_Grad<bhalf,bhalf4>(CUstream stream, float* db, float* db_partial, bhalf* dx, const bhalf* dy, const bhalf* y, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials);
+
+
+// x = [128*16*18]
+// a = range(0, 128*16) * 18 + idx[128*16], 1
+template <typename T, typename TA>
+__global__ void __launch_bounds__(64) fancy_gather1(
+    T* Y, const TA* __restrict__ A, const T* __restrict__ X,
+    uint dim0, uint dim1)
+{
+    uint idx0 = blockIdx.x*64 + threadIdx.x;
+    if (idx0 < dim0)
+    {
+        uint idx1 = max(load(add_ptr_u(A, idx0)), 0);
+        uint idxX = idx0*dim1 + idx1;
+
+        store(add_ptr_u(Y, idx0), load(add_ptr_u(X, idxX), 0, idx1 < dim1));
+    }
+}
+// x = [128*16*18]
+// a = range(0, 128*16) * 18 + idx[128*16], 1
+template <typename T, typename TA>
+__global__ void fancy_gather1_grad(
+    T* DX, const TA* __restrict__ A,  const T* __restrict__ DY,
+    uint dim0, uint dim1)
+{
+    uint tid  = threadIdx.x;
+    uint idx0 = blockIdx.x;
+
+    uint idx1 = max(load(add_ptr_u(A, idx0)), 0);
+
+    store(add_ptr_u(DX, idx0*dim1 + tid),
+        load(add_ptr_u(DY, idx0), 0, idx1 == tid && idx1 < dim1),
+        0, tid < dim1);
+}
+// x = [128*16*51, 64]
+// a = range(0, 128*16) * 51 + idx[128*16], 1
+template <typename T, typename TA>
+__global__ void fancy_gather2(
+    T* Y, const TA* __restrict__ A, const T* __restrict__ X,
+    uint dim0, uint dim1, uint dim2)
+{
+    uint tid  = threadIdx.x;
+    uint idx0 = blockIdx.x;
+
+    uint idx1 = max(load(add_ptr_u(A, idx0)), 0);
+
+    uint idxX = idx0*dim1*dim2 + idx1*dim2 + tid;
+    uint idxY = idx0*dim2 + tid;
+
+    store(add_ptr_u(Y, idxY),
+        load(add_ptr_u(X, idxX), 0, tid < dim2 && idx1 < dim1),
+         0, tid < dim2);
+}
+// x = [128*16*51, 64]
+// a = range(0, 128*16) * 51 + idx[128*16], 1
+template <typename T, typename TA>
+__global__ void fancy_gather2_grad(
+    T* DX, const TA* __restrict__ A,  const T* __restrict__ DY,
+    uint dim0, uint dim1, uint dim2)
+{
+    uint tid  = threadIdx.x;
+    uint idx0 = blockIdx.x;
+    uint idx1 = blockIdx.y;
+
+    if (tid < dim2)
+    {
+        uint idxX = idx0*dim1*dim2 + idx1*dim2 + tid;
+        uint idxY = idx0*dim2 + tid;
+
+        uint idx1a = max(load(add_ptr_u(A, idx0)), 0);
+
+        store(add_ptr_u(DX, idxX),
+            load(add_ptr_u(DY, idxY), 0, idx1a == idx1));
+    }
+}
+template <typename T, typename TA>
+bool EW_Fancy_Gather(CUstream stream, T* y, const TA* a, const T* x, uint dim0, uint dim1, uint dim2)
+{
+    if (dim2 == 1)
+    {
+        uint grid = CEIL_DIV(dim0, 64);
+        fancy_gather1<T,TA><<<grid,64,0,stream>>>(y, a, x, dim0, dim1);
+    }
+    else
+    {
+        uint threads = CEIL_DIV(dim2, 32) * 32;
+        fancy_gather2<T,TA><<<dim0,threads,0,stream>>>(y, a, x, dim0, dim1, dim2);
+    }
+    return true;
+}
+template <typename T, typename TA>
+bool EW_Fancy_Gather_Grad(CUstream stream, T* dx, const TA* a, const T* dy, uint dim0, uint dim1, uint dim2)
+{
+    if (dim2 == 1)
+    {
+        uint threads = CEIL_DIV(dim1, 32) * 32;
+        fancy_gather1_grad<T,TA><<<dim0,threads,0,stream>>>(dx, a, dy, dim0, dim1);
+    }
+    else
+    {
+        uint threads = CEIL_DIV(dim2, 32) * 32;
+        fancy_gather2_grad<T,TA><<<dim3(dim0,dim1),threads,0,stream>>>(dx, a, dy, dim0, dim1, dim2);
+    }
+    return true;
+}
+template bool EW_Fancy_Gather<  int,int>(CUstream stream,   int* y, const int* a, const   int* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Fancy_Gather<float,int>(CUstream stream, float* y, const int* a, const float* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Fancy_Gather<ehalf,int>(CUstream stream, ehalf* y, const int* a, const ehalf* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Fancy_Gather<bhalf,int>(CUstream stream, bhalf* y, const int* a, const bhalf* x, uint dim0, uint dim1, uint dim2);
+
+template bool EW_Fancy_Gather_Grad<float,int>(CUstream stream, float* dx, const int* a, const float* dy, uint dim0, uint dim1, uint dim2);
+template bool EW_Fancy_Gather_Grad<ehalf,int>(CUstream stream, ehalf* dx, const int* a, const ehalf* dy, uint dim0, uint dim1, uint dim2);
+template bool EW_Fancy_Gather_Grad<bhalf,int>(CUstream stream, bhalf* dx, const int* a, const bhalf* dy, uint dim0, uint dim1, uint dim2);
+
+template <typename T, typename TA>
+__global__ void reduce_column_max(
+    T* Y, TA* A, const T* __restrict__ X,
+    uint dim0, uint dim1, uint dim2)
+{
+    uint idx  = blockIdx.x*128 + threadIdx.x;
+    uint idx0 = idx / dim2;
+    uint idx2 = idx % dim2;
+
+    if (idx0 < dim0)
+    {
+        uint offset = idx0*dim1*dim2 + idx2;
+
+        float max_val = -FLT_MAX;
+        uint  max_idx = 0;
+        for (uint idx1 = 0; idx1 < dim1; idx1++)
+        {
+            float x = load(add_ptr_u(X, offset));
+
+            if (max_val < x)
+            {
+                max_val = x;
+                max_idx = idx1;
+            }
+            offset += dim2;
+        }
+        offset = idx0*dim2 + idx2;
+
+        store(add_ptr_u(Y, offset), max_val);
+        __stg(add_ptr_u(A, offset), max_idx);
+    }
+}
+
+template <typename T, typename TA>
+__global__ void reduce_column_max_grad(
+    T* DX, const TA* __restrict__ A,  const T* __restrict__ DY,
+    uint dim0, uint dim1, uint dim2)
+{
+    uint idx  = blockIdx.x*128 + threadIdx.x;
+    uint idx0 = idx / dim2;
+    uint idx2 = idx % dim2;
+
+    if (idx0 < dim0)
+    {
+        uint offset_dy = idx0*dim2      + idx2;
+        uint offset_dx = idx0*dim2*dim1 + idx2;
+
+        uint  idx_max = __ldg(add_ptr_u(A, offset_dy));
+        float dy = load(add_ptr_u(DY, offset_dy));
+
+        for (uint idx1 = 0; idx1 < dim1; idx1++)
+        {
+            float dx = idx1 == idx_max ? dy : 0.0f;
+
+            store(add_ptr_u(DX, offset_dx), dx);
+            offset_dx += dim2;
+        }
+    }
+}
+
+template <typename T, typename TA>
+bool EW_Reduce_Max(CUstream stream, T* y, TA* a, const T* x, uint dim0, uint dim1, uint dim2)
+{
+    uint dim02 = dim0*dim2;
+    uint grid  = CEIL_DIV(dim02, 128);
+    reduce_column_max<T,TA><<<grid,128,0,stream>>>(y, a, x, dim0, dim1, dim2);
+    return true;
+}
+
+template <typename T, typename TA>
+bool EW_Reduce_Max_Grad(CUstream stream, T* dx, const TA* a, const T* dy, uint dim0, uint dim1, uint dim2)
+{
+    uint dim02 = dim0*dim2;
+    uint grid  = CEIL_DIV(dim02, 128);
+    reduce_column_max_grad<T,TA><<<grid,128,0,stream>>>(dx, a, dy, dim0, dim1, dim2);
+    return true;
+}
+
+template bool EW_Reduce_Max<float,unsigned char>(CUstream stream, float* y, unsigned char* a, const float* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max<ehalf,unsigned char>(CUstream stream, ehalf* y, unsigned char* a, const ehalf* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max<bhalf,unsigned char>(CUstream stream, bhalf* y, unsigned char* a, const bhalf* x, uint dim0, uint dim1, uint dim2);
+
+template bool EW_Reduce_Max<float,       ushort>(CUstream stream, float* y,        ushort* a, const float* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max<ehalf,       ushort>(CUstream stream, ehalf* y,        ushort* a, const ehalf* x, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max<bhalf,       ushort>(CUstream stream, bhalf* y,        ushort* a, const bhalf* x, uint dim0, uint dim1, uint dim2);
+
+template bool EW_Reduce_Max_Grad<float,unsigned char>(CUstream stream, float* dx, const unsigned char* a, const float* dy, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max_Grad<ehalf,unsigned char>(CUstream stream, ehalf* dx, const unsigned char* a, const ehalf* dy, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max_Grad<bhalf,unsigned char>(CUstream stream, bhalf* dx, const unsigned char* a, const bhalf* dy, uint dim0, uint dim1, uint dim2);
+
+template bool EW_Reduce_Max_Grad<float,       ushort>(CUstream stream, float* dx, const        ushort* a, const float* dy, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max_Grad<ehalf,       ushort>(CUstream stream, ehalf* dx, const        ushort* a, const ehalf* dy, uint dim0, uint dim1, uint dim2);
+template bool EW_Reduce_Max_Grad<bhalf,       ushort>(CUstream stream, bhalf* dx, const        ushort* a, const bhalf* dy, uint dim0, uint dim1, uint dim2);
+
+
 
 #endif

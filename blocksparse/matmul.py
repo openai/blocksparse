@@ -42,8 +42,11 @@ SEG_MAX = (1<<63)-1
 
 class BlocksparseMatMul(object):
 
-    def __getinitargs__(self):
+    def __getstate__(self):
         return (self.layout, self.bsize, self.axis, self.name)
+
+    def __setstate__(self, state):
+        self.__init__(*state)
 
     def __init__(self, layout, block_size=32, feature_axis=1, name=None):
 
@@ -107,6 +110,7 @@ class BlocksparseMatMul(object):
         self.flops   = blocks * block_size * block_size * 2
         self.blocks  = blocks
         self.w_shape = (blocks, block_size, block_size)
+        self.g_shape = (blocks,)
         self.count   = 0
 
         self.CB = CB
@@ -198,11 +202,11 @@ class BlocksparseMatMul(object):
         for k in range(KB):
             if k not in kset:
                 # supported by assembly kernels
-                if self.axis == 1:
-                    segs.append( (k, []) )
-                    cols.append( (k, []) )
-                else:
-                    raise ValueError("sparsity mask has empty mappings.  Not yet supported with feature_axis=0")
+                #if self.axis == 1:
+                segs.append( (k, []) )
+                cols.append( (k, []) )
+                #else:
+                #    raise ValueError("sparsity mask has empty mappings.  Not yet supported with feature_axis=0")
 
         # bsmm lut
         offset = len(segs) * 4
@@ -241,6 +245,26 @@ class BlocksparseMatMul(object):
             answer |= ((x & mshifted) << shift) | ((y & mshifted) << (shift + 1))
             #print mshifted, shift, answer, bin(answer)
         return answer
+
+    def prune(self, param, gate):
+        new_blocks = np.sum(gate != 0.0)
+        if new_blocks != self.blocks:
+            new_param  = np.empty((new_blocks, self.bsize, self.bsize), dtype=np.float32)
+            new_w      = 0
+            layout     = self.layout
+            for w, (c, k) in enumerate(self.updat_list):
+                if gate[w] == 0.0:
+                    layout[c,k] = False
+                else:
+                    new_param[new_w,:,:] = param[w,:,:]
+                    new_w += 1
+        else:
+            new_param = param
+
+        sparsity = round(100 * float(new_blocks) / float(self.CB * self.KB), 1)
+
+        print("prune: ", self.blocks, new_blocks, sparsity)
+        return new_param
 
     def ortho_init(self):
         def _initializer(shape, dtype=np.float32, partition_info=None):
@@ -285,8 +309,25 @@ class BlocksparseMatMul(object):
             return W
         return _initializer
 
+    def checker_init(self):
+        def _initializer(shape, dtype=np.float32, partition_info=None):
+            gate = np.empty(self.blocks, dtype=dtype)
+            for w, (c, k) in enumerate(self.updat_list):
+                gate[w] = (c & 1) ^ (k & 1) ^ 1
+            return gate
+        return _initializer
 
-    def fprop_test(self, I, W):
+# grid = []
+# for c in range(5):
+#     row = []
+#     for k in range(5):
+#         row.append((c & 1) ^ (k & 1) ^ 1)
+#     grid.append(row)
+
+# for row in grid:
+#     print(row)
+
+    def fprop_test(self, I, W, gate=None):
         bsize = self.bsize
         if self.axis:
             O = np.zeros((I.shape[0], self.KB, bsize))
@@ -300,11 +341,17 @@ class BlocksparseMatMul(object):
             O = np.zeros((self.KB, bsize, N))
             I = I.reshape((self.CB, bsize, N))
             for k, lut in self.fprop_list:
-                for c, w in lut:
-                    O[k,:,:] += np.dot( W[w,:,:].T, I[c,:,:] ) # CK.T x CN = KN
+                if gate is None:
+                    for c, w in lut:
+                        O[k,:,:] += np.dot( W[w,:,:].T, I[c,:,:] ) # CK.T x CN = KN
+                else:
+                    for c, w in lut:
+                        if gate[w] != 0.0:
+                            O[k,:,:] += np.dot( W[w,:,:].T, I[c,:,:] ) * gate[w] # CK.T x CN = KN
+
             return O.reshape(-1, N)
 
-    def bprop_test(self, E, W):
+    def bprop_test(self, E, W, gate=None):
         bsize = self.bsize
         if self.axis:
             B = np.zeros((E.shape[0], self.CB, bsize))
@@ -318,12 +365,18 @@ class BlocksparseMatMul(object):
             B = np.zeros((self.CB, bsize, N))
             E = E.reshape((self.KB, bsize, N))
             for c, lut in self.bprop_list:
-                for k, w in lut:
-                    B[c,:,:] += np.dot( W[w,:,:], E[k,:,:] ) # CK x KN = CN
+                if gate is None:
+                    for k, w in lut:
+                        B[c,:,:] += np.dot( W[w,:,:], E[k,:,:] ) # CK x KN = CN
+                else:
+                    for k, w in lut:
+                        if gate[w] != 0.0:
+                            B[c,:,:] += np.dot( W[w,:,:], E[k,:,:] ) * gate[w] # CK x KN = CN
+
             return B.reshape(-1, N)
 
-    def updat_test(self, I, E):
-        U = np.empty(self.w_shape)
+    def updat_test(self, I, E, gate=None):
+        U = np.zeros(self.w_shape)
         bsize = self.bsize
         if self.axis:
             I = I.reshape((-1, self.CB, bsize))
@@ -333,8 +386,13 @@ class BlocksparseMatMul(object):
         else:
             I = I.reshape((self.CB, bsize, -1))
             E = E.reshape((self.KB, bsize, -1))
-            for w, (c, k) in enumerate(self.updat_list):
-                U[w,:,:] = np.dot( I[c,:,:], E[k,:,:].T ) # CN x KN.T = CK
+            if gate is None:
+                for w, (c, k) in enumerate(self.updat_list):
+                    U[w,:,:] = np.dot( I[c,:,:], E[k,:,:].T ) # CN x KN.T = CK
+            else:
+                for w, (c, k) in enumerate(self.updat_list):
+                    if gate[w] != 0.0:
+                        U[w,:,:] = np.dot( I[c,:,:], E[k,:,:].T ) * gate[w] # CN x KN.T = CK
         return U
 
     def l2_normalize_test(self, W, epsilon=1e-12):
@@ -368,15 +426,24 @@ class BlocksparseMatMul(object):
             W, _ = l2_normalize_gain_ck(W, gain, self.l2_lut, TY=dtype, epsilon=epsilon, K=self.K, shared=self.l2_shared, bsize=self.bsize )
         return W
 
-    def __call__(self, I, W, dw_dtype=tf.float32, name=None, bench=0):
+    def __call__(self, I, W, gate=None, dw_gated=False, dw_dtype=None, name=None, bench=0):
 
         if name is None:
             name = self.name + ("_%06d" % self.count)
         self.count += 1
 
+        if dw_dtype is None:
+            dw_dtype = W.dtype
+
+        if gate is None:
+            gate = []
+        else:
+            gate = [gate]
+            assert self.bsize == 8 and self.axis == 0, "blocksparse gating only implemented for block_size 8 on axis 0"
+
         O, _ = blocksparse_matmul(
-            I, W, self.fprop_lut, self.bprop_lut, self.updat_lut,
-            dtype_y=I.dtype, dtype_dw=dw_dtype,
+            I, W, self.fprop_lut, self.bprop_lut, self.updat_lut, gate,
+            dtype_y=I.dtype, dtype_dw=dw_dtype, gated_dw=dw_gated,
             blocks=self.blocks, bshift=self.bshift, axis=self.axis, C=self.C, K=self.K,
             segments=self.fprop_segments, segments_dx=self.bprop_segments,
             locks=self.fprop_locks, locks_dx=self.bprop_locks,
@@ -397,28 +464,33 @@ def blocksparse_matmul_grad(op, dy, temp):
     shared    = op.get_attr("shared_dx")
     locks     = op.get_attr("locks_dx")
     dtype_dw  = op.get_attr("dtype_dw")
+    gated_dw  = op.get_attr("gated_dw")
     bench     = op.get_attr("bench")
     x         = op.inputs[0]
     w         = op.inputs[1]
     lut_dx    = op.inputs[3]
     lut_dw    = op.inputs[4]
+    gate      = [op.inputs[5]] if len(op.inputs) > 5 else []
     name      = op.name.split('/')[-1]
 
     dx, _ = blocksparse_matmul_dx(
-        dy, w, lut_dx, dtype_dx=dy.dtype,
+        dy, w, lut_dx, gate, dtype_dx=dy.dtype, gated_dw=gated_dw,
         blocks=blocks, bshift=bshift, axis=axis, C=K, K=C, # swap C,K
         segments=segments, locks=locks, shared=shared,
         bench=bench, name=name+"_bprop")
 
     dw = blocksparse_matmul_dw(
-        [x], [dy], lut_dw, dtype_dw=dtype_dw,
+        [x], [dy], lut_dw, gate, dtype_dw=dtype_dw, gated_dw=gated_dw,
         blocks=blocks, bshift=bshift, axis=axis, C=C, K=K,
         bench=bench, name=name+"_updat")
 
     # print(dx.op.name, dx.op.device)
     # print(dw.op.name, dw.op.device)
 
-    return (dx, dw, None, None, None)
+    if len(gate) == 0:
+        return (dx, dw, None, None, None)
+    else:
+        return (dx, dw, None, None, None, None)
 
 
 @ops.RegisterGradient("L2NormalizeCK")
@@ -447,7 +519,7 @@ def blocksparse_l2_normalize_grad_ck(op, dy, sum_sqr_x):
 
 # Utils for graph re-writing
 
-def group_param_grads(param_grad, group_size=8, cast32=True):
+def group_param_grads(param_grad, group_size=8, cast32=False):
 
     assert group_size <= 8
 
@@ -469,7 +541,7 @@ def group_param_grads(param_grad, group_size=8, cast32=True):
     # we're going to be using absolute names, so clear name_scope
     with tf.name_scope(None):
         offset = 0
-        graph  = tf.get_default_graph()
+        # graph  = tf.get_default_graph()
         while offset < len(ops):
 
             xs = [op.inputs[0] for op in ops[offset:offset+group_size] ]
@@ -488,22 +560,24 @@ def group_param_grads(param_grad, group_size=8, cast32=True):
             bshift   = up.get_attr("bshift")
             axis     = up.get_attr("axis")
             dtype_dw = up.get_attr("dtype_dw")
+            gated_dw = up.get_attr("gated_dw")
             C        = up.get_attr("C")
             K        = up.get_attr("K")
             bench    = up.get_attr("bench") // len(xs)
             lut      = up.inputs[2]
             name     = "%s/matmul_concat_updat_%03d" % (scope, offset)
+            gate     = [up.inputs[3]] if len(op.inputs) > 3 else []
 
             # The first op needs to allocate a new dw tensor
             if offset == 0:
                 grad = blocksparse_matmul_dw(
-                    xs, gs, lut, dtype_dw=dtype_dw,
+                    xs, gs, lut, gate, dtype_dw=dtype_dw, gated_dw=gated_dw,
                     blocks=blocks, bshift=bshift, axis=axis,
                     C=C, K=K, bench=bench, name=name)
             # subsequent ops can just accumulate in place
             else:
                 grad = blocksparse_matmul_dwa(
-                    xs, gs, lut, grad,
+                    xs, gs, lut, grad, gate, gated_dw=gated_dw,
                     blocks=blocks, bshift=bshift, axis=axis,
                     C=C, K=K, bench=bench, name=name)
 
@@ -547,7 +621,7 @@ def get_parents(grad, op_type):
     return ops
 
 def add_control_input(op, control_input):
-    op._control_inputs.append(control_input)
+    op.control_inputs.append(control_input)
     op._recompute_node_def()
 
 def ceil_div(x, y):
@@ -572,8 +646,11 @@ OP_MUL = 3
 
 class SparseProj(object):
 
-    def __getinitargs__(self):
+    def __getstate__(self):
         return (self.nhidden, self.nproj, self.gather_lut, self.name)
+
+    def __setstate__(self, state):
+        self.__init__(state[0], nproj=state[1], gather_lut=state[2], name=state[3])
 
     def __init__(self, nhidden, nproj=None, proj_stride=None, block_size=32, gather_lut=None, name=None):
 

@@ -4,14 +4,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import time
 import os.path
-import sys
 import numpy as np
 import tensorflow as tf
-import operator
 from tensorflow.python.framework import ops
-if sys.version_info >= (3, 0):
-    from functools import reduce
 
 data_files_path = tf.resource_loader.get_data_files_path()
 _op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
@@ -152,78 +149,24 @@ def ew_z_xb_grad(op, dz):
 
     raise ValueError("bad op code")
 
-############################## fused_lstm_gates #####################################
-
-lstm_gates_op       = _op_module.lstm_gates
-lstm_gates_grad_op  = _op_module.lstm_gates_grad
-lstm_gates4_op      = _op_module.lstm_gates4
-lstm_gates4_grad_op = _op_module.lstm_gates4_grad
-
-def fused_lstm_gates(c, *args, **kwargs):
-    # returns c_next, h_next
-    
-    assert len(kwargs) <= 1
-    name = kwargs.pop('name', None)    
-    # args is h (all four gates fused in single tensor)
-    if len(args) == 1:
-        return lstm_gates_op(c, args[0], name=name)
-    # args is i, f, o, u
-    assert len(args) == 4
-    return lstm_gates4_op(c, *args, name=name)
-
-@ops.RegisterGradient("LSTMGates")
-def fused_lstm_gates_grad(op, ec, eh):
-    # returns dc, dh
-
-    # in mixed precision mode tf will send the wrong dtype for the first "ec"
-    # in our kernels we just conditionaly load zero instead of reading the constant tensor
-    if ec is None or ec.dtype != eh.dtype:
-        return lstm_gates_grad_op(op.inputs[0], op.inputs[1], [eh] )
-
-    return lstm_gates_grad_op(op.inputs[0], op.inputs[1], [eh, ec] )
-
-@ops.RegisterGradient("LSTMGates4")
-def fused_lstm_gates4_grad(op, ec, eh):
-    # returns dc, dh
-
-    # in mixed precision mode tf will send the wrong dtype for the first "ec"
-    # in our kernels we just conditionaly load zero instead of reading the constant tensor
-    if ec is None or ec.dtype != eh.dtype:
-        return lstm_gates4_grad_op(op.inputs[0], op.inputs[1], op.inputs[2], op.inputs[3], op.inputs[4], [eh] )
-
-    return lstm_gates4_grad_op(op.inputs[0], op.inputs[1], op.inputs[2], op.inputs[3], op.inputs[4], [eh, ec] )
-
-############################## Split4 #####################################
-
-split4_op  = _op_module.split4
-concat4_op = _op_module.concat4
-
-def split4(x):
-    return split4_op(x)
-
-def concat4(x0, x1, x2, x3):
-    return concat4_op(x0, x1, x2, x3)
-
-@ops.RegisterGradient("Split4")
-def split4_grad(op, dz0, dz1, dz2, dz3):
-    return concat4_op(dz0, dz1, dz2, dz3)
-
-@ops.RegisterGradient("Concat4")
-def concat4_grad(op, dz):
-    return split4_op(dz)
 
 ############################## Float Cast #####################################
 
 float_cast_op = _op_module.float_cast
 
 def float_cast(x, dtype, dx_dtype=None):
+
+    dev = x.op.device.lower()
+    if not dev or "cpu" in dev:
+        return tf.cast(x, dtype)
+
     dtype = tf.as_dtype(dtype)
     if dtype not in (tf.float32, tf.float16, tf.bfloat16):
         raise ValueError("Only float32 and float16 dtypes supported.")
     # no-op
     if dtype == x.dtype.base_dtype:
-        # return identity for code depening on an op being here.
-        return tf.identity(x)
+        # no-op
+        return x
     # default x dtype for dx
     if dx_dtype is None:
         dx_dtype = x.dtype.base_dtype
@@ -239,26 +182,6 @@ def float_cast_grad(op, dz):
 
     return float_cast_op(dz, TY=dx_dtype, dx_dtype=dx_dtype)
 
-############################## Sparse Relu #####################################
-
-
-sparse_relu_op = _op_module.sparse_relu
-
-def sparse_relu(x, alpha=1.0):
-    return sparse_relu_op(x, alpha)
-
-@ops.RegisterGradient("SparseRelu")
-def sparse_relu_grad(op, dz):
-    # same grad as relu
-    return ew_dx_dzza_op(dz, op.outputs[0], op=RELU_OP)
-
-def sparse_relu_test(x, alpha=1.0):
-
-    mean = np.mean(x, axis=1, keepdims=True)
-    std  = np.std(x, axis=1, keepdims=True)
-    cutoff = mean + alpha*std
-    return np.maximum(x, cutoff) - cutoff
-
 
 ############################## Dropout #####################################
 
@@ -267,19 +190,33 @@ dropout_op      = _op_module.dropout
 dropout_mask_op = _op_module.dropout_mask
 dropout_grad_op = _op_module.dropout_grad
 
-def dropout(x, keep_prob=0.8, mask=None):
+def dropout(x, keep_prob=None, scale=None, mask=None):
+
+    assert keep_prob is not None or mask is not None
+
+    if keep_prob is None:
+        keep_prob = 1.0
+    if type(keep_prob) in (float, int):
+        keep_prob = tf.constant(float(keep_prob))
+
+    if scale is None:
+        scale = tf.reciprocal(keep_prob)
+    elif type(scale) in (float, int):
+        scale = tf.constant(float(scale))
+
     if mask is None:
-        return dropout_op(x, keep_prob=keep_prob)
-    return dropout_mask_op(x, mask)
+        return dropout_op(x, keep_prob, scale)
+    return dropout_mask_op(x, mask, scale)
 
 @ops.RegisterGradient("Dropout")
 def dropout_grad(op, dy, dm):
-    return dropout_grad_op(dy, op.outputs[1])
+    dx = dropout_grad_op(dy, op.outputs[1], op.inputs[2])
+    return dx, None, None
 
 @ops.RegisterGradient("DropoutMask")
 def dropout_grad(op, dy):
-    dx = dropout_grad_op(dy, op.inputs[1])
-    return dx, None
+    dx = dropout_grad_op(dy, op.inputs[1], op.inputs[2])
+    return dx, None, None
 
 
 ############################## add_n8 #####################################
@@ -287,9 +224,150 @@ def dropout_grad(op, dy):
 add_n8_op = _op_module.add_n8
 
 def add_n8(xs, name="AddN"):
-    if name is None:
-        name = "AddN"
+    if name is None: name = "AddN"
     return add_n8_op(xs, name=name)
+
+def add_n(xs, name="AddN"):
+
+    if len(xs) == 1:
+        return xs[0]
+
+    if name is None: name = "AddN"
+
+    if len(xs) == 2:
+        return ew_z_xy_op(xs[0], xs[1], op=0, name=name)
+
+    total = None
+    while len(xs):
+      xs8 = [] if total is None else [total]
+      while len(xs) and len(xs8) < 8:
+        xs8.append(xs.pop())
+      total = add_n8_op(xs8, name=name)
+    return total
+
+old_add_n = None
+def replace_add_n():
+    from tensorflow.python.ops import math_ops
+    global old_add_n
+    old_add_n = math_ops.add_n
+    math_ops.add_n = add_n
+
+def restore_add_n():
+    from tensorflow.python.ops import math_ops
+    global old_add_n
+    math_ops.add_n = old_add_n
+
+
+############################## BiasRelu #####################################
+
+bias_relu_op      = _op_module.bias_relu
+bias_relu_grad_op = _op_module.bias_relu_grad
+bias_grad_op      = _op_module.bias_grad
+
+def bias_relu(x, b, relu=True, atomics=True, bench=0, use_tf=False):
+
+    dev = x.op.device.lower()
+    if use_tf or not dev or "cpu" in dev:
+        y = tf.nn.bias_add(x, b)
+        if relu:
+            y = tf.nn.relu(y)
+        return y
+
+    return bias_relu_op(x, b, relu=relu, bench=bench, atomics=atomics)
+
+@ops.RegisterGradient("BiasRelu")
+def bias_relu_grad(op, dy):
+
+    atomics = op.get_attr("atomics")
+    bench   = op.get_attr("bench")
+
+    if op.get_attr("relu"):
+        #return bias_relu_grad_op(dy, op.outputs[0], op.inputs[1], bench=op.get_attr("bench"))
+        dx, db, _ = bias_relu_grad_op(dy, op.outputs[0], op.inputs[1], atomics=atomics, bench=bench)
+        return dx, db
+
+    # dx = dy if no relu
+    #db = bias_grad_op(dy, op.inputs[1], bench=op.get_attr("bench"))
+    db, _ = bias_grad_op(dy, op.inputs[1], atomics=atomics, bench=bench)
+
+    return (dy, db)
+
+############################## FancyGather #####################################
+
+fancy_gather_op      = _op_module.fancy_gather
+fancy_gather_grad_op = _op_module.fancy_gather_grad
+
+def fancy_gather(x, idx, use_tf=False):
+
+    x_rank = len(x.shape)
+    i_rank = len(idx.shape)
+    assert x_rank > i_rank
+
+    dev = x.device.lower()
+    if use_tf or not dev or "cpu" in dev:
+        idx = tf.maximum(idx, 0)
+        flat_shape = tf.concat([[-1], tf.shape(x)[i_rank + 1:]], axis=0)
+
+        xx = tf.reshape(x, flat_shape)
+        ii = tf.expand_dims(
+                tf.range(0, tf.reduce_prod(tf.shape(x)[:i_rank])) * tf.shape(x)[i_rank] + tf.reshape(idx, [-1]),
+                1)
+        return tf.reshape(
+            tf.gather_nd(xx, ii),
+            tf.concat([tf.shape(idx), tf.shape(x)[i_rank + 1:]], axis=0),
+        )
+
+    if x_rank > i_rank + 1:
+        # temp restriction for now... easily fixed
+        assert x.shape[i_rank + 1:].num_elements() <= 1024
+
+    return fancy_gather_op(x, idx, idx_dim=x.shape[i_rank].value)
+
+@ops.RegisterGradient("FancyGather")
+def fancy_gather_grad(op, dy):
+    dx = fancy_gather_grad_op(dy, op.inputs[1], idx_dim=op.get_attr("idx_dim"))
+    return (dx, None)
+
+
+############################## ReduceMax #####################################
+
+reduce_max_op      = _op_module.reduce_max
+reduce_max_grad_op = _op_module.reduce_max_grad
+
+def reduce_max(x, axis, keepdims=False, use_tf=False):
+
+    shape = x.shape.as_list()
+    assert type(axis) is int, "reshape prior to op to support contiguous index ranges"
+    assert shape[axis] is not None, "reduction over unknown dimension size not supported"
+
+    if axis < 0:
+        axis += len(shape)
+
+    dev = x.op.device.lower()
+    if use_tf or not dev or "cpu" in dev or axis == len(shape)-1:
+        return tf.reduce_max(x, axis=axis, keepdims=keepdims)
+
+    idx_dtype = tf.uint16 if shape[axis] > 256 else tf.uint8
+
+    y, a = reduce_max_op(x, axis=axis, keepdims=keepdims, TA=idx_dtype)
+    return y
+
+@ops.RegisterGradient("ReduceMax")
+def reduce_max_grad(op, dy, a):
+
+    axis      = op.get_attr("axis")
+    keepdims  = op.get_attr("keepdims")
+    axis_size = op.inputs[0].shape[axis].value
+
+    return reduce_max_grad_op(dy, op.outputs[1], axis=axis, axis_size=axis_size, keepdims=keepdims)
+
+
+
+# if mpi_rank == 0:
+#     with tf.device("/gpu:0"), tf.name_scope("LogStats"):
+#         for i, (grad, param) in enumerate(zip(grads, params)):
+#             name = param.op.name + "_" + "_".join(str(x) for x in param.shape.as_list())
+#             grads[i] = ew.log_stats(grad, step, logfile="scale_14.txt", name=name)
 
 # def sig_test(x):
 #     return 1.0/(1.0 + np.exp(-x))
@@ -358,4 +436,13 @@ def add_n8(xs, name="AddN"):
 
 # def gain_mul_grad_test(dz, x, g):
 #     return (dz * g, np.sum(dz * x, axis=0, keepdims=True))
+# ebits = 4
+# fbits = 3
+# ebias = 8
+# for exp in range(1 << ebits):
+#     for frac in range(1 << fbits):
+#         frac /= 1 << fbits
+#         f8 = (1 + frac) * 2**(exp - ebias)
+#         l8 = 2**(exp + frac - ebias)
+#         print("%2d %.3f %9.5f %9.5f" % (exp-ebias, frac, f8, l8))
 

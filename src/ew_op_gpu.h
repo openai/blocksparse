@@ -353,6 +353,7 @@ __device__ __forceinline__ float8 to_float(ehalf8 v)
 
 __device__ __forceinline__ ehalf  to_ehalf(float  v)
 {
+    v = fmaxf(fminf(v, 65504.0f), -65504.0f);
     ehalf r;
     asm("cvt.rn.f16.f32 %0, %1;" : "=h"(r.x) : "f"(v));
     return r;
@@ -360,6 +361,8 @@ __device__ __forceinline__ ehalf  to_ehalf(float  v)
 
 __device__ __forceinline__ ehalf2 to_ehalf(float2 v)
 {
+    v.x = fmaxf(fminf(v.x, 65504.0f), -65504.0f);
+    v.y = fmaxf(fminf(v.y, 65504.0f), -65504.0f);
     ehalf2 r;
     asm("{\n\t"
         ".reg .f16 a, b;\n\t"
@@ -371,6 +374,10 @@ __device__ __forceinline__ ehalf2 to_ehalf(float2 v)
 }
 __device__ __forceinline__ ehalf4 to_ehalf(float4 v)
 {
+    v.x = fmaxf(fminf(v.x, 65504.0f), -65504.0f);
+    v.y = fmaxf(fminf(v.y, 65504.0f), -65504.0f);
+    v.z = fmaxf(fminf(v.z, 65504.0f), -65504.0f);
+    v.w = fmaxf(fminf(v.w, 65504.0f), -65504.0f);
     ehalf4 r;
     asm("{\n\t"
         ".reg .f16 a, b, c, d;\n\t"
@@ -385,6 +392,14 @@ __device__ __forceinline__ ehalf4 to_ehalf(float4 v)
 }
 __device__ __forceinline__ ehalf8 to_ehalf(float8 v)
 {
+    v.a.x = fmaxf(fminf(v.a.x, 65504.0f), -65504.0f);
+    v.a.y = fmaxf(fminf(v.a.y, 65504.0f), -65504.0f);
+    v.a.z = fmaxf(fminf(v.a.z, 65504.0f), -65504.0f);
+    v.a.w = fmaxf(fminf(v.a.w, 65504.0f), -65504.0f);
+    v.b.x = fmaxf(fminf(v.b.x, 65504.0f), -65504.0f);
+    v.b.y = fmaxf(fminf(v.b.y, 65504.0f), -65504.0f);
+    v.b.z = fmaxf(fminf(v.b.z, 65504.0f), -65504.0f);
+    v.b.w = fmaxf(fminf(v.b.w, 65504.0f), -65504.0f);
     ehalf8 r;
     asm("{\n\t"
         ".reg .f16 v<8>;\n\t"
@@ -627,49 +642,77 @@ __device__ __forceinline__ float8 __ldg(const float8 *ptr)
 }
 
 
-__device__ __forceinline__ void __stg(const ehalf *ptr, ehalf val)
+__device__ __forceinline__ void __stg(ehalf *ptr, ehalf val)
 {
     asm volatile ("st.global.wb.u16 [%0], %1;" :: "l"(ptr), "h"(val.x)  );
 }
-__device__ __forceinline__ void __stg(const ehalf2 *ptr, ehalf2 val)
+__device__ __forceinline__ void __stg(ehalf2 *ptr, ehalf2 val)
 {
     asm volatile ("st.global.wb.u32 [%0], %1;" :: "l"(ptr), "r"(val.x)  );
 }
-__device__ __forceinline__ void __stg(const ehalf4 *ptr, ehalf4 val)
+__device__ __forceinline__ void __stg(ehalf4 *ptr, ehalf4 val)
 {
     asm volatile ("st.global.wb.v2.u32 [%0], {%1, %2};" :: "l"(ptr), "r"(val.x), "r"(val.y)  );
 }
-__device__ __forceinline__ void __stg(const ehalf8 *ptr, ehalf8 val)
+__device__ __forceinline__ void __stg(ehalf8 *ptr, ehalf8 val)
 {
     asm volatile ("st.global.wb.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  );
 }
-__device__ __forceinline__ void __stg(const bhalf *ptr, bhalf val)
+__device__ __forceinline__ void __stg(bhalf *ptr, bhalf val)
 {
     asm volatile ("st.global.wb.u16 [%0], %1;" :: "l"(ptr), "h"(val.x)  );
 }
-__device__ __forceinline__ void __stg(const bhalf2 *ptr, bhalf2 val)
+__device__ __forceinline__ void __stg(bhalf2 *ptr, bhalf2 val)
 {
     asm volatile ("st.global.wb.u32 [%0], %1;" :: "l"(ptr), "r"(val.x)  );
 }
-__device__ __forceinline__ void __stg(const bhalf4 *ptr, bhalf4 val)
+__device__ __forceinline__ void __stg(bhalf4 *ptr, bhalf4 val)
 {
     asm volatile ("st.global.wb.v2.u32 [%0], {%1, %2};" :: "l"(ptr), "r"(val.x), "r"(val.y)  );
 }
-__device__ __forceinline__ void __stg(const bhalf8 *ptr, bhalf8 val)
+__device__ __forceinline__ void __stg(bhalf8 *ptr, bhalf8 val)
 {
     asm volatile ("st.global.wb.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(ptr), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)  );
 }
-__device__ __forceinline__ void __stg(const float *ptr, float val)
+__device__ __forceinline__ void __stg(float *ptr, float val)
 {
     asm volatile ("st.global.wb.f32 [%0], %1;" :: "l"(ptr), "f"(val)  );
 }
-__device__ __forceinline__ void __stg(const float2 *ptr, float2 val)
+__device__ __forceinline__ void __stg(float2 *ptr, float2 val)
 {
     asm volatile ("st.global.wb.v2.f32 [%0], {%1, %2};" :: "l"(ptr), "f"(val.x), "f"(val.y)  );
 }
-__device__ __forceinline__ void __stg(const float4 *ptr, float4 val)
+__device__ __forceinline__ void __stg(float4 *ptr, float4 val)
 {
     asm volatile ("st.global.wb.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(ptr), "f"(val.x), "f"(val.y), "f"(val.z), "f"(val.w)  );
+}
+
+
+__device__ __forceinline__ void __stg(unsigned char *ptr, uint val)
+{
+    asm volatile ("st.global.wb.u8 [%0], %1;" :: "l"(ptr), "r"(val) );
+}
+__device__ __forceinline__ void __stg(ushort *ptr, uint val)
+{
+    asm volatile ("st.global.wb.u16 [%0], %1;" :: "l"(ptr), "r"(val) );
+}
+__device__ __forceinline__ void __stg(uint *ptr, uint val)
+{
+    asm volatile ("st.global.wb.u32 [%0], %1;" :: "l"(ptr), "r"(val) );
+}
+
+
+__device__ __forceinline__ void __stg(char *ptr, int val)
+{
+    asm volatile ("st.global.wb.s8 [%0], %1;" :: "l"(ptr), "r"(val) );
+}
+__device__ __forceinline__ void __stg(short *ptr, int val)
+{
+    asm volatile ("st.global.wb.s16 [%0], %1;" :: "l"(ptr), "r"(val) );
+}
+__device__ __forceinline__ void __stg(int *ptr, int val)
+{
+    asm volatile ("st.global.wb.s32 [%0], %1;" :: "l"(ptr), "r"(val) );
 }
 
 
@@ -718,6 +761,11 @@ __device__ __forceinline__  void st_shared_v4(int a, float* v)
     asm volatile ("st.shared.v4.f32 [%0], {%1, %2, %3, %4};" :: "r"(a), "f"(v[0]),"f"(v[1]),"f"(v[2]),"f"(v[3]) );
 }
 
+__device__ __forceinline__  void st_shared_v8(uint a, ehalf8 v)
+{
+    asm volatile ("st.shared.v4.u32 [%0], {%1, %2, %3, %4};" :: "r"(a), "r"(v.x),"r"(v.y),"r"(v.z),"r"(v.w) );
+}
+
 __device__ __forceinline__ void ld_shared(int a, float* v, int x)
 {
          if (x == 4) ld_shared_v4(a, v);
@@ -732,15 +780,49 @@ __device__ __forceinline__ void st_shared(int a, float* v, int x)
     else             st_shared_v1(a, v);
 }
 
-__device__ __forceinline__ void atomicRed(float *ptr, float val)
+__device__ __forceinline__ void atomicRed(float *ptr, float val, int i=0, bool b=true)
 {
-    asm volatile ("red.global.gpu.add.f32 [%0], %1;" :: "l"(ptr), "f"(val)  );
+    if (b)
+        asm volatile ("red.global.add.f32 [%0], %1;" :: "l"(ptr+i), "f"(val)  );
+}
+__device__ __forceinline__ void atomicRed(float4 *ptr, float4 val, int i=0, bool b=true)
+{
+    if (b)
+        asm volatile ("red.global.add.f32 [%0], %1;" :: "l"(ptr+i), "f"(val.x)  );
+}
+__device__ __forceinline__ void atomicRedMax(float *ptr, float val)
+{
+    asm volatile ("red.global.max.u32 [%0], %1;" :: "l"(ptr), "r"(*(uint*)&val) );
 }
 
 __device__ __forceinline__ float shfl_xor(float var, int laneMask)
 {
     float ret;
-    asm volatile ("shfl.bfly.b32 %0, %1, %2, %3;" : "=f"(ret) : "f"(var), "r"(laneMask), "r"(0x1f));
+# if CUDA_VERSION >= 9020
+    asm volatile ("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(ret) : "f"(var), "r"(laneMask));
+# else
+    asm volatile ("shfl.bfly.b32 %0, %1, %2, 0x1f;" : "=f"(ret) : "f"(var), "r"(laneMask));
+# endif
+    return ret;
+}
+__device__ __forceinline__ uint shfl_xor(uint var, int laneMask)
+{
+    uint ret;
+# if CUDA_VERSION >= 9020
+    asm volatile ("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=r"(ret) : "r"(var), "r"(laneMask));
+# else
+    asm volatile ("shfl.bfly.b32 %0, %1, %2, 0x1f;" : "=r"(ret) : "r"(var), "r"(laneMask));
+# endif
+    return ret;
+}
+__device__ __forceinline__ int shfl_xor(int var, int laneMask)
+{
+    int ret;
+# if CUDA_VERSION >= 9020
+    asm volatile ("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=r"(ret) : "r"(var), "r"(laneMask));
+# else
+    asm volatile ("shfl.bfly.b32 %0, %1, %2, 0x1f;" : "=r"(ret) : "r"(var), "r"(laneMask));
+# endif
     return ret;
 }
 
@@ -765,19 +847,7 @@ __device__ __forceinline__ int mod_blkX(int bxy, int blkX, int by)
     return bx;
 }
 
-#define ADD_PTR(T) \
-__device__ __forceinline__ const T* add_ptr(const T* src, int offset) \
-{                                                                     \
-    const T* dst;                                                     \
-    asm("{\n\t"                                                       \
-        ".reg .u64 offset;\n\t"                                       \
-        "mov.b64 offset, {%2,0};\n\t"                                 \
-        "add.u64 %0, %1, offset;\n\t"                                 \
-        "}" : "=l"(dst) : "l"(src), "r"(offset));                     \
-    return dst;                                                       \
-}
-
-#define ADD_PTR_S(T,V) \
+#define ADD_PTR_S(T) \
 __device__ __forceinline__ const T* add_ptr_s(const T* src, int offset)     \
 {                                                                           \
     const T* dst;                                                           \
@@ -789,7 +859,7 @@ __device__ __forceinline__ const T* add_ptr_s(const T* src, int offset)     \
         "add.cc.u32  lo,lo,  of; \n\t"                                      \
         "addc.u32    hi,hi,  cc; \n\t"                                      \
         "mov.b64 %0, {lo,hi};    \n\t"                                      \
-        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)/V)); \
+        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)));   \
     return dst;                                                             \
 }                                                                           \
 __device__ __forceinline__ T* add_ptr_s(T* src, int offset)                 \
@@ -803,11 +873,11 @@ __device__ __forceinline__ T* add_ptr_s(T* src, int offset)                 \
         "add.cc.u32  lo,lo,  of; \n\t"                                      \
         "addc.u32    hi,hi,  cc; \n\t"                                      \
         "mov.b64 %0, {lo,hi};    \n\t"                                      \
-        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)/V)); \
+        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)));   \
     return dst;                                                             \
 }
 
-#define ADD_PTR_U(T,V) \
+#define ADD_PTR_U(T) \
 __device__ __forceinline__ const T* add_ptr_u(const T* src, int offset)      \
 {                                                                            \
     const T* dst;                                                            \
@@ -818,7 +888,7 @@ __device__ __forceinline__ const T* add_ptr_u(const T* src, int offset)      \
         "add.cc.u32  lo,lo,  of; \n\t"                                       \
         "addc.u32    hi,hi,  0;  \n\t"                                       \
         "mov.b64 %0, {lo,hi};    \n\t"                                       \
-        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)/V));  \
+        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)));    \
     return dst;                                                              \
 }                                                                            \
 __device__ __forceinline__ T* add_ptr_u(T* src, int offset)                  \
@@ -831,55 +901,49 @@ __device__ __forceinline__ T* add_ptr_u(T* src, int offset)                  \
         "add.cc.u32  lo,lo,  of; \n\t"                                       \
         "addc.u32    hi,hi,  0;  \n\t"                                       \
         "mov.b64 %0, {lo,hi};    \n\t"                                       \
-        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)/V));  \
+        "}" : "=l"(dst) : "l"(src), "r"(offset), "r"((int)sizeof(*src)));    \
     return dst;                                                              \
 }
 
-ADD_PTR(ehalf )
-ADD_PTR(ehalf2)
-ADD_PTR(ehalf4)
-ADD_PTR(ehalf8)
+ADD_PTR_S(ehalf )
+ADD_PTR_S(ehalf2)
+ADD_PTR_S(ehalf4)
+ADD_PTR_S(ehalf8)
 
-ADD_PTR(bhalf )
-ADD_PTR(bhalf2)
-ADD_PTR(bhalf4)
-ADD_PTR(bhalf8)
+ADD_PTR_S(bhalf )
+ADD_PTR_S(bhalf2)
+ADD_PTR_S(bhalf4)
+ADD_PTR_S(bhalf8)
 
-ADD_PTR(float )
-ADD_PTR(float2)
-ADD_PTR(float4)
-ADD_PTR(float8)
+ADD_PTR_S(float )
+ADD_PTR_S(float2)
+ADD_PTR_S(float4)
+ADD_PTR_S(float8)
 
-ADD_PTR_S(ehalf ,1)
-ADD_PTR_S(ehalf2,2)
-ADD_PTR_S(ehalf4,4)
-ADD_PTR_S(ehalf8,8)
+ADD_PTR_S(unsigned char)
+ADD_PTR_S(unsigned short)
+ADD_PTR_S(unsigned int)
+ADD_PTR_S(int)
 
-ADD_PTR_S(bhalf ,1)
-ADD_PTR_S(bhalf2,2)
-ADD_PTR_S(bhalf4,4)
-ADD_PTR_S(bhalf8,8)
+ADD_PTR_U(ehalf )
+ADD_PTR_U(ehalf2)
+ADD_PTR_U(ehalf4)
+ADD_PTR_U(ehalf8)
 
-ADD_PTR_S(float ,1)
-ADD_PTR_S(float2,2)
-ADD_PTR_S(float4,4)
-ADD_PTR_S(float8,8)
+ADD_PTR_U(bhalf )
+ADD_PTR_U(bhalf2)
+ADD_PTR_U(bhalf4)
+ADD_PTR_U(bhalf8)
 
+ADD_PTR_U(float )
+ADD_PTR_U(float2)
+ADD_PTR_U(float4)
+ADD_PTR_U(float8)
 
-ADD_PTR_U(ehalf ,1)
-ADD_PTR_U(ehalf2,2)
-ADD_PTR_U(ehalf4,4)
-ADD_PTR_U(ehalf8,8)
-
-ADD_PTR_U(bhalf ,1)
-ADD_PTR_U(bhalf2,2)
-ADD_PTR_U(bhalf4,4)
-ADD_PTR_U(bhalf8,8)
-
-ADD_PTR_U(float ,1)
-ADD_PTR_U(float2,2)
-ADD_PTR_U(float4,4)
-ADD_PTR_U(float8,8)
+ADD_PTR_U(unsigned char)
+ADD_PTR_U(unsigned short)
+ADD_PTR_U(unsigned int)
+ADD_PTR_U(int)
 
 __device__ __forceinline__ void ew_zero(ehalf  &a) { a.x = 0; }
 __device__ __forceinline__ void ew_zero(ehalf2 &a) { a.x = 0; }
@@ -896,6 +960,11 @@ __device__ __forceinline__ void ew_zero(float2 &a) { a.x = a.y = 0.0f; }
 __device__ __forceinline__ void ew_zero(float4 &a) { a.x = a.y = a.z = a.w = 0.0f; }
 __device__ __forceinline__ void ew_zero(float8 &v) { ew_zero(v.a); ew_zero(v.b); }
 
+__device__ __forceinline__ void ew_set(float  &a, float val) { a = val; }
+__device__ __forceinline__ void ew_set(float2 &a, float val) { a.x = a.y = val; }
+__device__ __forceinline__ void ew_set(float4 &a, float val) { a.x = a.y = a.z = a.w = val; }
+__device__ __forceinline__ void ew_set(float8 &v, float val) { ew_set(v.a, val); ew_set(v.b, val); }
+
 
 __device__ __forceinline__ float  _add(float x, float y) { return x + y; }
 __device__ __forceinline__ float  _sub(float x, float y) { return x - y; }
@@ -907,6 +976,9 @@ __device__ __forceinline__ float  _sqr(float x) { return x*x; }
 __device__ __forceinline__ float  _sig(float x) { return 1.0f/(1.0f + expf(-x)); }
 __device__ __forceinline__ float _relu(float x) { return fmaxf(x, 0.0f); }
 __device__ __forceinline__ float  _elu(float x, float a) { return x > 0.0f ? x : a * (expf(x) - 1.0f); }
+
+//__device__ __forceinline__ void  _argmax(float &maxval, uint &maxarg, float val, uint idx) { if (val > maxval) { maxval = val; maxarg = idx; } }
+
 
 __device__ __forceinline__ float  _div_grad(float dz, float x, float y) { return -dz * x / (y*y); }
 __device__ __forceinline__ float  _max_grad(float dz, float x, float y) { return dz * (x >= y); }
@@ -940,7 +1012,9 @@ __device__ __forceinline__ float2 load(const bhalf2* __restrict__ in, int i=0, b
 __device__ __forceinline__ float4 load(const bhalf4* __restrict__ in, int i=0, bool b=true) { bhalf4 v; ew_zero(v); if (b) v = __ldg(in + i); return to_float(v); }
 __device__ __forceinline__ float8 load(const bhalf8* __restrict__ in, int i=0, bool b=true) { bhalf8 v; ew_zero(v); if (b) v = __ldg(in + i); return to_float(v); }
 
-__device__ __forceinline__ int    load(const int*    __restrict__ in, int i=0, bool b=true) { int v = 0;   if (b) v = __ldg(in + i); return v; }
+__device__ __forceinline__  int   load(const  int*   __restrict__ in, int i=0, bool b=true) {  int v = 0;  if (b) v = __ldg(in + i); return v; }
+__device__ __forceinline__ uint   load(const uint*   __restrict__ in, int i=0, bool b=true) { uint v = 0;  if (b) v = __ldg(in + i); return v; }
+
 
 // load into float array
 __device__ __forceinline__ void load(float* ret, const float*  __restrict__ in, int i=0, bool b=true) { float  v; ew_zero(v); if (b) v = __ldg(in + i); *(float *)ret = v; }
@@ -979,15 +1053,19 @@ __device__ __forceinline__ void store(float2* out, float2 v, int i=0, bool b=tru
 __device__ __forceinline__ void store(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
 __device__ __forceinline__ void store(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
 
-__device__ __forceinline__ void store_f(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-__device__ __forceinline__ void store_f(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-__device__ __forceinline__ void store_f(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-__device__ __forceinline__ void store_f(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
+__device__ __forceinline__ void store(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
+__device__ __forceinline__ void store(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
+__device__ __forceinline__ void store(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
+__device__ __forceinline__ void store(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
 
-__device__ __forceinline__ void store_g(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-__device__ __forceinline__ void store_g(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-__device__ __forceinline__ void store_g(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-__device__ __forceinline__ void store_g(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
+__device__ __forceinline__ void store(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
+__device__ __forceinline__ void store(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
+__device__ __forceinline__ void store(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
+__device__ __forceinline__ void store(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
+
+
+__device__ __forceinline__ void store( int*  out,  int v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+__device__ __forceinline__ void store(uint*  out, uint v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
 
 // __device__ __forceinline__ void store_f(float*  out, float  v, int i=0, bool b=true) { float  r = round3f(v); if (b) __stg(out + i, r); }
 // __device__ __forceinline__ void store_f(float2* out, float2 v, int i=0, bool b=true) { float2 r = round3f(v); if (b) __stg(out + i, r); }
@@ -1000,37 +1078,35 @@ __device__ __forceinline__ void store_g(float8* out, float8 v, int i=0, bool b=t
 // __device__ __forceinline__ void store_g(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
 
 
+// __device__ __forceinline__ void store_f(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+// __device__ __forceinline__ void store_f(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+// __device__ __forceinline__ void store_f(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+// __device__ __forceinline__ void store_f(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
 
-__device__ __forceinline__ void store(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
 
-__device__ __forceinline__ void store(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_f(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
 
-__device__ __forceinline__ void store_f(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_f(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_f(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_f(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
 
-__device__ __forceinline__ void store_f(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_f(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_f(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_f(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
+// __device__ __forceinline__ void store_g(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
 
-__device__ __forceinline__ void store_g(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_g(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_g(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_g(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
-
-__device__ __forceinline__ void store_g(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_g(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_g(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
-__device__ __forceinline__ void store_g(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
-
+// __device__ __forceinline__ void store_g(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+// __device__ __forceinline__ void store_g(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+// __device__ __forceinline__ void store_g(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
+// __device__ __forceinline__ void store_g(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
 
 
 // For unused code paths but the compiler still needs to process.
@@ -1044,7 +1120,7 @@ __device__ __forceinline__ void store(bhalf2* out, float v, int i=0, bool b=true
 
 __device__ __forceinline__ float ew_sum(float  a) { return a; }
 __device__ __forceinline__ float ew_sum(float2 a) { return a.x + a.y; }
-__device__ __forceinline__ float ew_sum(float4 a) { return a.x + a.y + a.z + a.w; }
+__device__ __forceinline__ float ew_sum(float4 a) { return (a.x + a.y) + (a.z + a.w); }
 __device__ __forceinline__ float ew_sum(float8 v) { return ew_sum(v.a) + ew_sum(v.b); }
 
 __device__ __forceinline__ float  ew_warp_sum(float  a, int i) { a   += shfl_xor(a, i); return a; }

@@ -1,6 +1,5 @@
 
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 // #include <stdio.h>
 #include "ew_op_gpu.h"
@@ -81,69 +80,81 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x8_xprop(
     float regY[4][8];
     for (int w = 0; w < 4; w++)
         for (int x = 0; x < 8; x++)
-            regY[w][x] = 0;
+            // use asm here to ensure this happens after main loop skipping
+            asm volatile ("mov.b32 %0, 0;" : "=f"(regY[w][x]) :);
+
+    // skip loop if empty lut
+    // Compiler generates suboptimal code if a simple "for loop" is used.
+    asm volatile (".reg .pred lut_zero; \n\t"
+        "setp.eq.u32 lut_zero, %0, 0;   \n\t"
+        "@lut_zero bra.uni END_LOOP;" :: "r"(lut_size));
 
     // loop over each lut entry to compute a gemm block
-    int i = 0;
-    #pragma unroll 1
-    do
     {
-        int2 entry = Lut2s[i++];
-
-        entry.x += offsetX;
-        entry.y += tid*4;
-
-        const TW* W0;
-        const TX* X0;
-        const TX* X4;
-        // Simplify pointer arithmatic by letting compiler assume all offsets fit in 32 bits.
-        asm("{\n\t"
-            ".reg .u64 x0, x4, w0;\n\t"
-            "mov.b64 w0, {%5, 0};\n\t"
-            "mov.b64 x0, {%6, 0};\n\t"
-            "mov.b64 x4, {%7, 0};\n\t"
-            "add.u64 %0, w0, %3;\n\t"
-            "add.u64 %1, x0, %4;\n\t"
-            "add.u64 %2, x4, %4;\n\t"
-            "}" : "=l"(W0),"=l"(X0),"=l"(X4) : "l"(W), "l"(X), "r"(entry.y), "r"(entry.x), "r"(entry.x + N*4*8*2) );
-
-        // Fetch 8 rows at a time from W and X
-        float2 w0 = load(W0, 0);
-        float8 x0 = load(X0, 0, bn);
-        float8 x4 = load(X4, 0, bn);
-
-        // store to shared.
-        if (Fprop)
-            st_shared_v2(storWs + 64*8*4, w0);
-        else
+        int i = 0;
+        #pragma unroll 1
+        do
         {
-            // transpose the shared store of W
-            st_shared_v1(storWs + 0*4 + 64*8*4, w0.x);
-            st_shared_v1(storWs + 8*4 + 64*8*4, w0.y);
-        }
-        st_shared_v4(storXs + (0*64 + 0*32)*4, x0.a);
-        st_shared_v4(storXs + (0*64 + 1*32)*4, x0.b);
-        st_shared_v4(storXs + (4*64 + 0*32)*4, x4.a);
-        st_shared_v4(storXs + (4*64 + 1*32)*4, x4.b);
+            int2 entry = Lut2s[i++];
 
-        // computes an 8x64x8 gemm tile with 4x8 register blocking
-        float regW[4];
-        float regX[8];
-        #pragma unroll
-        for (int j = 0; j < 4; j++)
-        {
-            // fetch outer product data
-            ld_shared_v4(readWs + ( 8*j + 64*8 + (Fprop ? 0 : (j>>1)*8))*4, regW ); // shift over 8 floats every 2 rows
-            ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
-            ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+            entry.x += offsetX;
+            entry.y += tid*4;
 
-            // accumulate outer product
-            for (int w = 0; w < 4; w++)
-                for (int x = 0; x < 8; x++)
-                    regY[w][x] += regW[w] * regX[x];
-        }
+            const TW* W0;
+            const TX* X0;
+            const TX* X4;
+            // Simplify pointer arithmatic by letting compiler assume all offsets fit in 32 bits.
+            asm("{\n\t"
+                ".reg .u64 x0, x4, w0;\n\t"
+                "mov.b64 w0, {%5, 0};\n\t"
+                "mov.b64 x0, {%6, 0};\n\t"
+                "mov.b64 x4, {%7, 0};\n\t"
+                "add.u64 %0, w0, %3;\n\t"
+                "add.u64 %1, x0, %4;\n\t"
+                "add.u64 %2, x4, %4;\n\t"
+                "}" : "=l"(W0),"=l"(X0),"=l"(X4) : "l"(W), "l"(X), "r"(entry.y), "r"(entry.x), "r"(entry.x + N*4*8*2) );
 
-    } while (i < lut_size);
+            // Fetch 8 rows at a time from W and X
+            float2 w0 = load(W0, 0);
+            float8 x0 = load(X0, 0, bn);
+            float8 x4 = load(X4, 0, bn);
+
+            // store to shared.
+            if (Fprop)
+                st_shared_v2(storWs + 64*8*4, w0);
+            else
+            {
+                // transpose the shared store of W
+                st_shared_v1(storWs + 0*4 + 64*8*4, w0.x);
+                st_shared_v1(storWs + 8*4 + 64*8*4, w0.y);
+            }
+            st_shared_v4(storXs + (0*64 + 0*32)*4, x0.a);
+            st_shared_v4(storXs + (0*64 + 1*32)*4, x0.b);
+            st_shared_v4(storXs + (4*64 + 0*32)*4, x4.a);
+            st_shared_v4(storXs + (4*64 + 1*32)*4, x4.b);
+
+            // computes an 8x64x8 gemm tile with 4x8 register blocking
+            float regW[4];
+            float regX[8];
+            #pragma unroll
+            for (int j = 0; j < 4; j++)
+            {
+                // fetch outer product data
+                ld_shared_v4(readWs + ( 8*j + 64*8 + (Fprop ? 0 : (j>>1)*8))*4, regW ); // shift over 8 floats every 2 rows
+                ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
+                ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+
+                // accumulate outer product
+                for (int w = 0; w < 4; w++)
+                    for (int x = 0; x < 8; x++)
+                        regY[w][x] += regW[w] * regX[x];
+            }
+
+        } while (i < lut_size);
+    }
+    asm volatile ("\nEND_LOOP:\n":: );
+    asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
+    asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_N) :);
 
     int tidN = (tid >> 1) & 7;
     int tidK = tid  & 1;
@@ -158,7 +169,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x8_xprop(
         {
             float swap = t16 ? regY[2*w + 0][x] : regY[2*w + 1][x];
             outY[w][x] = t16 ? regY[2*w + 1][x] : regY[2*w + 0][x];
-            outY[w][x] += __shfl_xor(swap, 16);
+            outY[w][x] += shfl_xor(swap, 16);
         }
     }
 
@@ -244,9 +255,6 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x4_xprop(
 
     int4 lut_head = ((const int4*)Lut)[idx_L];
 
-    // used to zero accumulation registers
-    shrX1[tid] = 0.0f;
-
     int tid15 = tid & 15;
     int tid16 = tid >> 4;
 
@@ -298,63 +306,75 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x4_xprop(
         entry.y *= 32;
         Lut2_s[i] = entry;
     }
-    float regX[4];
-    float regW[4];
-    float regY[4][4];
-
     // zero accumulation registers
+    float regY[4][4];
     for (int w = 0; w < 4; w++)
-        *(float4*)regY[w] = shrX4[w];
+        for (int x = 0; x < 4; x++)
+            // use asm here to ensure this happens after main loop skipping
+            asm volatile ("mov.b32 %0, 0;" : "=f"(regY[w][x]) :);
+
+    // skip loop if empty lut
+    // Compiler generates suboptimal code if a simple "for loop" is used.
+    asm volatile (".reg .pred lut_zero; \n\t"
+        "setp.eq.u32 lut_zero, %0, 0;   \n\t"
+        "@lut_zero bra.uni END_LOOP;" :: "r"(lut_size));
 
     // loop over each lut entry to compute a gemm block
-    #pragma unroll 1
-    for (int i = 0; i < lut_size; i++)
     {
-        int2 entry = Lut2_s[i];
+        int i = 0;
+        #pragma unroll 1
+        do
+        {
+            int2 entry = Lut2_s[i++];
 
-        // Fetch 8 rows at a time from W and X
-        TW w0;
-        TX x0, x2, x4, x6;
-        w0 = W0[entry.y];
-        if (bn)
-        {
-            x0 = X0[entry.x];
-            x2 = X2[entry.x];
-            x4 = X4[entry.x];
-            x6 = X6[entry.x];
-        }
-        // Convert to float if needed and store to shared.
-        if (Fprop)
-            storW2[0] = to_float(w0);
-        else
-        {
-            // transpose the shared store of W
-            float2 w2 = to_float(w0);
-            storW1[0] = w2.x;
-            storW1[8] = w2.y;
-        }
-        storX4[0*16] = to_float(x0);
-        storX4[2*16] = to_float(x2);
-        storX4[4*16] = to_float(x4);
-        storX4[6*16] = to_float(x6);
+            // Fetch 8 rows at a time from W and X
+            TW w0;
+            TX x0, x2, x4, x6;
+            w0 = W0[entry.y];
+            if (bn)
+            {
+                x0 = X0[entry.x];
+                x2 = X2[entry.x];
+                x4 = X4[entry.x];
+                x6 = X6[entry.x];
+            }
+            // Convert to float if needed and store to shared.
+            if (Fprop)
+                storW2[0] = to_float(w0);
+            else
+            {
+                // transpose the shared store of W
+                float2 w2 = to_float(w0);
+                storW1[0] = w2.x;
+                storW1[8] = w2.y;
+            }
+            storX4[0*16] = to_float(x0);
+            storX4[2*16] = to_float(x2);
+            storX4[4*16] = to_float(x4);
+            storX4[6*16] = to_float(x6);
 
-        // computes an 8x64x8 gemm block
-        #pragma unroll
-        for (int j = 0; j < 8; j++)
-        {
-            // fetch outer product data
-            *(float2*)&regX[0] = readX2[32*j +  0];
-            *(float2*)&regW[0] = readW2[ 4*j +  0 + (Fprop ? 0 : (j>>1)*4)]; // shift over 8 floats every 2 rows
-            *(float2*)&regX[2] = readX2[32*j + 16];
-            *(float2*)&regW[2] = readW2[ 4*j +  2 + (Fprop ? 0 : (j>>1)*4)];
-            // accumulate outer product
-            for (int w = 0; w < 4; w++)
-                for (int x = 0; x < 4; x++)
-                    regY[w][x] += regW[w] * regX[x];
-        }
+            // computes an 8x64x8 gemm block
+            float regX[4];
+            float regW[4];
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                // fetch outer product data
+                *(float2*)&regX[0] = readX2[32*j +  0];
+                *(float2*)&regW[0] = readW2[ 4*j +  0 + (Fprop ? 0 : (j>>1)*4)]; // shift over 8 floats every 2 rows
+                *(float2*)&regX[2] = readX2[32*j + 16];
+                *(float2*)&regW[2] = readW2[ 4*j +  2 + (Fprop ? 0 : (j>>1)*4)];
+                // accumulate outer product
+                for (int w = 0; w < 4; w++)
+                    for (int x = 0; x < 4; x++)
+                        regY[w][x] += regW[w] * regX[x];
+            }
+        } while (i < lut_size);
     }
-    tid   = threadIdx.x;
-    idx_N = blockIdx.x;
+    asm volatile ("\nEND_LOOP:\n":: );
+    asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
+    asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_N) :);
+
     tid15 = tid >> 1;
     tid16 = tid  & 1;
     N2    = N >> 1;
@@ -525,78 +545,91 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x8_xprop(
     float regY[4][8];
     for (int w = 0; w < 4; w++)
         for (int x = 0; x < 8; x++)
-            regY[w][x] = 0;
+            // use asm here to ensure this happens after main loop skipping
+            asm volatile ("mov.b32 %0, 0;" : "=f"(regY[w][x]) :);
 
-    // loop over each lut entry to compute a gemm block
-    int i = 0;
-    #pragma unroll 1
-    do
+    // skip loop if empty lut
+    // Compiler generates suboptimal code if a simple "for loop" is used.
+    asm volatile (".reg .pred lut_zero; \n\t"
+        "setp.eq.u32 lut_zero, %0, 0;   \n\t"
+        "@lut_zero bra.uni END_LOOP;" :: "r"(lut_size));
+
     {
-        int2 entry = Lut2s[i++];
-
-        entry.x += offsetX;
-        entry.y += tid*4*2;
-
-        const TW* W0;
-        const TX* X0;
-        const TX* X8;
-        // Simplify pointer arithmetic by letting compiler assume all offsets fit in 32 bits.
-        asm("{\n\t"
-            ".reg .u64 x0, x4, w0;\n\t"
-            "mov.b64 w0, {%5, 0};\n\t"
-            "mov.b64 x0, {%6, 0};\n\t"
-            "mov.b64 x4, {%7, 0};\n\t"
-            "add.u64 %0, w0, %3;\n\t"
-            "add.u64 %1, x0, %4;\n\t"
-            "add.u64 %2, x4, %4;\n\t"
-            "}" : "=l"(W0),"=l"(X0),"=l"(X8) : "l"(W), "l"(X), "r"(entry.y), "r"(entry.x), "r"(entry.x + N*8*8*2) );
-
-        // Fetch 8 rows at a time from W and X
-        float4 w0 = load(W0, 0);
-        float8 x0 = load(X0, 0, bn);
-        float8 x8 = load(X8, 0, bn);
-
-        __syncthreads();
-
-        // store to shared.
-        if (Fprop)
-            st_shared_v4(storWs + 64*16*4, w0);
-        else
+        // loop over each lut entry to compute a gemm block
+        int i = 0;
+        #pragma unroll 1
+        do
         {
-            // transpose the shared store of W
-            st_shared_v1(storWs + 0*16*4 + 64*16*4, w0.x);
-            st_shared_v1(storWs + 1*16*4 + 64*16*4, w0.y);
-            st_shared_v1(storWs + 2*16*4 + 64*16*4, w0.z);
-            st_shared_v1(storWs + 3*16*4 + 64*16*4, w0.w);
-        }
-        // avoid bank conflicts by splitting 8 floats in two groups of 4
-        // We can rejoin them on the output
-        st_shared_v4(storXs + (0*64 + 0*32)*4, x0.a);
-        st_shared_v4(storXs + (0*64 + 1*32)*4, x0.b);
-        st_shared_v4(storXs + (8*64 + 0*32)*4, x8.a);
-        st_shared_v4(storXs + (8*64 + 1*32)*4, x8.b);
+            int2 entry = Lut2s[i++];
 
-        __syncthreads();
+            entry.x += offsetX;
+            entry.y += tid*4*2;
 
-        // computes a 16x64x16 gemm tile with 4x8 register blocking
-        float regW[4];
-        float regX[8];
-        #pragma unroll
-        for (int j = 0; j < 8; j++)
-        {
-            // fetch outer product data
-            ld_shared_v4(readWs + (16*j + 64*16 + (Fprop ? 0 : (j>>2)*8))*4, regW ); // shift over 8 floats every 4 rows
-            ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
-            ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+            const TW* W0;
+            const TX* X0;
+            const TX* X8;
+            // Simplify pointer arithmetic by letting compiler assume all offsets fit in 32 bits.
+            asm("{\n\t"
+                ".reg .u64 x0, x4, w0;\n\t"
+                "mov.b64 w0, {%5, 0};\n\t"
+                "mov.b64 x0, {%6, 0};\n\t"
+                "mov.b64 x4, {%7, 0};\n\t"
+                "add.u64 %0, w0, %3;\n\t"
+                "add.u64 %1, x0, %4;\n\t"
+                "add.u64 %2, x4, %4;\n\t"
+                "}" : "=l"(W0),"=l"(X0),"=l"(X8) : "l"(W), "l"(X), "r"(entry.y), "r"(entry.x), "r"(entry.x + N*8*8*2) );
 
-            // accumulate outer product
-            for (int w = 0; w < 4; w++)
-                for (int x = 0; x < 8; x++)
-                    regY[w][x] += regW[w] * regX[x];
+            // Fetch 8 rows at a time from W and X
+            float4 w0 = load(W0, 0);
+            float8 x0 = load(X0, 0, bn);
+            float8 x8 = load(X8, 0, bn);
 
-        }
+            __syncthreads();
 
-    } while (i < lut_size);
+            // store to shared.
+            if (Fprop)
+                st_shared_v4(storWs + 64*16*4, w0);
+            else
+            {
+                // transpose the shared store of W
+                st_shared_v1(storWs + 0*16*4 + 64*16*4, w0.x);
+                st_shared_v1(storWs + 1*16*4 + 64*16*4, w0.y);
+                st_shared_v1(storWs + 2*16*4 + 64*16*4, w0.z);
+                st_shared_v1(storWs + 3*16*4 + 64*16*4, w0.w);
+            }
+            // avoid bank conflicts by splitting 8 floats in two groups of 4
+            // We can rejoin them on the output
+            st_shared_v4(storXs + (0*64 + 0*32)*4, x0.a);
+            st_shared_v4(storXs + (0*64 + 1*32)*4, x0.b);
+            st_shared_v4(storXs + (8*64 + 0*32)*4, x8.a);
+            st_shared_v4(storXs + (8*64 + 1*32)*4, x8.b);
+
+            __syncthreads();
+
+            // computes a 16x64x16 gemm tile with 4x8 register blocking
+            float regW[4];
+            float regX[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++)
+            {
+                // fetch outer product data
+                ld_shared_v4(readWs + (16*j + 64*16 + (Fprop ? 0 : (j>>2)*8))*4, regW ); // shift over 8 floats every 4 rows
+                ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
+                ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+
+                // accumulate outer product
+                for (int w = 0; w < 4; w++)
+                    for (int x = 0; x < 8; x++)
+                        regY[w][x] += regW[w] * regX[x];
+
+            }
+
+        } while (i < lut_size);
+    }
+
+    asm volatile ("\nEND_LOOP:\n":: );
+    asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
+    asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_N) :);
 
     tid16 = tid & 16;
     tid32 = tid & 32;
@@ -614,7 +647,7 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x8_xprop(
         {
             float swap = t16 ? regY[2*w + 0][x] : regY[2*w + 1][x];
             outY[w][x] = t16 ? regY[2*w + 1][x] : regY[2*w + 0][x];
-            outY[w][x] += __shfl_xor(swap, 16);
+            outY[w][x] += shfl_xor(swap, 16);
         }
     }
 
@@ -683,7 +716,7 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x8_xprop(
     }
 }
 
-template <bool fprop, typename TW, typename TX, typename TY>
+template <bool Fprop, typename TW, typename TX, typename TY>
 __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_xprop(
     const  int2* __restrict__ Lut,
     const    TW* __restrict__ W,
@@ -691,7 +724,7 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_xprop(
     TY* Y, int* Lock, int locks, int N)
 {
     __shared__ float shrX1[64*16];
-    __shared__ float shrW1[fprop ? 16*16 : 16*16 + 4*8];
+    __shared__ float shrW1[Fprop ? 16*16 : 16*16 + 4*8];
    float2* shrW2 = (float2*)shrW1;
    float2* shrX2 = (float2*)shrX1;
    float4* shrW4 = (float4*)shrW1;
@@ -705,15 +738,12 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_xprop(
 
     int4 lut_head = ((const int4*)Lut)[idx_L];
 
-    // used to zero accumulation registers
-    shrX1[tid] = 0.0f;
-
     int tid15 = tid & 15;
     int tid16 = tid >> 4;
 
     float4* storW4;
     float*  storW1;
-    if (fprop)
+    if (Fprop)
         storW4 = &shrW4[tid];
     else
     {
@@ -758,68 +788,81 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_xprop(
     }
     __syncthreads();
 
-    float regX[4];
-    float regW[4];
-    float regY[4][4];
-
     // zero accumulation registers
+    float regY[4][4];
     for (int w = 0; w < 4; w++)
-        *(float4*)regY[w] = shrX4[w];
+        for (int x = 0; x < 4; x++)
+            // use asm here to ensure this happens after main loop skipping
+            asm volatile ("mov.b32 %0, 0;" : "=f"(regY[w][x]) :);
+
+    // skip loop if empty lut
+    // Compiler generates suboptimal code if a simple "for loop" is used.
+    asm volatile (".reg .pred lut_zero; \n\t"
+        "setp.eq.u32 lut_zero, %0, 0;   \n\t"
+        "@lut_zero bra.uni END_LOOP;" :: "r"(lut_size));
 
     // loop over each lut entry to compute a gemm block
-    #pragma unroll 1
-    for (int i = 0; i < lut_size; i++)
     {
-        int2 entry = Lut2_s[i];
-
-        // Fetch 16 rows at a time from W and X
-        TW w0 = W0[entry.y];
-        TX x0[4];
-        if (bn)
+        int k = 0;
+        #pragma unroll 1
+        do
         {
+            int2 entry = Lut2_s[k++];
+
+            // Fetch 16 rows at a time from W and X
+            TW w0 = W0[entry.y];
+            TX x0[4];
+            if (bn)
+            {
+                for (int i = 0; i < 4; i++)
+                    x0[i] = X4[i][entry.x];
+            }
+            float4 w4 = to_float(w0);
+            float4 x4[4];
             for (int i = 0; i < 4; i++)
-                x0[i] = X4[i][entry.x];
-        }
-        float4 w4 = to_float(w0);
-        float4 x4[4];
-        for (int i = 0; i < 4; i++)
-            x4[i] = to_float(x0[i]);
+                x4[i] = to_float(x0[i]);
 
-        // Convert to float if needed and store to shared.
-        __syncthreads();
+            // Convert to float if needed and store to shared.
+            __syncthreads();
 
-        if (fprop)
-            storW4[0] = w4;
-        else
-        {
-            // transpose the shared store of W
-            storW1[0*16] = w4.x;
-            storW1[1*16] = w4.y;
-            storW1[2*16] = w4.z;
-            storW1[3*16] = w4.w;
-        }
-        for (int i = 0; i < 4; i++)
-            storX4[i*4*16] = x4[i];
+            if (Fprop)
+                storW4[0] = w4;
+            else
+            {
+                // transpose the shared store of W
+                storW1[0*16] = w4.x;
+                storW1[1*16] = w4.y;
+                storW1[2*16] = w4.z;
+                storW1[3*16] = w4.w;
+            }
+            for (int i = 0; i < 4; i++)
+                storX4[i*4*16] = x4[i];
 
-        __syncthreads();
+            __syncthreads();
 
-        // computes a 16x64x16 gemm block
-        #pragma unroll
-        for (int j = 0; j < 16; j++)
-        {
-            // fetch outer product data
-            *(float2*)&regX[0] = readX2[32*j +  0];
-            *(float2*)&regW[0] = readW2[ 8*j +  0 + (fprop ? 0 : (j>>2)*4)]; // shift over 8 floats every 4 rows
-            *(float2*)&regX[2] = readX2[32*j + 16];
-            *(float2*)&regW[2] = readW2[ 8*j +  4 + (fprop ? 0 : (j>>2)*4)];
-            // accumulate outer product
-            for (int w = 0; w < 4; w++)
-                for (int x = 0; x < 4; x++)
-                    regY[w][x] += regW[w] * regX[x];
-        }
+            // computes a 16x64x16 gemm block
+            float regX[4];
+            float regW[4];
+            #pragma unroll
+            for (int j = 0; j < 16; j++)
+            {
+                // fetch outer product data
+                *(float2*)&regX[0] = readX2[32*j +  0];
+                *(float2*)&regW[0] = readW2[ 8*j +  0 + (Fprop ? 0 : (j>>2)*4)]; // shift over 8 floats every 4 rows
+                *(float2*)&regX[2] = readX2[32*j + 16];
+                *(float2*)&regW[2] = readW2[ 8*j +  4 + (Fprop ? 0 : (j>>2)*4)];
+                // accumulate outer product
+                for (int w = 0; w < 4; w++)
+                    for (int x = 0; x < 4; x++)
+                        regY[w][x] += regW[w] * regX[x];
+            }
+
+        } while (k < lut_size);
     }
-    tid   = threadIdx.x;
-    idx_N = blockIdx.x;
+    asm volatile ("\nEND_LOOP:\n":: );
+    asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
+    asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_N) :);
+
     tid15 = (tid >> 1) & 15;
     tid16 = ((tid & 32) >> 4) | (tid & 1);
     int N2 = N >> 1;
@@ -1856,107 +1899,119 @@ __global__ void __launch_bounds__(128) gemm_blocksparse_32x64x32x8_xprop(
     }
     __syncthreads();
 
+    // zero accumulation registers
+    float regY[4][8];
+    for (int w = 0; w < 4; w++)
+        for (int x = 0; x < 8; x++)
+            // use asm here to ensure this happens after main loop skipping
+            asm volatile ("mov.b32 %0, 0;" : "=f"(regY[w][x]) :);
+
+    // skip loop if empty lut
+    // Compiler generates suboptimal code if a simple "for loop" is used.
+    asm volatile (".reg .pred lut_zero; \n\t"
+        "setp.eq.u32 lut_zero, %0, 0;   \n\t"
+        "@lut_zero bra.uni END_LOOP;" :: "r"(lut_size));
+
     // Force compiler to fully compute these prior to loop
     asm("mov.b32 %0, %0;" : "+r"(storXs)  : );
     asm("mov.b32 %0, %0;" : "+r"(storWs)  : );
     asm("mov.b32 %0, %0;" : "+r"(readXs)  : );
     asm("mov.b32 %0, %0;" : "+r"(readWs)  : );
     asm("mov.b32 %0, %0;" : "+r"(offsetX) : );
-
-    // zero accumulation registers
-    float regY[4][8];
-    for (int w = 0; w < 4; w++)
-        for (int x = 0; x < 8; x++)
-            regY[w][x] = 0;
-
-    // loop over each lut entry to compute a gemm block
-    int i = 0;
-    #pragma unroll 1
-    do
     {
-        int2 entry = Lut2s[i++];
-
-        entry.x += offsetX;
-        entry.y += tid*4*2;
-
-        const TW* W0;
-        const TX* X00;
-        const TX* X16;
-        // Simplify pointer arithmetic by letting compiler assume all offsets fit in 32 bits.
-        asm("{\n\t"
-            ".reg .u64 x0, x4, w0;\n\t"
-            "mov.b64 w0, {%5, 0};\n\t"
-            "mov.b64 x0, {%6, 0};\n\t"
-            "mov.b64 x4, {%7, 0};\n\t"
-            "add.u64 %0, w0, %3;\n\t"
-            "add.u64 %1, x0, %4;\n\t"
-            "add.u64 %2, x4, %4;\n\t"
-            "}" : "=l"(W0),"=l"(X00),"=l"(X16) : "l"(W), "l"(X), "r"(entry.y), "r"(entry.x), "r"(entry.x + N*16*8*2) );
-
-        // Fetch 8 rows at a time from W and X
-        TW w00 = __ldg(W0);
-        TW w16 = __ldg(W0 + 128);
-        TX x00, x16;
-        ew_zero(x00); ew_zero(x16);
-        if (bn)
+        // loop over each lut entry to compute a gemm block
+        int i = 0;
+        #pragma unroll 1
+        do
         {
-            x00 = __ldg(X00);
-            x16 = __ldg(X16);
-        }
+            int2 entry = Lut2s[i++];
 
-        __syncthreads();
+            entry.x += offsetX;
+            entry.y += tid*4*2;
 
-        float4 fw00 = to_float(w00);
-        float4 fw16 = to_float(w16);
-        float8 fx00 = to_float(x00);
-        float8 fx16 = to_float(x16);
+            const TW* W0;
+            const TX* X00;
+            const TX* X16;
+            // Simplify pointer arithmetic by letting compiler assume all offsets fit in 32 bits.
+            asm("{\n\t"
+                ".reg .u64 x0, x4, w0;\n\t"
+                "mov.b64 w0, {%5, 0};\n\t"
+                "mov.b64 x0, {%6, 0};\n\t"
+                "mov.b64 x4, {%7, 0};\n\t"
+                "add.u64 %0, w0, %3;\n\t"
+                "add.u64 %1, x0, %4;\n\t"
+                "add.u64 %2, x4, %4;\n\t"
+                "}" : "=l"(W0),"=l"(X00),"=l"(X16) : "l"(W), "l"(X), "r"(entry.y), "r"(entry.x), "r"(entry.x + N*16*8*2) );
 
-        // store to shared.
-        if (Fprop)
-        {
-            st_shared_v4(storWs + (0*16*32 + 64*32)*4, fw00);
-            st_shared_v4(storWs + (1*16*32 + 64*32)*4, fw16);
-        }
-        else
-        {
-            // transpose the shared store of W
-            st_shared_v1(storWs + (0*32 + 0*16 + 64*32)*4, fw00.x);
-            st_shared_v1(storWs + (1*32 + 0*16 + 64*32)*4, fw00.y);
-            st_shared_v1(storWs + (2*32 + 0*16 + 64*32)*4, fw00.z);
-            st_shared_v1(storWs + (3*32 + 0*16 + 64*32)*4, fw00.w);
+            // Fetch 8 rows at a time from W and X
+            TW w00 = __ldg(W0);
+            TW w16 = __ldg(W0 + 128);
+            TX x00, x16;
+            ew_zero(x00); ew_zero(x16);
+            if (bn)
+            {
+                x00 = __ldg(X00);
+                x16 = __ldg(X16);
+            }
 
-            st_shared_v1(storWs + (0*32 + 1*16 + 64*32)*4, fw16.x);
-            st_shared_v1(storWs + (1*32 + 1*16 + 64*32)*4, fw16.y);
-            st_shared_v1(storWs + (2*32 + 1*16 + 64*32)*4, fw16.z);
-            st_shared_v1(storWs + (3*32 + 1*16 + 64*32)*4, fw16.w);
-        }
-        // avoid bank conflicts by splitting 8 floats in two groups of 4
-        // We can rejoin them on the output
-        st_shared_v4(storXs + ( 0*64 + 0*32)*4, fx00.a);
-        st_shared_v4(storXs + ( 0*64 + 1*32)*4, fx00.b);
-        st_shared_v4(storXs + (16*64 + 0*32)*4, fx16.a);
-        st_shared_v4(storXs + (16*64 + 1*32)*4, fx16.b);
+            __syncthreads();
 
-        __syncthreads();
+            float4 fw00 = to_float(w00);
+            float4 fw16 = to_float(w16);
+            float8 fx00 = to_float(x00);
+            float8 fx16 = to_float(x16);
 
-        // computes a 16x64x16 gemm tile with 4x8 register blocking
-        float regW[4];
-        float regX[8];
-        #pragma unroll
-        for (int j = 0; j < 16; j++)
-        {
-            // fetch outer product data
-            ld_shared_v4(readWs + (32*j + 64*32 + (Fprop ? 0 : (j>>2)*4))*4, regW ); // shift over 4 floats every 4 rows
-            ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
-            ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+            // store to shared.
+            if (Fprop)
+            {
+                st_shared_v4(storWs + (0*16*32 + 64*32)*4, fw00);
+                st_shared_v4(storWs + (1*16*32 + 64*32)*4, fw16);
+            }
+            else
+            {
+                // transpose the shared store of W
+                st_shared_v1(storWs + (0*32 + 0*16 + 64*32)*4, fw00.x);
+                st_shared_v1(storWs + (1*32 + 0*16 + 64*32)*4, fw00.y);
+                st_shared_v1(storWs + (2*32 + 0*16 + 64*32)*4, fw00.z);
+                st_shared_v1(storWs + (3*32 + 0*16 + 64*32)*4, fw00.w);
 
-            // accumulate outer product
-            for (int w = 0; w < 4; w++)
-                for (int x = 0; x < 8; x++)
-                    regY[w][x] += regW[w] * regX[x];
-        }
+                st_shared_v1(storWs + (0*32 + 1*16 + 64*32)*4, fw16.x);
+                st_shared_v1(storWs + (1*32 + 1*16 + 64*32)*4, fw16.y);
+                st_shared_v1(storWs + (2*32 + 1*16 + 64*32)*4, fw16.z);
+                st_shared_v1(storWs + (3*32 + 1*16 + 64*32)*4, fw16.w);
+            }
+            // avoid bank conflicts by splitting 8 floats in two groups of 4
+            // We can rejoin them on the output
+            st_shared_v4(storXs + ( 0*64 + 0*32)*4, fx00.a);
+            st_shared_v4(storXs + ( 0*64 + 1*32)*4, fx00.b);
+            st_shared_v4(storXs + (16*64 + 0*32)*4, fx16.a);
+            st_shared_v4(storXs + (16*64 + 1*32)*4, fx16.b);
 
-    } while (i < lut_size);
+            __syncthreads();
+
+            // computes a 16x64x16 gemm tile with 4x8 register blocking
+            float regW[4];
+            float regX[8];
+            #pragma unroll
+            for (int j = 0; j < 16; j++)
+            {
+                // fetch outer product data
+                ld_shared_v4(readWs + (32*j + 64*32 + (Fprop ? 0 : (j>>2)*4))*4, regW ); // shift over 4 floats every 4 rows
+                ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
+                ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+
+                // accumulate outer product
+                for (int w = 0; w < 4; w++)
+                    for (int x = 0; x < 8; x++)
+                        regY[w][x] += regW[w] * regX[x];
+            }
+
+        } while (i < lut_size);
+    }
+
+    asm volatile ("\nEND_LOOP:\n":: );
+    asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
+    asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_N) :);
 
     tid16 = tid &  16;
     tid32 = tid & -32;
@@ -1974,7 +2029,7 @@ __global__ void __launch_bounds__(128) gemm_blocksparse_32x64x32x8_xprop(
         {
             float swap = t16 ? regY[2*w + 0][x] : regY[2*w + 1][x];
             outY[w][x] = t16 ? regY[2*w + 1][x] : regY[2*w + 0][x];
-            outY[w][x] += __shfl_xor(swap, 16);
+            outY[w][x] += shfl_xor(swap, 16);
         }
     }
 
@@ -2125,132 +2180,142 @@ __global__ void __launch_bounds__(128) gemm_blocksparse_32x64x32x4_xprop(
     asm("mov.b32 %0, %0;" : "+r"(readXs)  : );
     asm("mov.b32 %0, %0;" : "+r"(readWs)  : );
     asm("mov.b32 %0, %0;" : "+r"(offsetX) : );
-    asm("mov.b32 %0, %0;" : "+r"(N8) : );
+    asm("mov.b32 %0, %0;" : "+r"(N8)      : );
 
     // zero accumulation registers
     float regY[4][8];
     for (int w = 0; w < 4; w++)
         for (int x = 0; x < 8; x++)
-            regY[w][x] = 0;
+            // use asm here to ensure this happens after main loop skipping
+            asm volatile ("mov.b32 %0, 0;" : "=f"(regY[w][x]) :);
 
-
-    // loop over each lut entry to compute a gemm block
-    int i = 0;
-    #pragma unroll 1
-    do
+    // skip loop if empty lut
+    // Compiler generates suboptimal code if a simple "for loop" is used.
+    asm volatile (".reg .pred lut_zero; \n\t"
+        "setp.eq.u32 lut_zero, %0, 0;   \n\t"
+        "@lut_zero bra.uni END_LOOP;" :: "r"(lut_size));
     {
-        int2 entry = Lut2s[i++];
-
-        entry.x += offsetX;
-        entry.y += tid*sizeof(TW);
-
-        const TW* W0;
-        const TX* X00;
-        const TX* X08;
-        const TX* X16;
-        const TX* X24;
-        // Simplify pointer arithmetic by letting compiler assume all offsets fit in 32 bits.
-        asm("{\n\t"
-            ".reg .u64 w0, x0, N8, X00, X08, X16, X24;\n\t"
-            "mov.b64 x0, {%7, 0};\n\t"
-            "mov.b64 w0, {%8, 0};\n\t"
-            "mov.b64 N8, {%9, 0};\n\t"
-            "add.u64 X00, %5, x0;\n\t"
-            "add.u64 X08, X00, N8;\n\t"
-            "add.u64 X16, X08, N8;\n\t"
-            "add.u64 X24, X16, N8;\n\t"
-            "mov.b64 %0, X00;\n\t"
-            "mov.b64 %1, X08;\n\t"
-            "mov.b64 %2, X16;\n\t"
-            "mov.b64 %3, X24;\n\t"
-            "add.u64 %4, %6, w0;\n\t"
-            "}" : "=l"(X00),"=l"(X08),"=l"(X16),"=l"(X24), "=l"(W0) : "l"(X), "l"(W), "r"(entry.x), "r"(entry.y), "r"(N8) );
-
-        // Fetch 8 rows at a time from W and X
-        TW w00 = __ldg(W0);
-        TW w16 = __ldg(W0 + 128);
-        TX x00, x08, x16, x24;
-        ew_zero(x00);
-        ew_zero(x08);
-        ew_zero(x16);
-        ew_zero(x24);
-        if (bn)
+        // loop over each lut entry to compute a gemm block
+        int i = 0;
+        #pragma unroll 1
+        do
         {
-            x00 = __ldg(X00);
-            x08 = __ldg(X08);
-            x16 = __ldg(X16);
-            x24 = __ldg(X24);
-        }
+            int2 entry = Lut2s[i++];
 
-        __syncthreads();
+            entry.x += offsetX;
+            entry.y += tid*sizeof(TW);
 
-        float4 fw00 = to_float(w00);
-        float4 fw16 = to_float(w16);
+            const TW* W0;
+            const TX* X00;
+            const TX* X08;
+            const TX* X16;
+            const TX* X24;
+            // Simplify pointer arithmetic by letting compiler assume all offsets fit in 32 bits.
+            asm("{\n\t"
+                ".reg .u64 w0, x0, N8, X00, X08, X16, X24;\n\t"
+                "mov.b64 x0, {%7, 0};\n\t"
+                "mov.b64 w0, {%8, 0};\n\t"
+                "mov.b64 N8, {%9, 0};\n\t"
+                "add.u64 X00, %5, x0;\n\t"
+                "add.u64 X08, X00, N8;\n\t"
+                "add.u64 X16, X08, N8;\n\t"
+                "add.u64 X24, X16, N8;\n\t"
+                "mov.b64 %0, X00;\n\t"
+                "mov.b64 %1, X08;\n\t"
+                "mov.b64 %2, X16;\n\t"
+                "mov.b64 %3, X24;\n\t"
+                "add.u64 %4, %6, w0;\n\t"
+                "}" : "=l"(X00),"=l"(X08),"=l"(X16),"=l"(X24), "=l"(W0) : "l"(X), "l"(W), "r"(entry.x), "r"(entry.y), "r"(N8) );
 
-        float4 fx00 = to_float(x00);
-        float4 fx08 = to_float(x08);
-        float4 fx16 = to_float(x16);
-        float4 fx24 = to_float(x24);
+            // Fetch 8 rows at a time from W and X
+            TW w00 = __ldg(W0);
+            TW w16 = __ldg(W0 + 128);
+            TX x00, x08, x16, x24;
+            ew_zero(x00);
+            ew_zero(x08);
+            ew_zero(x16);
+            ew_zero(x24);
+            if (bn)
+            {
+                x00 = __ldg(X00);
+                x08 = __ldg(X08);
+                x16 = __ldg(X16);
+                x24 = __ldg(X24);
+            }
 
-        // fw00 = round3w(fw00);
-        // fw16 = round3w(fw16);
-        // fx00 = round4(fx00);
-        // fx08 = round4(fx08);
-        // fx16 = round4(fx16);
-        // fx24 = round4(fx24);
+            __syncthreads();
 
-        // store to shared.
-        if (Fprop)
-        {
-            st_shared_v4(storWs + (0*16*32 + 64*32)*4, fw00);
-            st_shared_v4(storWs + (1*16*32 + 64*32)*4, fw16);
-        }
-        else
-        {
-            // transpose the shared store of W
-            st_shared_v1(storWs + (0*32 + 0*16 + 64*32)*4, fw00.x);
-            st_shared_v1(storWs + (1*32 + 0*16 + 64*32)*4, fw00.y);
-            st_shared_v1(storWs + (2*32 + 0*16 + 64*32)*4, fw00.z);
-            st_shared_v1(storWs + (3*32 + 0*16 + 64*32)*4, fw00.w);
+            float4 fw00 = to_float(w00);
+            float4 fw16 = to_float(w16);
 
-            st_shared_v1(storWs + (0*32 + 1*16 + 64*32)*4, fw16.x);
-            st_shared_v1(storWs + (1*32 + 1*16 + 64*32)*4, fw16.y);
-            st_shared_v1(storWs + (2*32 + 1*16 + 64*32)*4, fw16.z);
-            st_shared_v1(storWs + (3*32 + 1*16 + 64*32)*4, fw16.w);
-        }
+            float4 fx00 = to_float(x00);
+            float4 fx08 = to_float(x08);
+            float4 fx16 = to_float(x16);
+            float4 fx24 = to_float(x24);
 
-        st_shared_v4(storXs +  0*64*4, fx00);
-        st_shared_v4(storXs +  8*64*4, fx08);
-        st_shared_v4(storXs + 16*64*4, fx16);
-        st_shared_v4(storXs + 24*64*4, fx24);
+            // fw00 = round3w(fw00);
+            // fw16 = round3w(fw16);
+            // fx00 = round4(fx00);
+            // fx08 = round4(fx08);
+            // fx16 = round4(fx16);
+            // fx24 = round4(fx24);
 
-        __syncthreads();
+            // store to shared.
+            if (Fprop)
+            {
+                st_shared_v4(storWs + (0*16*32 + 64*32)*4, fw00);
+                st_shared_v4(storWs + (1*16*32 + 64*32)*4, fw16);
+            }
+            else
+            {
+                // transpose the shared store of W
+                st_shared_v1(storWs + (0*32 + 0*16 + 64*32)*4, fw00.x);
+                st_shared_v1(storWs + (1*32 + 0*16 + 64*32)*4, fw00.y);
+                st_shared_v1(storWs + (2*32 + 0*16 + 64*32)*4, fw00.z);
+                st_shared_v1(storWs + (3*32 + 0*16 + 64*32)*4, fw00.w);
 
-        // computes a 16x64x16 gemm tile with 4x8 register blocking
-        float regW[4];
-        float regX[8];
-        #pragma unroll
-        for (int j = 0; j < 16; j++)
-        {
-            // fetch outer product data
-            ld_shared_v4(readWs + (32*j + 64*32 + (Fprop ? 0 : (j>>2)*4))*4, regW ); // shift over 4 floats every 4 rows
-            ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
-            ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+                st_shared_v1(storWs + (0*32 + 1*16 + 64*32)*4, fw16.x);
+                st_shared_v1(storWs + (1*32 + 1*16 + 64*32)*4, fw16.y);
+                st_shared_v1(storWs + (2*32 + 1*16 + 64*32)*4, fw16.z);
+                st_shared_v1(storWs + (3*32 + 1*16 + 64*32)*4, fw16.w);
+            }
 
-            // accumulate outer product
-            for (int w = 0; w < 4; w++)
-                for (int x = 0; x < 8; x++)
-                {
-                    regY[w][x] += regW[w] * regX[x];
-                    //asm("fma.rz.ftz.f32 %0, %1, %2, %0;" : "+f"(regY[w][x]) : "f"(regW[w]), "f"(regX[x]));
-                    // if (j == 7)
-                    //     asm("and.b32 %0, %0, 0xfffffff0;" : "+f"(regY[w][x]) : );
-                    // else
-                    //asm("and.b32 %0, %0, 0xffffff00;" : "+f"(regY[w][x]) : );
-                }
-        }
+            st_shared_v4(storXs +  0*64*4, fx00);
+            st_shared_v4(storXs +  8*64*4, fx08);
+            st_shared_v4(storXs + 16*64*4, fx16);
+            st_shared_v4(storXs + 24*64*4, fx24);
 
-    } while (i < lut_size);
+            __syncthreads();
+
+            // computes a 16x64x16 gemm tile with 4x8 register blocking
+            float regW[4];
+            float regX[8];
+            #pragma unroll
+            for (int j = 0; j < 16; j++)
+            {
+                // fetch outer product data
+                ld_shared_v4(readWs + (32*j + 64*32 + (Fprop ? 0 : (j>>2)*4))*4, regW ); // shift over 4 floats every 4 rows
+                ld_shared_v4(readXs + (64*j +  0)*4, &regX[0] );
+                ld_shared_v4(readXs + (64*j + 32)*4, &regX[4] );
+
+                // accumulate outer product
+                for (int w = 0; w < 4; w++)
+                    for (int x = 0; x < 8; x++)
+                    {
+                        regY[w][x] += regW[w] * regX[x];
+                        //asm("fma.rz.ftz.f32 %0, %1, %2, %0;" : "+f"(regY[w][x]) : "f"(regW[w]), "f"(regX[x]));
+                        // if (j == 7)
+                        //     asm("and.b32 %0, %0, 0xfffffff0;" : "+f"(regY[w][x]) : );
+                        // else
+                        //asm("and.b32 %0, %0, 0xffffff00;" : "+f"(regY[w][x]) : );
+                    }
+            }
+
+        } while (i < lut_size);
+    }
+    asm volatile ("\nEND_LOOP:\n":: );
+    asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
+    asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_N) :);
 
     tid16 = tid &  16;
     tid32 = tid & -32;
@@ -2268,7 +2333,7 @@ __global__ void __launch_bounds__(128) gemm_blocksparse_32x64x32x4_xprop(
         {
             float swap = t16 ? regY[2*w + 0][x] : regY[2*w + 1][x];
             outY[w][x] = t16 ? regY[2*w + 1][x] : regY[2*w + 0][x];
-            outY[w][x] += __shfl_xor(swap, 16);
+            outY[w][x] += shfl_xor(swap, 16);
         }
     }
 
@@ -2791,7 +2856,7 @@ __global__ void __launch_bounds__(256) gemm_blocksparse_32x64x32x4_updat(
 
     u2 = ew_add(ew_mul(u2, alpha), ew_mul(b2, beta));
 
-    store_g(U, u2, offset);
+    store(U, u2, offset);
 
     __syncthreads();
 
@@ -2815,7 +2880,7 @@ __global__ void __launch_bounds__(256) gemm_blocksparse_32x64x32x4_updat(
 
     u2 = ew_add(ew_mul(u2, alpha), ew_mul(b2, beta));
 
-    store_g(U, u2, offset + 256);
+    store(U, u2, offset + 256);
 }
 
 #define GridDim(size, shift) ((size >> shift) + ((size & ((1<<shift)-1)) != 0))

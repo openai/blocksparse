@@ -32,16 +32,202 @@ l2_normalize_gain_cktrs      = _op_module.l2_normalize_gain_cktrs
 l2_normalize_gain_grad_kctrs = _op_module.l2_normalize_gain_grad_kctrs
 l2_normalize_gain_grad_cktrs = _op_module.l2_normalize_gain_grad_cktrs
 
-cwise_linear_axpb       = _op_module.c_wise_linear_axpb
-cwise_linear_ax         = _op_module.c_wise_linear_ax
-cwise_linear_xpb        = _op_module.c_wise_linear_xpb
-cwise_linear_grad_axpb  = _op_module.c_wise_linear_grad_axpb
-cwise_linear_grad_ax    = _op_module.c_wise_linear_grad_ax
-cwise_linear_grad_xpb   = _op_module.c_wise_linear_grad_xpb
 
 # float_cast_op           = _op_module.float_cast
 
+#convenince wrappers:
 
+# from blocksparse.conv import conv_edge_bias_init
+
+# y = tf.nn.conv2d(x, w, stride_shape, pad, data_format="NHWC")
+
+# edge_bias_op = conv_edge_bias_init(y, x, w, stride_shape, pad, data_format="NHWC")
+
+# eg = tf.get_variable("EG", edge_bias_op.shape, tf.float32, initializer=tf.ones_initializer())
+# eb = tf.get_variable("EB", edge_bias_op.shape, tf.float32, initializer=tf.zeros_initializer())
+
+# y = edge_bias_op(y, eg, eb)
+
+def conv_edge_bias_init(y, x, w, strides=None, padding="SAME", data_format="NHWC", dilations=None):
+    return ConvEdgeBias(y.shape.as_list(), x.shape.as_list(), w.shape.as_list(), strides, padding, data_format, dilations)
+
+
+def deconv_edge_bias_init(y, x, w, strides=None, padding="SAME", data_format="NHWC", dilations=None):
+    # swap x and y
+    return ConvEdgeBias(x.shape.as_list(), y.shape.as_list(), w.shape.as_list(), strides, padding, data_format, dilations, deconv=True)
+
+
+class ConvEdgeBias(object):
+
+    Cache = dict()
+
+    def __init__(self, y_shape, x_shape, w_shape, strides=None, padding="SAME", data_format="NHWC", dilations=None, deconv=False):
+
+        if data_format in ("NCW","NCHW","NCDHW"):
+            self.layout = 0
+            sdim = slice(2,None) # NCHW
+            #fdim = slice(2,None) # KCRS
+            # tf keeps its own format for params and does transpose ops..
+            fdim = slice(0,-2) # RSCK
+            cdim = 1
+        else:
+            self.layout = 1
+            sdim = slice(1,-1) # NHWC
+            fdim = slice(0,-2) # RSCK
+            cdim = -1
+
+        C = x_shape[cdim]
+        K = y_shape[cdim]
+        MPQ = expand_dims(y_shape[sdim])
+        DHW = expand_dims(x_shape[sdim])
+        TRS = expand_dims(w_shape[fdim])
+
+        strides = (1,1,1) if strides   is None else expand_dims(strides[sdim])
+        dilates = (1,1,1) if dilations is None else expand_dims(dilations[sdim])
+
+        if padding.upper() == "VALID":
+            padding = (0,0,0)
+        else:
+            padding = list()
+            for S, Q, W, stride, dilate in zip(TRS, MPQ, DHW, strides, dilates):
+                # match padding formula used in tensorflow
+                padding.append(max((Q - 1) * stride + S - W, 0) // 2)
+
+        if deconv:
+            lut_func = bprop_lut
+            MPQ, DHW = DHW, MPQ
+            C, K     = K, C
+        else:
+            lut_func = fprop_lut
+
+        key = tuple(tuple(a) for a in (MPQ, DHW, TRS, padding, strides, dilates))
+
+        entry = ConvEdgeBias.Cache.get(key, None)
+        if entry is None:
+
+            mpqLut = list()
+            fdata  = list(zip(TRS, padding, strides, dilates))
+            for i in range(3):
+                mpqLut.append( [ lut_func( dim, DHW[i], *fdata[i]) for dim in range(MPQ[i]) ] )
+
+            self._build_edge_lut(MPQ, mpqLut)
+
+            ConvEdgeBias.Cache[key] = (self.edgeBiasMap, self.edgeBiasLut, self.edgeEntries)
+        else:
+            self.edgeBiasMap, self.edgeBiasLut, self.edgeEntries = entry
+            self.edgeBiasDim = len(self.edgeBiasMap)
+
+        self.shape = (self.edgeBiasDim, K) if self.layout else (K, self.edgeBiasDim)
+
+
+    def _build_edge_lut(self, MPQ, mpqLut):
+
+        # Hash the mpq coordinates on unique edge overlap patterns
+        # The hash key is the list of lut indicies where the offset is -1
+        PQ = MPQ[1] * MPQ[2]
+        Q  = MPQ[2]
+        edge_map = dict()
+        mLut, pLut, qLut = mpqLut
+        for m,p,q in np.ndindex(*MPQ):
+            key = list()
+            for di, d in enumerate(mLut[m]):
+                for hi, h in enumerate(pLut[p]):
+                    for wi, w in enumerate(qLut[q]):
+                        if any(x == -1 for x in (d,h,w)):
+                            key.append((di,hi,wi))
+            if len(key):
+                key = tuple(key)
+                mpqOffset = m*PQ + p*Q + q
+                edge_list = edge_map.get(key)
+                if edge_list is None:
+                    edge_map[key] = [mpqOffset]
+                else:
+                    edge_list.append(mpqOffset)
+
+        self.edgeBiasDim = len(edge_map)
+
+        if self.edgeBiasDim:
+            # so K x len(edge_map) is the size of the bias vector
+            # we need a lut of bias index => mpqOffset mappings
+            biasHead = list()
+            biasData = list()
+            biasMap  = sorted(edge_map.values(), key=lambda x: x[0])
+            offset   = len(biasMap) * 2
+            # the lut contains a header with 2 entries per unique bias: offset, size
+            for mpqList in biasMap:
+                biasHead.extend((offset, len(mpqList)))
+                biasData.extend(mpqList)
+                offset += len(mpqList)
+
+            pad4 = 4 - (len(biasData) & 3) if (len(biasData) & 3) else 0
+            biasLut = biasHead + biasData + ( [0] * pad4 )
+            self.edgeEntries = len(biasData)
+            self.edgeBiasMap = biasMap
+            self.edgeBiasLut = tf.constant(np.array(biasLut, dtype=np.int32), name="edge_bias_lut")
+
+    def edge_bias_test(self, x, g, b):
+        if self.edgeBiasDim:
+            if self.layout:
+                N = x.shape[0]
+                K = x.shape[-1]
+                y = np.array(x.reshape(N, -1, K))
+                for i in range(self.edgeBiasDim):
+                    y[:,self.edgeBiasMap[i],:] = y[:,self.edgeBiasMap[i],:] * g[i,:].reshape(1, 1, K) + b[i, :].reshape(1, 1, K)
+                return y.reshape(x.shape)
+            else:
+                N, K = x.shape[0:2]
+                y = np.array(x.reshape(N, K, -1))
+                for i in range(self.edgeBiasDim):
+                    y[:,:,self.edgeBiasMap[i]] = y[:,:,self.edgeBiasMap[i]] * g[:,i].reshape(1, K, 1) + b[:,i].reshape(1, K, 1)
+                return y.reshape(x.shape)
+        else:
+            return x
+
+    # dx = g * dy
+    # dg = sum(dy * x)
+    # db = sum(dy)
+    def edge_bias_grad_test(self, dy, x, g):
+        if self.edgeBiasDim:
+            lut = self.edgeBiasMap
+            dy_shape = dy.shape
+            if self.layout:
+                N = dy_shape[0]
+                K = dy_shape[-1]
+                x  = x.reshape(N, -1, K)
+                dy = dy.reshape(N, -1, K)
+                dx = np.array(dy)
+                dg = np.empty(self.shape, dtype=np.float32)
+                db = np.empty(self.shape, dtype=np.float32)
+                for i in range(self.edgeBiasDim):
+                    dx[:,lut[i],:] *= g[i,:].reshape(1, 1, K)
+                    dg[i,:] = (dy[:,lut[i],:] * x[:,lut[i],:]).sum(axis=(0,1))
+                    db[i,:] = dy[:,lut[i],:].sum(axis=(0,1))
+            else:
+                N, K = dy_shape[0:2]
+                x  = x.reshape(N, K, -1)
+                dy = dy.reshape(N, K, -1)
+                dx = np.array(dy)
+                dg = np.empty(self.shape, dtype=np.float32)
+                db = np.empty(self.shape, dtype=np.float32)
+                for i in range(self.edgeBiasDim):
+                    dx[:,:,lut[i]] *= g[:,i].reshape(1, K, 1)
+                    dg[:,i] = (dy[:,:,lut[i]] * x[:,:,lut[i]]).sum(axis=(0,2))
+                    db[:,i] = dy[:,:,lut[i]].sum(axis=(0,2))
+
+            return dx.reshape(dy_shape), dg, db
+        else:
+            return dy, None, None
+
+    def __call__(self, x, g, b, inference=False, bench=0, name=None):
+        if self.edgeBiasDim:
+            return edge_bias_op(x, g, b, self.edgeBiasLut, layout=self.layout, entries=self.edgeEntries, inference=inference, bench=bench, name=name)
+        return x
+
+@ops.RegisterGradient("EdgeBias")
+def edge_bias_grad(op, dy):
+
+    dx, dg, db = edge_bias_grad_op(dy, op.inputs[0], op.inputs[1], op.inputs[3], layout=op.get_attr("layout"), entries=op.get_attr("entries"), bench=op.get_attr("bench"))
+    return (dx, dg, db, None)
 
 
 class BlocksparseConv(object):
@@ -57,9 +243,8 @@ class BlocksparseConv(object):
     strides: (1,1,1) or (1,1) or (1,)
     dilates: (1,1,1) or (1,1) or (1,)
     padding: (1,1,1) or (1,1) or (1,) or "SAME" or "VALID"
-    edge_bias: True/False
     """
-    def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", edge_bias=False, debug=False, deconv=False):
+    def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", debug=False, deconv=False):
 
         # save this so we know the users perfered number of dims (before we pad 1's out to 3 dims)
         self.userTRS = list(TRS)
@@ -162,8 +347,8 @@ class BlocksparseConv(object):
         self.mpqSlice = None
         fdata = list(zip(TRS, padding, strides, dilates))
         for i in range(3):
-            self.mpqLut.append( [ self.fprop_lut( x, DHW[i], *fdata[i]) for x in range(MPQ[i]) ] )
-            self.dhwLut.append( [ self.bprop_lut( x, MPQ[i], *fdata[i]) for x in range(DHW[i]) ] )
+            self.mpqLut.append( [ fprop_lut( x, DHW[i], *fdata[i]) for x in range(MPQ[i]) ] )
+            self.dhwLut.append( [ bprop_lut( x, MPQ[i], *fdata[i]) for x in range(DHW[i]) ] )
         mpq_lut = self.spatial_grid(DHW, MPQ, self.mpqLut, mpq, trs)
         dhw_lut = self.spatial_grid(MPQ, DHW, self.dhwLut, dhw, trs)
 
@@ -245,10 +430,6 @@ class BlocksparseConv(object):
         self.updat_grid = tf.constant(updatGrid, name="updat_grid")
         self.norm_lut   = tf.constant(normLut,   name="norm_lut")
 
-        if edge_bias:
-            self.init_edge_bias()
-        else:
-            self.edgeBiasDim = 0
 
     def spatial_grid(self, DHW, MPQ, mpqLut, mpq, trs):
 
@@ -311,61 +492,6 @@ class BlocksparseConv(object):
 
         return np.array(mpq_lut, dtype=np.int32)
 
-    def _edge_bias_init(self, MPQ, mpqLut):
-
-        # Hash the mpq coordinates on unique edge overlap patterns
-        # The hash key is the list of lut indicies where the offset is -1
-        PQ = MPQ[1] * MPQ[2]
-        Q  = MPQ[2]
-        edge_map = dict()
-        mLut, pLut, qLut = mpqLut
-        for m,p,q in np.ndindex(*MPQ):
-            key = list()
-            for di, d in enumerate(mLut[m]):
-                for hi, h in enumerate(pLut[p]):
-                    for wi, w in enumerate(qLut[q]):
-                        if any(x == -1 for x in (d,h,w)):
-                            key.append((di,hi,wi))
-            if len(key):
-                key = tuple(key)
-                mpqOffset = m*PQ + p*Q + q
-                edge_list = edge_map.get(key)
-                if edge_list is None:
-                    edge_map[key] = [mpqOffset]
-                else:
-                    edge_list.append(mpqOffset)
-
-        self.edgeBiasDim = len(edge_map)
-
-        if self.edgeBiasDim:
-            # so K x len(edge_map) is the size of the bias vector
-            # we need a lut of bias index => mpqOffset mappings
-            biasHead = list()
-            biasData = list()
-            biasMap  = sorted(edge_map.values(), key=lambda x: x[0])
-            offset   = len(biasMap) * 2
-            # the lut contains a header with 2 entries per unique bias: offset, size
-            for mpqList in biasMap:
-                biasHead.extend((offset, len(mpqList)))
-                biasData.extend(mpqList)
-                offset += len(mpqList)
-
-            biasLut = biasHead + biasData
-            self.edgeBiasMap = biasMap
-            self.edgeBiasLut = tf.constant(np.array(biasLut, dtype=np.int32), name="edge_bias_lut")
-
-    def init_edge_bias(self):
-        self._edge_bias_init(self.MPQ, self.mpqLut)
-
-    def edge_bias(self, x, eb):
-        if self.edgeBiasDim:
-            o_shape = self.o_shape(None)
-            return edge_bias_op(x, eb, self.edgeBiasLut, edges=self.edgeBiasDim, K=o_shape[1], MPQ=o_shape[2:])
-        else:
-            return x
-
-    def edge_bias_shape(self): return (self.K, self.edgeBiasDim)
-
     def i_shape(self, N): return [N, self.C] + self.DHW
     def o_shape(self, N): return [N, self.K] + self.MPQ
     def f_shape(self, block=None):
@@ -378,7 +504,7 @@ class BlocksparseConv(object):
         return [len(lutK), len(lutC)] + self.userTRS
 
 
-    def __call__(self, F, I, edge_bias=None):
+    def __call__(self, F, I):
         assert I.get_shape()[1] == self.C
         output = blocksparse_conv_op(
             self.fprop_grid, self.bprop_grid, self.updat_grid,
@@ -389,8 +515,6 @@ class BlocksparseConv(object):
             magic_trs=self.magic_trs[0], shift_trs=self.magic_trs[1],
             dimF=F.get_shape().as_list(), fshare=self.fshared, bshare=self.bshared, debug=self.debug
         )
-        if edge_bias is not None and self.edgeBiasDim:
-            output = self.edge_bias(output, edge_bias)
         return output
 
     def l2_normalize(self, F, gain=None, epsilon=1e-12, dtype=np.float32):
@@ -409,75 +533,16 @@ class BlocksparseConv(object):
             offset += f.size
         return flatF
 
-    def fprop_lut(self, q, X, S, padding, stride, dilate):
-        qs = q * stride - padding
-        image = list()
-        for s in range(S):
-            x = qs + s * dilate
-            image.append(x if x >= 0 and x < X else -1)
-        return image
-
-    def bprop_lut(self, x, Q, S, padding, stride, dilate):
-        pad_eff = dilation_size(S, dilate) - padding - 1
-        xs = x - pad_eff
-        image = list()
-        # invert the filter to image mapping
-        for s in range(S-1, -1, -1):
-            q = xs + s * dilate
-            if q % stride == 0:
-                q //= stride
-                if q >= 0 and q < Q:
-                    image.append(q)
-                else:
-                    image.append(-1)
-            else:
-                # we need to be able to distinguish a hole in striding and edge padding
-                image.append(-2)
-        return image
-
-    def fprop_slice(self, q, X, S, padding, stride, dilate):
-        qs = q * stride - padding
-        x1 = None
-        for s in range(S):
-            x = qs + s * dilate
-            if x1 is None and x >= 0:
-                x1 = x
-                f1 = s
-            if x < X:
-                x2 = x
-                f2 = s
-        return (slice(f1, f2 + 1), slice(x1, x2 + 1, dilate), f2 - f1 + 1)
-
-    def bprop_slice(self, x, Q, S, padding, stride, dilate):
-        pad_eff = dilation_size(S, dilate) - padding - 1
-        xs = x - pad_eff
-        f, e = list(), list()
-        for s in range(S):
-            q = xs + s * dilate
-            if q % stride == 0:
-                q //= stride
-                if q >= 0 and q < Q:
-                    f.append(s)
-                    e.append(q)
-        if len(f) == 0:
-            return (slice(0, 0, 1), slice(0, 0, 1))
-        if len(f) == 1:
-            fstride = estride = 1
-        else:
-            fstride = f[1] - f[0]
-            estride = e[1] - e[0]
-        return (slice(f[0], f[-1]+1, fstride), slice(e[0], e[-1]+1, estride))
-
     def init_slices(self):
         if self.mpqSlice is None:
             self.mpqSlice = list()
             self.dhwSlice = list()
             fdata  = list(zip(self.TRS, self.padding, self.strides, self.dilates))
             for i in range(3):
-                self.mpqSlice.append( [ self.fprop_slice(x, self.DHW[i], *fdata[i]) for x in range(self.MPQ[i]) ] )
-                self.dhwSlice.append( [ self.bprop_slice(x, self.MPQ[i], *fdata[i]) for x in range(self.DHW[i]) ] )
+                self.mpqSlice.append( [ fprop_slice(x, self.DHW[i], *fdata[i]) for x in range(self.MPQ[i]) ] )
+                self.dhwSlice.append( [ bprop_slice(x, self.MPQ[i], *fdata[i]) for x in range(self.DHW[i]) ] )
 
-    def fprop_test(self, F, I, alpha=1.0, edge_bias=None):
+    def fprop_test(self, F, I, alpha=1.0):
         self.init_slices()
         N = I.shape[0]
         O = np.zeros([N, self.K] + self.MPQ)
@@ -500,11 +565,9 @@ class BlocksparseConv(object):
                 # NxKMPQ
                 O[:,lutK,m,p,q] += np.dot( slicedI, slicedF.T ) * alpha
 
-        O = self.edge_bias_test(O, edge_bias)
-
         return O
 
-    def bprop_test(self, F, I, alpha=1.0, edge_bias=None):
+    def bprop_test(self, F, I, alpha=1.0):
         self.init_slices()
         N = I.shape[0]
         O = np.zeros([N, self.C] + self.DHW)
@@ -527,8 +590,6 @@ class BlocksparseConv(object):
                 slicedI = I[:,lutK,sliceM,sliceP,sliceQ].reshape((N, -1))
                 # NxCDHW
                 O[:,lutC,d,h,w] += np.dot( slicedI, slicedF.T ) * alpha
-
-        O = self.edge_bias_test(O, edge_bias)
 
         return O
 
@@ -556,30 +617,7 @@ class BlocksparseConv(object):
                 # CxKTRS
                 blockU[:,:,sliceT,sliceR,sliceS] += np.dot(slicedE.T, slicedI).reshape((dimF[0], dimF[1], tlen, rlen, slen)) * alpha
 
-        EBU = self.edge_bias_grad_test(I if transpose else E)
-
-        return self.collapse_filter(U, dtype=np.float32), EBU
-
-    def edge_bias_test(self, x, eb):
-        if eb is not None and self.edgeBiasDim:
-            N, K = x.shape[0:2]
-            y = np.array(x.reshape(N, K, -1))
-            for i in range(self.edgeBiasDim):
-                y[:,:,self.edgeBiasMap[i]] += eb[:,i].reshape(1, K, 1)
-            return y.reshape(x.shape)
-        else:
-            return x
-
-    def edge_bias_grad_test(self, grad_y):
-        if self.edgeBiasDim:
-            N, K = grad_y.shape[0:2]
-            grad_y = grad_y.reshape(N, K, -1)
-            grad_b = np.empty(self.edge_bias_shape())
-            for i in range(self.edgeBiasDim):
-                grad_b[:,i] = grad_y[:,:,self.edgeBiasMap[i]].sum(axis=(0,2))
-            return grad_b
-        else:
-            return None
+        return self.collapse_filter(U, dtype=np.float32)
 
     def l2_normalize_test(self, F, gain=None, epsilon=1e-12):
         normF = list()
@@ -667,17 +705,6 @@ def blocksparse_conv_grad(op, grad):
 
     return (None, None, None, None, None, None, grad_F, grad_I)
 
-@ops.RegisterGradient("EdgeBias")
-def edge_bias_grad(op, grad):
-
-    edges = op.get_attr("edges")
-    K     = op.get_attr("K")
-    MPQ   = op.get_attr("MPQ")
-
-    assert grad.get_shape()[1] == K
-
-    grad_b = edge_bias_grad_op(grad, op.inputs[2], edges=edges, K=K, MPQ=MPQ)
-    return (grad, grad_b, None)
 
 @ops.RegisterGradient("L2NormalizeKCTRS")
 def blocksparse_l2_normalize_grad_kctrs(op, grad_y, sum_sqr_x):
@@ -705,7 +732,7 @@ def blocksparse_l2_normalize_grad_kctrs(op, grad_y, sum_sqr_x):
 
 class BlocksparseDeconv(BlocksparseConv):
 
-    def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", edge_bias=False, debug=False):
+    def __init__(self, BCK, TRS, DHW, MPQ=None, strides=(1,1,1), dilates=(1,1,1), padding="SAME", debug=False):
 
         # C<=>K, DHW<=>MPQ, fprop<=>bprop, update args (EI <=> IE), filter layout: KCTRS <=> CKTRS
         BKC = list()
@@ -716,18 +743,13 @@ class BlocksparseDeconv(BlocksparseConv):
             padding = get_padding(padding, TRS, dilates)
             MPQ = [ in_dim(*dims) for dims in zip(TRS, DHW, padding, strides, dilates) ]
 
-        super(BlocksparseDeconv, self).__init__(BKC, TRS, MPQ, DHW, strides, dilates, padding, edge_bias, debug, True)
-
-    def edge_bias_shape(self): return (self.C, self.edgeBiasDim)
-
-    def init_edge_bias(self):
-        self._edge_bias_init(self.DHW, self.dhwLut)
+        super(BlocksparseDeconv, self).__init__(BKC, TRS, MPQ, DHW, strides, dilates, padding, debug, True)
 
     def i_shape(self, N): return [N, self.K] + self.MPQ
     def o_shape(self, N): return [N, self.C] + self.DHW
 
-    def fprop_test(self, F, I, alpha=1.0, edge_bias=None):
-        return super(BlocksparseDeconv, self).bprop_test(F, I, alpha, edge_bias)
+    def fprop_test(self, F, I, alpha=1.0):
+        return super(BlocksparseDeconv, self).bprop_test(F, I, alpha)
 
     def bprop_test(self, F, I, alpha=1.0):
         return super(BlocksparseDeconv, self).fprop_test(F, I, alpha)
@@ -783,7 +805,7 @@ class BlocksparseDeconv(BlocksparseConv):
 
         return self.collapse_filter(D, dtype=np.float32), grad_g
 
-    def __call__(self, F, I, edge_bias=None):
+    def __call__(self, F, I):
         assert I.get_shape()[1] == self.K
         # mode 0 => 1
         output = blocksparse_deconv_op(
@@ -795,8 +817,6 @@ class BlocksparseDeconv(BlocksparseConv):
             magic_trs=self.magic_trs[0], shift_trs=self.magic_trs[1],
             dimF=F.get_shape().as_list(), fshare=self.fshared, bshare=self.bshared, debug=self.debug
         )
-        if edge_bias is not None and self.edgeBiasDim:
-            output = self.edge_bias(output, edge_bias)
         return output
 
     def l2_normalize(self, F, gain=None, epsilon=1e-12, dtype=np.float32):
@@ -884,71 +904,97 @@ def blocksparse_l2_normalize_gain_grad_cktrs(op, grad_y, sum_sqr_x):
 
 ############################## ChannelWise Linear #####################################
 
-def cwise_linear(x, a=None, b=None):
+cwise_linear_op      = _op_module.c_wise_linear
+cwise_linear_grad_op = _op_module.c_wise_linear_grad
 
-    shape = x.get_shape()
-    C     = shape[1]
-    DHW   = shape[2:].num_elements()
 
-    if a is not None:
-        assert C == a.get_shape().num_elements()
-    if b is not None:
-        assert C == b.get_shape().num_elements()
+def cwise_linear(x, gain=None, bias=None, relu=False, bias_first=False, use_tf=False):
 
-    if a is not None and b is not None:
-        return cwise_linear_axpb(x, a, b, C=C, DHW=DHW)
-    if a is not None:
-        return cwise_linear_ax(x, a, C=C, DHW=DHW)
-    if b is not None:
-        return cwise_linear_xpb(x, b, C=C, DHW=DHW)
-    return x
+    assert gain is not None or bias is not None
 
-@ops.RegisterGradient("CWiseLinearAXPB")
+    dev = x.op.device.lower()
+    if use_tf or not dev or "cpu" in dev:
+        if bias_first:
+            if bias is not None:
+                x += bias
+            if gain is not None:
+                x *= gain
+        else:
+            if gain is not None:
+                x *= gain
+            if bias is not None:
+                x += bias
+        return tf.nn.relu(x) if relu else x
+
+    gain = [] if gain is None else [gain]
+    bias = [] if bias is None else [bias]
+
+    return cwise_linear_op(x, gain, bias, relu=relu, swap=bias_first)
+
+
+@ops.RegisterGradient("CWiseLinear")
 def cwise_linear_axpb_grad(op, dy):
-    C   = op.get_attr("C")
-    DHW = op.get_attr("DHW")
-    magic = magic64u(DHW)
-    return cwise_linear_grad_axpb(dy, op.inputs[0], op.inputs[1], op.inputs[2], C=C, DHW=DHW, magic_DHW=magic[0], shift_DHW=magic[1])
 
-@ops.RegisterGradient("CWiseLinearAX")
-def cwise_linear_ax_grad(op, dy):
-    C   = op.get_attr("C")
-    DHW = op.get_attr("DHW")
-    magic = magic64u(DHW)
-    return cwise_linear_grad_ax(dy, op.inputs[0], op.inputs[1], C=C, DHW=DHW, magic_DHW=magic[0], shift_DHW=magic[1])
+    relu  = op.get_attr("relu")
+    swap  = op.get_attr("swap")
+    n_a   = op.get_attr("n_a")
+    n_b   = op.get_attr("n_b")
 
-@ops.RegisterGradient("CWiseLinearXPB")
-def cwise_linear_xpb_grad(op, dy):
-    C   = op.get_attr("C")
-    DHW = op.get_attr("DHW")
-    magic = magic64u(DHW)
-    db = cwise_linear_grad_xpb(dy, op.inputs[1], C=C, DHW=DHW, magic_DHW=magic[0], shift_DHW=magic[1])
-    return dy, db
+    if n_a:
+        # anything with a scale factor we need to save the input
+        xy = [ op.inputs[0]  ]
+    elif relu:
+        # with relu(x + b) we save the outputs
+        xy = [ op.outputs[0] ]
+    else:
+        # x + b requires no saved tensors
+        xy = []
 
-def cwise_linear_test(x, a=1, b=0):
+    a = [ op.inputs[1    ] ] if n_a else []
+    b = [ op.inputs[1+n_a] ] if n_b else []
+
+    dx, da, db = cwise_linear_grad_op(dy, xy, a, b, relu=relu, swap=swap)
+
+    if n_a and n_b:
+        return dx, da, db
+    if n_a:
+        return dx, da
+
+    return dx, db
+
+def cwise_linear_test(x, a=1, b=0, relu=False):
 
     # create broadcastable shapes for a and b
-    shape = list(x.shape)
-    for i in range(len(shape)):
-        if i != 1: shape[i] = 1
+    bcast = list(x.shape)
+    for i in range(len(bcast)):
+        if i != 1: bcast[i] = 1
     if a is not 1:
-        a = a.reshape(shape)
+        a = a.reshape(bcast)
     if b is not 0:
-        b = b.reshape(shape)
+        b = b.reshape(bcast)
 
-    return a*x + b
+    y = a*x + b
+    if relu:
+        y = np.maximum(y, 0.)
 
-def cwise_linear_grad_test(dy, x, a=1):
+    return y
 
-    shape = list(dy.shape)
+def cwise_linear_grad_test(dy, x, a=1, b=0, relu=False):
+
+    bcast = list(dy.shape)
     axis  = list()
-    for i in range(len(shape)):
+    for i in range(len(bcast)):
         if i != 1:
-            shape[i] = 1
+            bcast[i] = 1
             axis.append(i)
     axis = tuple(axis)
     if a is not 1:
-        a = a.reshape(shape)
+        a = a.reshape(bcast)
+    if b is not 0:
+        b = b.reshape(bcast)
+
+    if relu:
+        dy = dy * (a*x + b > 0.0)
 
     dx = a * dy
     da = np.sum(dy * x, axis=axis)
@@ -964,6 +1010,16 @@ def ceil_div(x, y):
 
 def dilation_size(S, dilate):
     return S * dilate - dilate + 1
+
+def tf_out_dim_pad(S, W, padding, stride, dilate):
+    S = dilation_size(S, dilate)
+    if padding.upper() == "SAME":
+        Q = ceil_div(W, stride)
+        p = max((Q - 1) * stride + S - W, 0) // 2
+    else:
+        Q = ceil_div(W - S + 1, stride)
+        p = 0;
+    return Q, p
 
 def out_dim(S, W, padding, stride, dilate):
     return ceil_div(W - dilation_size(S, dilate) + 1 + 2*padding, stride)
@@ -1024,3 +1080,63 @@ def magic64u(d):
     if magic != 1:
         shift -= 32
     return (magic, shift)
+
+
+def fprop_lut(q, X, S, padding, stride, dilate):
+    qs = q * stride - padding
+    image = list()
+    for s in range(S):
+        x = qs + s * dilate
+        image.append(x if x >= 0 and x < X else -1)
+    return image
+
+def bprop_lut(x, Q, S, padding, stride, dilate):
+    pad_eff = dilation_size(S, dilate) - padding - 1
+    xs = x - pad_eff
+    image = list()
+    # invert the filter to image mapping
+    for s in range(S-1, -1, -1):
+        q = xs + s * dilate
+        if q % stride == 0:
+            q //= stride
+            if q >= 0 and q < Q:
+                image.append(q)
+            else:
+                image.append(-1)
+        else:
+            # we need to be able to distinguish a hole in striding and edge padding
+            image.append(-2)
+    return image
+
+def fprop_slice(q, X, S, padding, stride, dilate):
+    qs = q * stride - padding
+    x1 = None
+    for s in range(S):
+        x = qs + s * dilate
+        if x1 is None and x >= 0:
+            x1 = x
+            f1 = s
+        if x < X:
+            x2 = x
+            f2 = s
+    return (slice(f1, f2 + 1), slice(x1, x2 + 1, dilate), f2 - f1 + 1)
+
+def bprop_slice(x, Q, S, padding, stride, dilate):
+    pad_eff = dilation_size(S, dilate) - padding - 1
+    xs = x - pad_eff
+    f, e = list(), list()
+    for s in range(S):
+        q = xs + s * dilate
+        if q % stride == 0:
+            q //= stride
+            if q >= 0 and q < Q:
+                f.append(s)
+                e.append(q)
+    if len(f) == 0:
+        return (slice(0, 0, 1), slice(0, 0, 1))
+    if len(f) == 1:
+        fstride = estride = 1
+    else:
+        fstride = f[1] - f[0]
+        estride = e[1] - e[0]
+    return (slice(f[0], f[-1]+1, fstride), slice(e[0], e[-1]+1, estride))

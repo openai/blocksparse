@@ -1,165 +1,144 @@
 
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 #include "ew_op_gpu.h"
 //#include <stdio.h>
 
-
-// mean = mean(x, axis=0)
-template <typename T, int UNROLL, int THREADS>
-__global__ void __launch_bounds__(THREADS) layer_norm_mean_CN(
-          float*              Mean,
-    const     T* __restrict__ X,
-    int K, int N, float rcpK)
+template <typename T, typename V, uint THREADS, uint WIDTH>
+__global__ void __launch_bounds__(THREADS) layer_norm_moments1_CN(
+          V*              P1,
+          V*              P2,
+    const T* __restrict__ X,
+    uint K, uint N)
 {
-    __shared__ float4 Share4[THREADS];
-    float* Share = (float*)Share4;
+    // Stripe the reduction lines with tid and block_n
+    uint tid      = threadIdx.x;
+    uint block_n  = blockIdx.x;
+    uint block_k  = blockIdx.y;
 
-    int tid   = threadIdx.x;
-    int idx_K = blockIdx.x;
-    int idx_N = blockIdx.y;
+    uint warps = THREADS / 32;
+    uint lines = THREADS / WIDTH;
+    uint line  = tid     / WIDTH;
 
-    int tid16 = tid >> 4;
-    int tid15 = tid & 15;
+    uint n = block_n*WIDTH + (tid % WIDTH);
+    uint k = block_k * lines + line;
 
-    int k = idx_K*UNROLL*(THREADS/16) + tid16;
-    int n = idx_N*16 + tid15;
+    uint kn = k*N + n;
+    bool bn = n < N;
 
-    int  N4  = N >> 2;
-    bool bn  = n < N4;
+    uint inc_k  = gridDim.y * lines;
+    uint inc_kn = inc_k*N;
 
-    int xi  = k*N4 + n;
-    int inc = N4 * (THREADS/16);
-
-    float4 mean4;
-    ew_zero(mean4);
-    #pragma unroll 4
-    for (int j = 0; j < UNROLL; j++)
+    V mean1, mean2;
+    ew_zero(mean1);
+    ew_zero(mean2);
+    #pragma unroll 1
+    while (k < K)
     {
-        float4 x = load(X, xi, bn && k < K);
+        V x = load(add_ptr_u(X, kn), 0, bn);
 
-        mean4 = ew_add(mean4, x);
-
-        k  += (THREADS/16);
-        xi += inc;
+        mean1 = ew_add(mean1, x);
+        mean2 = ew_add(mean2, ew_sqr(x));
+        kn += inc_kn;
+        k  += inc_k;
     }
-    Share4[(tid16 << 4) + tid15] = mean4;
+    __shared__ V sMean1[THREADS];
+    __shared__ V sMean2[THREADS];
+
+    sMean1[tid] = mean1;
+    sMean2[tid] = mean2;
 
     __syncthreads();
-    int tid32 = tid >> 5;
-    int tid31 = tid & 31;
 
-    if (tid32 == 0)
+    if (tid < 32)
     {
-        n = idx_N*64 + tid31;
-        Mean += n;
+        for (uint i = 1; i < warps; i++)
+            mean1 = ew_add(mean1, sMean1[tid + i*32]);
 
-        float mean = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            mean += Share[tid31 + i*64];
-        mean *= rcpK;
+        // if the line width is less than a warp, reduce the lines within a warp
+        for (int i = 16; i >= WIDTH; i >>= 1)
+            mean1 = ew_warp_sum(mean1, i);
 
-        if (n < N)
-            //*Mean = mean;
-            atomicAdd(Mean, mean);
+        // output a partial sums
+        if (tid < WIDTH && bn)
+            store(add_ptr_u(P1, block_k*N + n), mean1);
     }
-    else if (tid32 == 3)
+    else if (tid < 64)
     {
-        n = idx_N*64 + tid31+32;
-        Mean += n;
+        tid -= 32;
+        mean2 = ew_add(mean2, sMean2[tid + 0*32]);
+        for (uint i = 2; i < warps; i++)
+            mean2 = ew_add(mean2, sMean2[tid + i*32]);
 
-        float mean = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            mean += Share[tid31 + i*64 + 32];
-        mean *= rcpK;
+        // if the line width is less than a warp, reduce the lines within a warp
+        for (int i = 16; i >= WIDTH; i >>= 1)
+            mean2 = ew_warp_sum(mean2, i);
 
-        if (n < N)
-            //*Mean = mean;
-            atomicAdd(Mean, mean);
+        // output a partial sums
+        if (tid < WIDTH && bn)
+            store(add_ptr_u(P2, block_k*N + n), mean2);
     }
 }
 
-// var = var(x, axis=0)
-template <typename T, int UNROLL, int THREADS>
-__global__ void __launch_bounds__(THREADS) layer_norm_var_CN(
-           float*              Var,
-    const      T* __restrict__ X,
-    const float4* __restrict__ Mean,
-    int K, int N, float rcpK)
+// Reduce partial sums
+__global__ void __launch_bounds__(256) layer_norm_moments2_CN(
+          float*              Mean,
+          float*              Rstd,
+    const float* __restrict__ P1,
+    const float* __restrict__ P2,
+    uint nPartials, uint N, float rcpK, float epsilon)
 {
-    __shared__ float4 Share4[THREADS];
-    float* Share = (float*)Share4;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
 
-    int tid   = threadIdx.x;
-    int idx_K = blockIdx.x;
-    int idx_N = blockIdx.y;
+    // load in 8 units of n wide to allow efficient transpose in L1 cache
+    uint n = bid*8 + tid/32;
+    uint k = tid & 31;
 
-    int tid16 = tid >> 4;
-    int tid15 = tid & 15;
+    uint kn = k*N + n;
+    bool bn = n < N;
 
-    int k = idx_K*UNROLL*(THREADS/16) + tid16;
-    int n = idx_N*16 + tid15;
+    // force compute outside of loop
+    asm("mov.b32 %0, %0;" : "+r"(kn) : );
 
-    int  N4  = N >> 2;
-    bool bn  = n < N4;
-
-    int xi  = k*N4 + n;
-    int inc = N4 * (THREADS/16);
-
-    float4 mean = load(Mean, n, bn);
-
-    float4 var4;
-    ew_zero(var4);
-    #pragma unroll 4
-    for (int j = 0; j < UNROLL; j++)
+    float mean1 = 0.0f, mean2 = 0.0f;
+    // We should generally have #SMs * 2 partials.
+    #pragma unroll 1
+    while (k < nPartials)
     {
-        float4 x = load(X, xi, bn && k < K);
+#if __CUDA_ARCH__ >= 700
+        const int UNROLL = 5; // 2*80 partials
+#else
+        const int UNROLL = 4; // 2*56 partials
+#endif
 
-        // var4 += (x - mean)**2
-        if (k < K)
-            var4 = ew_add(var4, ew_sqr(ew_sub(x, mean)));
+        bool bnk[UNROLL];
+        bnk[0] = bn;
+        for (int i = 1; i < UNROLL; i++)
+            bnk[i] = bn && (k+32*i < nPartials);
 
-        k  += (THREADS/16);
-        xi += inc;
+        for (int i = 0; i < UNROLL; i++)
+        {
+            mean1 += load(add_ptr_u(P1, kn + N*32*i), 0, bnk[i]);
+            mean2 += load(add_ptr_u(P2, kn + N*32*i), 0, bnk[i]);
+        }
+        kn += 32*UNROLL*N;
+        k  += 32*UNROLL;
     }
-    Share4[(tid16 << 4) + tid15] = var4;
-
-    __syncthreads();
-    int tid32 = tid >> 5;
-    int tid31 = tid & 31;
-
-    if (tid32 == 0)
+    for (uint i = 16; i > 0; i >>= 1)
     {
-        n = idx_N*64 + tid31;
-        Var += n;
-
-        float var = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            var += Share[tid31 + i*64];
-        var *= rcpK;
-
-        if (n < N)
-            //*Var = var;
-            atomicAdd(Var, var);
+        mean1 += shfl_xor(mean1, i);
+        mean2 += shfl_xor(mean2, i);
     }
-    else if (tid32 == 3)
+    if (bn & (tid & 31) == 0)
     {
-        n = idx_N*64 + tid31+32;
-        Var += n;
-
-        float var = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            var += Share[tid31 + i*64 + 32];
-        var *= rcpK;
-
-        if (n < N)
-            //*Var = var;
-            atomicAdd(Var, var);
+        // var  = mean(x**2) - mean(x)**2
+        // rstd = 1/sqrt(var)
+        mean1 *= rcpK;
+        mean2 *= rcpK;
+        float rstd = rsqrtf((mean2 - ew_sqr(mean1)) + epsilon);
+        store(add_ptr_u(Mean, n), mean1);
+        store(add_ptr_u(Rstd, n), rstd);
     }
 }
 
@@ -171,10 +150,10 @@ __global__ void __launch_bounds__(32) layer_norm_CN(
                T*              Y,
     const      T* __restrict__ X,
     const float4* __restrict__ Mean,
-    const float4* __restrict__ Var,
+    const float4* __restrict__ Rstd,
     const  float* __restrict__ G,
     const  float* __restrict__ B,
-    int K, int N, float epsilon, int relu)
+    int K, int N, int relu)
 {
     __shared__ float Gain[UNROLL*2];
     __shared__ float Bias[UNROLL*2];
@@ -197,23 +176,15 @@ __global__ void __launch_bounds__(32) layer_norm_CN(
     int k = idx_K + tid16;
     int n = idx_N + tid15;
 
-    int  N4 = N  >> 2;
-    bool bn = n < N4;
+    bool bn = n < N;
 
-    int xi  = k*N4 + n;
-    int inc = N4 * 2;
+    int xi  = k*N + n;
+    int inc = N * 2;
 
-    float4 var  = load(Var,  n, bn);
+    float4 rstd = load(Rstd, n, bn);
     float4 mean = load(Mean, n, bn);
 
-    // rstd = 1 / sqrt(var + epsilon)
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.x) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.y) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.z) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.w) : );
-    float4 rstd = ew_rsqrt(ew_add(var, epsilon));
-
-    #pragma unroll 4
+    #pragma unroll
     for (int j = 0; j < UNROLL; j++)
     {
         bool bnk = bn && k < K;
@@ -230,7 +201,7 @@ __global__ void __launch_bounds__(32) layer_norm_CN(
         if (relu)
             y = ew_relu(y);
 
-        store_f(Y, y, xi, bnk);
+        store(Y, y, xi, bnk);
 
         k     += 2;
         tid16 += 2;
@@ -241,56 +212,53 @@ template <typename T, typename V>
 bool LayerNormForward_CN(CUstream stream, int SMs,
               T* y,
           float* mean,
-          float* var,
+          float* rstd,
+          float* p1,
+          float* p2,
     const     T* x,
     const float* g,
     const float* b,
     float epsilon, int K, int N, float rcpK, int relu)
 {
-    const V* X = (const V*)x;
+    const      V*    X = (const V*)x;
     const float4* Mean = (const float4*)mean;
-    const float4* Var  = (const float4*)var;
+    const float4* Rstd = (const float4*)rstd;
+          float4*   P1 = (      float4*)p1;
+          float4*   P2 = (      float4*)p2;
 
-    cuMemsetD32Async((CUdeviceptr)mean, 0, N, stream);
-    cuMemsetD32Async((CUdeviceptr)var,  0, N, stream);
+    uint gridN64 = (N >> 6) + ((N &  63) != 0);
+    uint gridN8  = (N >> 3) + ((N &   7) != 0);
+    uint gridK8  = (K >> 3) + ((K &   7) != 0);
 
-    int gridN = (N >> 6) + ((N &  63) != 0);
-    int gridK = (K >> 3) + ((K &   7) != 0);
-
-    if ((K >> 8) < (SMs >> 1))
-    {
-        dim3 grid((K >> 7) + ((K & 127) != 0), gridN);
-        layer_norm_mean_CN<V,16,128><<<grid,128,0,stream>>>(mean, X, K, N, rcpK);
-        layer_norm_var_CN <V,16,128><<<grid,128,0,stream>>>(var, X, Mean, K, N, rcpK);
-    }
+    uint nPartials = gridN64 > 1 ? SMs : SMs*2;
+    if (K <= 8*nPartials)
+        layer_norm_moments1_CN<V,float4,128,16><<<dim3(gridN64, nPartials),128,0,stream>>>(P1, P2, X, K, N>>2);
     else
-    {
-        dim3 grid((K >> 8) + ((K & 255) != 0), gridN);
-        layer_norm_mean_CN<V,16,256><<<grid,256,0,stream>>>(mean, X, K, N, rcpK);
-        layer_norm_var_CN <V,16,256><<<grid,256,0,stream>>>(var, X, Mean, K, N, rcpK);
-    }
-    dim3 grid(gridK, gridN);
-    layer_norm_CN<V,4><<<grid,32, 0,stream>>>((V*)y, X, Mean, Var, g, b, K, N, epsilon, relu);
+        layer_norm_moments1_CN<V,float4,256,16><<<dim3(gridN64, nPartials),256,0,stream>>>(P1, P2, X, K, N>>2);
+
+    layer_norm_moments2_CN<<<gridN8,256,0,stream>>>(mean, rstd, p1, p2, nPartials, N, rcpK, epsilon);
+
+    layer_norm_CN<V,4><<<dim3(gridK8, gridN64),32, 0,stream>>>((V*)y, X, Mean, Rstd, g, b, K, N>>2, relu);
     return true; // TODO
 }
-template bool LayerNormForward_CN<float,float4>(CUstream stream, int SMs, float* y, float* mean, float* rstd, const float* x, const float* g, const float* b, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormForward_CN<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* y, float* mean, float* rstd, const ehalf* x, const float* g, const float* b, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormForward_CN<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* y, float* mean, float* rstd, const bhalf* x, const float* g, const float* b, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormForward_CN<float,float4>(CUstream stream, int SMs, float* y, float* mean, float* rstd, float* p1, float* p2, const float* x, const float* g, const float* b, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormForward_CN<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* y, float* mean, float* rstd, float* p1, float* p2, const ehalf* x, const float* g, const float* b, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormForward_CN<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* y, float* mean, float* rstd, float* p1, float* p2, const bhalf* x, const float* g, const float* b, float epsilon, int K, int N, float rcpK, int relu);
 
 
 // dg = sum(dy * xhat(x), axis=1)
 // db = sum(dy, axis=1)
-template <typename B, typename F>
+template <typename T>
 __global__ void __launch_bounds__(128) layer_norm_dg_db_CN(
            float*              DG,
            float*              DB,
-    const      B* __restrict__ DY,
-    const      F* __restrict__ X,
+    const      T* __restrict__ DY,
+    const      T* __restrict__ X,
     const  float* __restrict__ Gain,
     const  float* __restrict__ Bias,
     const float4* __restrict__ Mean,
-    const float4* __restrict__ Var,
-    float epsilon, int K, int N, int relu)
+    const float4* __restrict__ Rstd,
+    int K, int N, int relu)
 {
     __shared__ float gain[8];
     __shared__ float bias[8];
@@ -325,16 +293,10 @@ __global__ void __launch_bounds__(128) layer_norm_dg_db_CN(
         {
             float4 x    = load(X,    n);
             float4 dy   = load(DY,   n);
-            float4 var  = load(Var,  n);
+            float4 rstd = load(Rstd, n);
             float4 mean = load(Mean, n);
 
-            // rstd = 1 / sqrt(var + epsilon)
             // xhat = (x - mean) * rstd
-            // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.x) : );
-            // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.y) : );
-            // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.z) : );
-            // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.w) : );
-            float4 rstd = ew_rsqrt(ew_add(var, epsilon));
             float4 xhat = ew_mul(ew_sub(x, mean), rstd);
 
             if (relu)
@@ -353,8 +315,8 @@ __global__ void __launch_bounds__(128) layer_norm_dg_db_CN(
         // reduce each half warp
         for (int i = 8; i > 0; i >>= 1)
         {
-            dg += __shfl_xor(dg, i);
-            db += __shfl_xor(db, i);
+            dg += shfl_xor(dg, i);
+            db += shfl_xor(db, i);
         }
         if (tid15 == 0)
         {
@@ -367,162 +329,166 @@ __global__ void __launch_bounds__(128) layer_norm_dg_db_CN(
 // dy    = dy * g
 // sum1  = sum(xhat * dy, axis=0)
 // sum2  = sum(dy, axis=0)
-template <typename B, typename F, int UNROLL, int THREADS>
-__global__ void __launch_bounds__(THREADS) layer_norm_dx_sum_CN(
-           float*              Sum1,
-           float*              Sum2,
-    const      B* __restrict__ DY,
-    const      F* __restrict__ X,
+template <typename T, uint THREADS, uint WIDTH>
+__global__ void __launch_bounds__(THREADS) layer_norm_dx_sum1_CN(
+          float4*              P1,
+          float4*              P2,
+    const      T* __restrict__ DY,
+    const      T* __restrict__ X,
     const  float* __restrict__ Gain,
     const  float* __restrict__ Bias,
     const float4* __restrict__ Mean,
-    const float4* __restrict__ Var,
-    float epsilon, int K, int N, int relu)
+    const float4* __restrict__ Rstd,
+    int K, int N, int relu)
 {
-    __shared__ float4 Sum1f4[THREADS];
-    __shared__ float4 Sum2f4[THREADS];
-    __shared__ float gain[UNROLL*(THREADS/16)];
-    __shared__ float bias[UNROLL*(THREADS/16)];
-    float* Sum1f1 = (float*)Sum1f4;
-    float* Sum2f1 = (float*)Sum2f4;
+    // Stripe the reduction lines with tid and block_n
+    uint tid      = threadIdx.x;
+    uint block_n  = blockIdx.x;
+    uint block_k  = blockIdx.y;
 
-    int tid   = threadIdx.x;
-    int idx_K = blockIdx.x * UNROLL*(THREADS/16);
-    int idx_N = blockIdx.y * 16;
+    uint warps = THREADS / 32;
+    uint lines = THREADS / WIDTH;
+    uint line  = tid     / WIDTH;
 
-    // load gain/bias for this K-block
-    int ki = idx_K + tid;
-    if (tid < UNROLL*(THREADS/16) && ki < K)
-    {
-        gain[tid] = Gain[ki];
-        bias[tid] = Bias[ki];
-    }
-    __syncthreads();
+    uint n = block_n*WIDTH + (tid % WIDTH);
+    uint k = block_k * lines + line;
 
-    int tid16 = tid >> 4;
-    int tid15 = tid & 15;
-    int gbi   = tid16;
+    uint kn = k*N + n;
+    bool bn = n < N;
 
-    int k = idx_K + tid16;
-    int n = idx_N + tid15;
+    uint inc_k  = gridDim.y * lines;
+    uint inc_kn = inc_k*N;
 
-    int  N4 = N  >> 2;
-    bool bn = n < N4;
-
-    int xi  = k*N4 + n;
-    int inc = N4 * (THREADS/16);
-
-    float4 var  = load(Var,  n, bn);
+    float4 rstd = load(Rstd, n, bn);
     float4 mean = load(Mean, n, bn);
-
-    // rstd = 1 / sqrt(var + epsilon)
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.x) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.y) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.z) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.w) : );
-    float4 rstd = ew_rsqrt(ew_add(var, epsilon));
 
     float4 sum1, sum2;
     ew_zero(sum1);
     ew_zero(sum2);
-    #pragma unroll 2
-    for (int j = 0; j < UNROLL; j++)
+    #pragma unroll 1
+    while (k < K)
     {
-        bool bnk = bn & k < K;
-        float4  x = load( X, xi, bnk);
-        float4 dy = load(DY, xi, bnk);
-        float g = gain[gbi];
-        float b = bias[gbi];
+        float4 dy = load(add_ptr_u(DY, kn), 0, bn);
+        float4 x  = load(add_ptr_u(X,  kn), 0, bn);
+
+        float gain = load(add_ptr_u(Gain, k), 0, bn);
+        float bias = load(add_ptr_u(Bias, k), 0, bn && relu != 0);
 
         float4 xhat = ew_mul(ew_sub(x, mean), rstd);
-        if (relu)
-            dy = ew_relu_grad(dy, ew_add(ew_mul(xhat, g), b));
-        dy = ew_mul(dy, g);
+        if (relu != 0)
+            dy = ew_relu_grad(dy, ew_add(ew_mul(xhat, gain), bias));
+        dy = ew_mul(dy, gain);
 
-        if (bnk)
-        {
-            sum1 = ew_add(sum1, ew_mul(dy, xhat));
-            sum2 = ew_add(sum2, dy);
-        }
-        k   += (THREADS/16);
-        gbi += (THREADS/16);
-        xi  += inc;
+        sum1 = ew_add(sum1, ew_mul(dy, xhat));
+        sum2 = ew_add(sum2, dy);
+
+        kn += inc_kn;
+        k  += inc_k;
     }
-    int si = (tid16 << 4) + tid15;
-    Sum1f4[si] = sum1;
-    Sum2f4[si] = sum2;
+    __shared__ float4 sSum1[THREADS];
+    __shared__ float4 sSum2[THREADS];
+
+    sSum1[tid] = sum1;
+    sSum2[tid] = sum2;
+
     __syncthreads();
 
-    int tid32 = tid >> 5;
-    int tid31 = tid & 31;
-    n = idx_N*4 + tid31;
-
-    if (tid32 == 0)
+    if (tid < 32)
     {
-        Sum1 += n;
+        for (uint i = 1; i < warps; i++)
+            sum1 = ew_add(sum1, sSum1[tid + i*32]);
 
-        float sum1 = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            sum1 += Sum1f1[tid31 + i*64];
+        // if the line width is less than a warp, reduce the lines within a warp
+        for (int i = 16; i >= WIDTH; i >>= 1)
+            sum1 = ew_warp_sum(sum1, i);
 
-        if (n < N)
-            atomicAdd(Sum1, sum1);
+        // output a partial sums
+        if (tid < WIDTH && bn)
+            store(add_ptr_u(P1, block_k*N + n), sum1);
     }
-    else if (tid32 == 1)
+    else if (tid < 64)
     {
-        n += 32;
-        Sum1 += n;
+        tid -= 32;
+        sum2 = ew_add(sum2, sSum2[tid + 0*32]);
+        for (uint i = 2; i < warps; i++)
+            sum2 = ew_add(sum2, sSum2[tid + i*32]);
 
-        float sum1 = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            sum1 += Sum1f1[tid31 + i*64 + 32];
+        // if the line width is less than a warp, reduce the lines within a warp
+        for (int i = 16; i >= WIDTH; i >>= 1)
+            sum2 = ew_warp_sum(sum2, i);
 
-        if (n < N)
-            atomicAdd(Sum1, sum1);
+        // output a partial sums
+        if (tid < WIDTH && bn)
+            store(add_ptr_u(P2, block_k*N + n), sum2);
     }
-    else if (tid32 == 2)
+}
+// Reduce partial sums
+__global__ void __launch_bounds__(256) layer_norm_dx_sum2_CN(float* Sum1, float* Sum2, uint nPartials, uint N)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    // load in 8 units of n wide to allow efficient transpose in L1 cache
+    uint n = bid*8 + tid/32;
+    uint k = tid & 31;
+
+    float* Sum = Sum1;
+    if (n >= N)
     {
-        Sum2 += n;
-
-        float sum2 = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            sum2 += Sum2f1[tid31 + i*64];
-
-        if (n < N)
-            atomicAdd(Sum2, sum2);
+        n  -= N;
+        Sum = Sum2;
     }
-    else if (tid32 == 3)
+    uint kn = k*N + n;
+    bool bn = n < N;
+
+    // force compute outside of loop
+    asm("mov.b32 %0, %0;" : "+r"(kn) : );
+
+    float sum = 0.0f;
+    // We should generally have #SMs * 2 partials.
+    #pragma unroll 1
+    while (k < nPartials)
     {
-        n += 32;
-        Sum2 += n;
+#if __CUDA_ARCH__ >= 700
+        const int UNROLL = 5; // 2*80 partials
+#else
+        const int UNROLL = 4; // 2*56 partials
+#endif
 
-        float sum2 = 0.0f;
-        #pragma unroll
-        for (int i = 0; i < (THREADS/16); i++)
-            sum2 += Sum2f1[tid31 + i*64 + 32];
+        bool bnk[UNROLL];
+        bnk[0] = bn;
+        for (int i = 1; i < UNROLL; i++)
+            bnk[i] = bn && (k+32*i < nPartials);
 
-        if (n < N)
-            atomicAdd(Sum2, sum2);
+        for (int i = 0; i < UNROLL; i++)
+            sum += load(add_ptr_u((const float*)Sum, kn + N*32*i), 0, bnk[i]);
+
+        kn += 32*UNROLL*N;
+        k  += 32*UNROLL;
     }
+    for (uint i = 16; i > 0; i >>= 1)
+    {
+        sum += shfl_xor(sum, i);
+    }
+    if (bn & (tid & 31) == 0)
+        store(add_ptr_u(Sum, n), sum);
+
 }
 
 // dy = dy * g
 // dx = (dy - ((xhat * sum1 + sum2) * rcpK)) * xstdr
-template <typename B, typename F, int UNROLL>
+template <typename T, int UNROLL>
 __global__ void __launch_bounds__(32) layer_norm_dx_CN(
-               B*              DX,
-    const      B* __restrict__ DY,
-    const      F* __restrict__ X,
+               T*              DX,
+    const      T* __restrict__ DY,
+    const      T* __restrict__ X,
     const  float* __restrict__ Gain,
     const  float* __restrict__ Bias,
     const float4* __restrict__ Mean,
-    const float4* __restrict__ Var,
+    const float4* __restrict__ Rstd,
     const float4* __restrict__ Sum1,
     const float4* __restrict__ Sum2,
-    float epsilon, int K, int N, float rcpK, int relu)
+    int K, int N, float rcpK, int relu)
 {
     __shared__ float gain[UNROLL*2];
     __shared__ float bias[UNROLL*2];
@@ -551,17 +517,11 @@ __global__ void __launch_bounds__(32) layer_norm_dx_CN(
     int xi  = k*N4 + n;
     int inc = N4 * 2;
 
-    float4 var  = load(Var,  n, bn);
+    float4 rstd = load(Rstd, n, bn);
     float4 mean = load(Mean, n, bn);
     float4 sum1 = load(Sum1, n, bn);
     float4 sum2 = load(Sum2, n, bn);
 
-    // rstd = 1 / sqrt(var + epsilon)
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.x) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.y) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.z) : );
-    // asm("and.b32 %0, %0, 0xffffc000;" : "+f"(var.w) : );
-    float4 rstd = ew_rsqrt(ew_add(var, epsilon));
     #pragma unroll 4
     for (int j = 0; j < UNROLL; j++)
     {
@@ -579,59 +539,59 @@ __global__ void __launch_bounds__(32) layer_norm_dx_CN(
         // dx = (dy - ((xhat * sum1 + sum2) * rcpK)) * rstd;
         float4 dx = ew_mul(ew_sub(dy, ew_mul(ew_add(ew_mul(xhat, sum1), sum2), rcpK)), rstd);
 
-        store_g(DX, dx, xi, bnk);
+        store(DX, dx, xi, bnk);
         k     += 2;
         tid16 += 2;
         xi    += inc;
     }
 }
 
-template <typename B, typename F, typename VB, typename VF>
+template <typename T, typename V>
 bool LayerNormBackward_CN(CUstream stream, int SMs,
-              B* dx,
+              T* dx,
           float* dg,
           float* db,
           float* sum1,
           float* sum2,
-    const     B* dy,
-    const     F* x,
+    const     T* dy,
+    const     T* x,
     const float* g,
     const float* b,
     const float* mean,
-    const float* var,
+    const float* rstd,
     float epsilon, int K, int N, float rcpK, int relu)
 {
-    int gridK8   = (K >> 3) + ((K &   7) != 0);
-    int gridK256 = (K >> 8) + ((K & 255) != 0);
-    int gridN64  = (N >> 6) + ((N &  63) != 0);
-    dim3 grid8(  gridK8,   gridN64, 1);
-    dim3 grid256(gridK256, gridN64, 1);
+    uint gridN64 = (N >> 6) + ((N &  63) != 0);
+    uint gridN8  = (N >> 3) + ((N &   7) != 0);
+    uint gridK8  = (K >> 3) + ((K &   7) != 0);
+    uint nPartials = gridN64 > 1 ? SMs : SMs*2;
 
-          VB* DX = (      VB*)dx;
-    const VB* DY = (const VB*)dy;
-    const VF*  X = (const VF*)x;
+          V* DX = (      V*)dx;
+    const V* DY = (const V*)dy;
+    const V*  X = (const V*)x;
 
     const float4* Mean = (const float4*)mean;
-    const float4* Var  = (const float4*)var;
+    const float4* Rstd = (const float4*)rstd;
     const float4* Sum1 = (const float4*)sum1;
     const float4* Sum2 = (const float4*)sum2;
 
-    cuMemsetD32Async((CUdeviceptr)sum1, 0, N, stream);
-    cuMemsetD32Async((CUdeviceptr)sum2, 0, N, stream);
+    layer_norm_dg_db_CN<V><<<gridK8,128,0,stream>>>(dg, db, DY, X, g, b, Mean, Rstd, K, N, relu);
 
-    layer_norm_dg_db_CN <VB,VF       ><<<gridK8 ,128,0,stream>>>(dg, db, DY, X, g, b, Mean, Var, epsilon, K, N, relu);
-    layer_norm_dx_sum_CN<VB,VF,16,256><<<grid256,256,0,stream>>>(sum1, sum2, DY, X, g, b, Mean, Var, epsilon, K, N, relu);
-    layer_norm_dx_CN    <VB,VF, 4    ><<<grid8,   32,0,stream>>>(DX, DY, X, g, b, Mean, Var, Sum1, Sum2, epsilon, K, N, rcpK, relu);
+    if (K <= 8*nPartials)
+        layer_norm_dx_sum1_CN<V,128,16><<<dim3(gridN64, nPartials),128,0,stream>>>((float4*)sum1, (float4*)sum2, DY, X, g, b, Mean, Rstd, K, N>>2, relu);
+    else
+        layer_norm_dx_sum1_CN<V,256,16><<<dim3(gridN64, nPartials),256,0,stream>>>((float4*)sum1, (float4*)sum2, DY, X, g, b, Mean, Rstd, K, N>>2, relu);
+
+    layer_norm_dx_sum2_CN<<<gridN8*2,256,0,stream>>>(sum1, sum2, nPartials, N);
+
+    layer_norm_dx_CN<V,4><<<dim3(gridK8, gridN64),32,0,stream>>>(DX, DY, X, g, b, Mean, Rstd, Sum1, Sum2, K, N, rcpK, relu);
 
     return true; // TODO
 }
 
-template bool LayerNormBackward_CN<float,float,float4,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, float* sum1, float* sum2, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormBackward_CN<ehalf,ehalf,ehalf4,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, float* sum1, float* sum2, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormBackward_CN<bhalf,bhalf,bhalf4,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, float* sum1, float* sum2, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-
-template bool LayerNormBackward_CN<float,ehalf,float4,ehalf4>(CUstream stream, int SMs, float* dx, float* dg, float* db, float* sum1, float* sum2, const float* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template bool LayerNormBackward_CN<float,bhalf,float4,bhalf4>(CUstream stream, int SMs, float* dx, float* dg, float* db, float* sum1, float* sum2, const float* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormBackward_CN<float,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, float* sum1, float* sum2, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormBackward_CN<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, float* sum1, float* sum2, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
+template bool LayerNormBackward_CN<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, float* sum1, float* sum2, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
 
 
 // Sparse Projection Code

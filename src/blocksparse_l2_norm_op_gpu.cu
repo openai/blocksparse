@@ -1,6 +1,5 @@
 
 #if GOOGLE_CUDA
-#define EIGEN_USE_GPU
 
 #include "ew_op_gpu.h"
 
@@ -59,7 +58,7 @@ __global__ void __launch_bounds__(32) l2_normalize_KCTRS(
     }
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-        sum_sqr_x += __shfl_xor(sum_sqr_x, i);
+        sum_sqr_x += shfl_xor(sum_sqr_x, i);
 
     // store reduction for gradient pass
     if (tid == 0)
@@ -125,7 +124,7 @@ __global__ void __launch_bounds__(32) l2_normalize_CKTRS(
     }
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
-        sum_sqr_x += __shfl_xor(sum_sqr_x, i);
+        sum_sqr_x += shfl_xor(sum_sqr_x, i);
 
     // store reduction for gradient pass
     if (tid == 0)
@@ -280,7 +279,7 @@ __global__ void __launch_bounds__(32) l2_normalize_CK_16(
         }
     }
     // reduce sum_sqr_x across the 4 rows of the warp
-    sum_sqr_x += __shfl_xor(sum_sqr_x, 16);
+    sum_sqr_x += shfl_xor(sum_sqr_x, 16);
 
     store(S, sum_sqr_x, k, tid < 16);
 
@@ -350,8 +349,8 @@ __global__ void __launch_bounds__(32) l2_normalize_CK_8(
         sum_sqr_x += x0 * x0 + x1 * x1;
     }
     // reduce sum_sqr_x across the 4 rows of the warp
-    sum_sqr_x += __shfl_xor(sum_sqr_x, 16);
-    sum_sqr_x += __shfl_xor(sum_sqr_x, 8);
+    sum_sqr_x += shfl_xor(sum_sqr_x, 16);
+    sum_sqr_x += shfl_xor(sum_sqr_x, 8);
 
     store(S, sum_sqr_x, k, tid < 8);
 
@@ -476,8 +475,8 @@ __global__ void __launch_bounds__(32) l2_normalize_grad_KCTRS(
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
     {
-        red_val += __shfl_xor(red_val, i);
-        dg      += __shfl_xor(dg, i);
+        red_val += shfl_xor(red_val, i);
+        dg      += shfl_xor(dg, i);
     }
     if (apply_gain && tid == 0)
         DG[k] = dg;
@@ -563,8 +562,8 @@ __global__ void __launch_bounds__(32) l2_normalize_grad_CKTRS(
     #pragma unroll
     for (int i = 16; i > 0; i >>= 1)
     {
-        red_val += __shfl_xor(red_val, i);
-        dg      += __shfl_xor(dg, i);
+        red_val += shfl_xor(red_val, i);
+        dg      += shfl_xor(dg, i);
     }
     if (apply_gain && tid == 0)
         DG[k] = dg;
@@ -767,8 +766,8 @@ __global__ void __launch_bounds__(32) l2_normalize_grad_CK_16(
         }
     }
     // reduce red_val,dg across the 4 rows of the warp
-    red_val += __shfl_xor(red_val, 16);
-    dg      += __shfl_xor(dg,      16);
+    red_val += shfl_xor(red_val, 16);
+    dg      += shfl_xor(dg,      16);
 
     store(DG, dg, k, apply_gain && tid < 16);
 
@@ -860,10 +859,10 @@ __global__ void __launch_bounds__(32) l2_normalize_grad_CK_8(
         }
     }
     // reduce red_val,dg across the 4 rows of the warp
-    red_val += __shfl_xor(red_val, 16);
-    dg      += __shfl_xor(dg,      16);
-    red_val += __shfl_xor(red_val, 8);
-    dg      += __shfl_xor(dg,      8);
+    red_val += shfl_xor(red_val, 16);
+    dg      += shfl_xor(dg,      16);
+    red_val += shfl_xor(red_val, 8);
+    dg      += shfl_xor(dg,      8);
 
     store(DG, dg, k, apply_gain && tid < 8);
 

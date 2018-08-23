@@ -21,6 +21,17 @@ int GetCountSMs()
     cuDeviceGetAttribute(&count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
     return count;
 }
+int GetCountSMsVersion(int* major, int* minor)
+{
+    CUdevice device; int count;
+    cuCtxGetDevice(&device);
+    cuDeviceGetAttribute(&count, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device);
+    if (major != NULL)
+        cuDeviceGetAttribute(major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device);
+    if (minor != NULL)
+        cuDeviceGetAttribute(minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device);
+    return count;
+}
 
 // Returns current wall time in micros.
 static double NowMicros() {
@@ -30,8 +41,9 @@ static double NowMicros() {
 }
 
 
-Benchmark::Benchmark(const char* name, float mem_size, float num_flops, int repeat, bool isgpu)
+Benchmark::Benchmark(CUstream stream, const char* name, float mem_size, float num_flops, int repeat, bool isgpu)
 {
+    stream_    = stream;
     name_      = name;
     mem_size_  = mem_size;
     num_flops_ = num_flops;
@@ -42,7 +54,7 @@ Benchmark::Benchmark(const char* name, float mem_size, float num_flops, int repe
     {
         CUDA_CHECK( cuEventCreate(&hStart_, CU_EVENT_BLOCKING_SYNC) );
         CUDA_CHECK( cuEventCreate(&hStop_,  CU_EVENT_BLOCKING_SYNC) );
-        CUDA_CHECK( cuEventRecord(hStart_, NULL) );
+        CUDA_CHECK( cuEventRecord(hStart_, stream_) );
     }
     else
         us_start_ = NowMicros();
@@ -52,7 +64,7 @@ Benchmark::~Benchmark()
     float ms = 1.0f;
     if (isgpu_)
     {
-        CUDA_CHECK( cuEventRecord(hStop_, NULL) );
+        CUDA_CHECK( cuEventRecord(hStop_, stream_) );
         CUDA_CHECK( cuEventSynchronize(hStop_) );
         CUDA_CHECK( cuEventElapsedTime(&ms, hStart_, hStop_) );
         CUDA_CHECK( cuEventDestroy(hStart_) );
