@@ -1,4 +1,7 @@
 
+#ifndef GPU_TYPES_H
+#define GPU_TYPES_H
+
 #include <cuda.h>
 #include <vector_types.h>
 #include <cuda_runtime.h>
@@ -168,3 +171,7 @@ typedef struct QuantStats
     float ftz_pct;
     float max_val;
 } QuantStats;
+
+void magicu64(uint d, uint &magic, uint &shift);
+
+#endif // GPU_TYPES_H

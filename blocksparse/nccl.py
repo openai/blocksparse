@@ -43,7 +43,7 @@ def allreduce(x, sync_size=0, num_comms=2, logfile="", rank=0, prereduce=0, name
     return ret
 
 
-def group_allreduce(grads, parms, search_strings=None, cast_map=None, num_comms=2, prereduce=0):
+def group_allreduce(grads, parms, search_strings=None, cast_map=None, cast_all=None, num_comms=2, prereduce=0):
 
     # if no grouping specified, create one group to reduce at the end (no overlap with compute)
     if search_strings is None:
@@ -55,7 +55,10 @@ def group_allreduce(grads, parms, search_strings=None, cast_map=None, num_comms=
         for name, group16, group32 in groups:
             if name == search_strings[-1] or name in param.name:
 
-                if cast_map is not None and name in cast_map:
+                if cast_all is not None:
+                    grad = float_cast(grad, dtype=cast_all)
+
+                elif cast_map is not None and name in cast_map:
                     grad = float_cast(grad, dtype=cast_map[name])
 
                 if grad.dtype.base_dtype is tf.float16:

@@ -324,7 +324,7 @@ __global__ void masked_softmax(
         __syncthreads();
     }
 
-    uint ti = (tid & 0x3fe0)*U + (tid & 31);
+    uint ti = (tid & 0x3fe0)*U + (tid & 31); // 0x3fe0 = -32
     uint offsetX = d0*D123 + d1*D23 + d2*D3 + ti;
     uint offsetM =           d1*M1  + d2*M2 + ti;
 

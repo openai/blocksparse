@@ -2,6 +2,7 @@
 
 #include "ew_op_gpu.h"
 #include <stdio.h>
+#include <type_traits>
 
 // Forward Kernels
 #define OP_Z_XY(func, op)                   \
@@ -715,6 +716,51 @@ template bool DropoutBackward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* dx
 template bool DropoutBackward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* dx, const char* m, const bhalf* dy, uint size, float scale);
 
 
+template <typename T, typename V>
+__global__ void filter_infinity(T* Grad, uint size, float scale, uint zero_nans)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    for (uint i = bid*1024 + tid; i < size; i += gridDim.x*1024)
+    {
+        V grad = load((const T*)Grad + i);
+
+        grad = ew_mul(grad, scale);
+
+        // Nans => zero
+        if (zero_nans)
+            grad = ew_zero_nan(grad);
+
+        // Saturate fp16 infinity values
+        if (std::is_same<T, ehalf4>::value || std::is_same<T, ehalf>::value)
+            grad = ew_maximum(ew_minimum(grad, 65504.0f), -65504.0f);
+
+        store(Grad + i, grad);
+    }
+}
+
+template <typename T, typename V>
+bool FilterInfinity(CUstream stream, uint SMs, T* grad, uint size, float scale, bool zero_nans)
+{
+    if (size & 3)
+    {
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        filter_infinity<T,float><<<grid,1024,0,stream>>>(grad, size, scale, zero_nans);
+    }
+    else
+    {
+        size >>= 2; // use vector loads
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        filter_infinity<V,float4><<<grid,1024,0,stream>>>((V*)grad, size, scale, zero_nans);
+    }
+    return true;
+}
+template bool FilterInfinity<float,float4>(CUstream stream, uint SMs, float* grad, uint size, float scale, bool zero_nans);
+template bool FilterInfinity<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* grad, uint size, float scale, bool zero_nans);
+template bool FilterInfinity<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* grad, uint size, float scale, bool zero_nans);
+
+
 
 template <typename T, typename V>
 __global__ void __launch_bounds__(32) add_n(
@@ -818,13 +864,13 @@ template bool EW_Bias_Relu<bhalf,bhalf4>(CUstream stream, bhalf* y, const bhalf*
 
 // db = sum(dy, axis=0)
 // dx = dy * (y > 0)
-template <typename T, typename V, uint THREADS, uint WIDTH>
+template <typename T, typename V, uint THREADS, uint WIDTH, uint RELU>
 __global__ void __launch_bounds__(THREADS) bias_relu_grad(
           V*              DB,
           T*              DX,
     const T* __restrict__ DY,
     const T* __restrict__ Y,
-    uint N, uint K, uint relu, uint partials)
+    uint N, uint K, uint partials)
 {
     // Stripe the reduction lines with tid and block_n
     uint tid      = threadIdx.x;
@@ -832,7 +878,6 @@ __global__ void __launch_bounds__(THREADS) bias_relu_grad(
     uint block_n  = blockIdx.y;
     uint blocks_n = gridDim.y;
 
-    uint warps = THREADS / 32;
     uint lines = THREADS / WIDTH;
     uint line  = tid     / WIDTH;
 
@@ -851,7 +896,7 @@ __global__ void __launch_bounds__(THREADS) bias_relu_grad(
     {
         V dy = load(add_ptr_u(DY, nk), 0, bk);
 
-        if (relu)
+        if (RELU)
         {
             V  y = load(add_ptr_u(Y, nk), 0, bk);
             dy = ew_relu_grad(dy, y);
@@ -862,22 +907,31 @@ __global__ void __launch_bounds__(THREADS) bias_relu_grad(
         nk += inc_nk;
         n  += inc_n;
     }
-    // if the line width is less than a warp, reduce the lines within a warp
-    for (int i = 16; i >= WIDTH; i >>= 1)
-        db = ew_warp_sum(db, i);
 
     if (THREADS > 32)
     {
         __shared__ V Share[THREADS];
-        if (tid >= 32)
+        if (tid >= 64)
             Share[tid] = db;
 
         __syncthreads();
 
-        if (tid < WIDTH)
-            for (uint i = 1; i < warps; i++)
-                db = ew_add(db, Share[tid + i*32]);
+        if (tid < 64)
+        {
+            for (uint i = 1; i < THREADS/64; i++)
+                db = ew_add(db, Share[tid + i*64]);
+
+            Share[tid] = db;
+        }
+        __syncthreads();
+
+        if (tid < 32)
+            db = ew_add(db, Share[tid + 32]);
     }
+    // if the line width is less than a warp, reduce the lines within a warp
+    for (int i = 16; i >= WIDTH; i >>= 1)
+        db = ew_warp_sum(db, i);
+
     // if blocks_n==0 then this is the final result
     // otherwise output a partial sum to be reduced with bias_grad2
     if (tid < WIDTH && bk)
@@ -1004,27 +1058,55 @@ bool EW_Bias_Relu_Grad(CUstream stream,
               V* DX = (      V*)dx;
         float4* DB = gridN > 1 && partials ? (float4*)db_partial : (float4*)db;
 
-        if      (width == 32)
-            bias_relu_grad<V,float4,256,32><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
-        else if (width == 16)
-            bias_relu_grad<V,float4,256,16><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
-        else if (width == 8)
-            bias_relu_grad<V,float4,256, 8><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
-        else if (width == 4)
-            bias_relu_grad<V,float4,256, 4><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, relu, partials);
+        if (relu)
+        {
+            if      (width == 32)
+                bias_relu_grad<V,float4,256,32,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            else if (width == 16)
+                bias_relu_grad<V,float4,256,16,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            else if (width == 8)
+                bias_relu_grad<V,float4,256, 8,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            else if (width == 4)
+                bias_relu_grad<V,float4,256, 4,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+        }
+        else
+        {
+            if      (width == 32)
+                bias_relu_grad<V,float4,256,32,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            else if (width == 16)
+                bias_relu_grad<V,float4,256,16,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            else if (width == 8)
+                bias_relu_grad<V,float4,256, 8,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            else if (width == 4)
+                bias_relu_grad<V,float4,256, 4,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+        }
     }
     else
     {
         float* DB = gridN > 1 && partials ? db_partial : db;
 
-        if      (width == 32)
-            bias_relu_grad<T,float,1024,32><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
-        else if (width == 16)
-            bias_relu_grad<T,float,1024,16><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
-        else if (width == 8)
-            bias_relu_grad<T,float,1024, 8><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
-        else if (width == 4)
-            bias_relu_grad<T,float,1024, 4><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, relu, partials);
+        if (relu)
+        {
+            if      (width == 32)
+                bias_relu_grad<T,float,1024,32,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            else if (width == 16)
+                bias_relu_grad<T,float,1024,16,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            else if (width == 8)
+                bias_relu_grad<T,float,1024, 8,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            else if (width == 4)
+                bias_relu_grad<T,float,1024, 4,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+        }
+        else
+        {
+            if      (width == 32)
+                bias_relu_grad<T,float,1024,32,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            else if (width == 16)
+                bias_relu_grad<T,float,1024,16,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            else if (width == 8)
+                bias_relu_grad<T,float,1024, 8,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            else if (width == 4)
+                bias_relu_grad<T,float,1024, 4,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+        }
     }
     if (gridN > 1 && partials)
     {

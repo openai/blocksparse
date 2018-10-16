@@ -295,7 +295,7 @@ class BlocksparseMatMulTest(tf.test.TestCase):
 
         with self.test_session(config=conf) as sess, tf.device("/gpu:0"):
 
-            for bsize, axis in ( (32,1), (32,0), (16,0), (8,0), ): # (32,1), (32,0), (16,0), (8,0)
+            for bsize, axis in ( (32,0), (16,0), (8,0), ): # (32,1), (32,0), (16,0), (8,0)
 
                 bsmm = BlocksparseMatMul(layout, block_size=bsize, feature_axis=axis, name="test")
 

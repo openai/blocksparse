@@ -416,6 +416,54 @@ REGISTER_KERNEL_BUILDER(Name("EwDxdgDzxg").Device(DEVICE_GPU).TypeConstraint<EHA
 REGISTER_KERNEL_BUILDER(Name("EwDxdgDzxg").Device(DEVICE_GPU).TypeConstraint<BHALF>("B").TypeConstraint<BHALF>("F"),EwDxdgDzxgOp<BHALF,BHALF,bhalf,bhalf,bhalf4,bhalf4>);
 //REGISTER_KERNEL_BUILDER(Name("EwDxdgDzxg").Device(DEVICE_GPU).TypeConstraint<float>("B").TypeConstraint<BHALF>("F"),EwDxdgDzxgOp<float,BHALF,float,bhalf,float4,bhalf4>);
 
+
+
+template <typename T, typename V> bool FilterInfinity(CUstream stream, uint SMs, T* grad, uint size, float scale, bool zero_nans);
+
+REGISTER_OP("FilterInfinity")
+    .Input("x: T")
+    .Input("scale: float")    // scalar host tensor
+    .Output("y: T")
+    .Attr("T: {half, float, bfloat16}")
+    .Attr("zero_nans: bool = true")
+    .SetShapeFn(UnchangedShape)
+    .Doc(R"doc(
+scale tensor, saturate infinities, optionally filter nans.
+)doc");
+
+template <typename T, typename V1, typename V4>
+class FilterInfinityOp : public OpKernel
+{
+ public:
+  explicit FilterInfinityOp(OpKernelConstruction* ctx) : OpKernel(ctx), SMs_(0)
+  {
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_nans", &zero_nans_ ));
+  }
+  void Compute(OpKernelContext* ctx) override
+  {
+    if (SMs_ == 0)
+      SMs_ = GetCountSMs();
+
+    const Tensor& x = ctx->input(0);
+    float scale = ctx->input(1).scalar<float>()();
+    ctx->set_output(0, x);
+    int size = x.shape().num_elements();
+
+    V1* x_ptr = (V1*)x.flat<T>().data();
+
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
+
+    FilterInfinity<V1,V4>(stream, SMs_, x_ptr, size, scale, zero_nans_);
+  }
+  bool zero_nans_;
+  uint SMs_;
+};
+REGISTER_KERNEL_BUILDER(Name("FilterInfinity").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T").HostMemory("scale"),FilterInfinityOp<FLOAT,float,float4>);
+REGISTER_KERNEL_BUILDER(Name("FilterInfinity").Device(DEVICE_GPU).TypeConstraint<EHALF>("T").HostMemory("scale"),FilterInfinityOp<EHALF,ehalf,ehalf4>);
+REGISTER_KERNEL_BUILDER(Name("FilterInfinity").Device(DEVICE_GPU).TypeConstraint<BHALF>("T").HostMemory("scale"),FilterInfinityOp<BHALF,bhalf,bhalf4>);
+
+
+
 template <typename TY, typename TX, typename VY, typename VX> bool FloatCast(CUstream stream, TY* y, const TX* x, int size);
 
 REGISTER_OP("FloatCast")

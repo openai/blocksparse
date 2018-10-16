@@ -15,7 +15,7 @@ from tensorflow.python.framework import function
 ones = 0
 out  = 0
 bench = 0
-atomics = True
+atomics = False
 shapes = [
     #(32, 32),
 

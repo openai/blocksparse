@@ -276,10 +276,10 @@ def model(X, Y, hps):
         loss = tf.reduce_mean(loss)
 
         params = tf.trainable_variables()
-        grads  = tf.gradients(loss, params)
+        grads  = tf.gradients(loss * cost_scale, params)
 
-        # for p in params:
-        #     print(p.op.name + "_" + "_".join(str(x) for x in p.shape.as_list()))
+        for p in params:
+            print(p.op.name + "_" + "_".join(str(x) for x in p.shape.as_list()))
 
         test = tf.reduce_sum(tf.cast(tf.equal(tf.cast(tf.argmax(logits, 1), tf.int32), ys[mpi_rank]), tf.float32))
 
@@ -287,12 +287,12 @@ def model(X, Y, hps):
 
         # all reduce grads
         if mpi_size > 1:
-            group_allreduce(grads, params, search_strings=["classifier"] + ["layer_%d" % l for l in range(hps.n_layer-1, -1, -1)])
+            group_allreduce(grads, params, search_strings=["classifier"] + ["layer_%d" % l for l in range(hps.n_layer-1, -1, -1)], prereduce=8, num_comms=2)
 
             loss = allreduce(loss) * grad_scale
-            test = allreduce(test)
 
-        train = Adam(grads, params, grad_scale=grad_scale, param_qspec=qspec_e4f11, mean_qspec=qspec_e5f10, var_qspec=qspec_e5f10)
+
+        train = Adam(grads, params, grad_scale=grad_scale/cost_scale, param_qspec=qspec_e4f11, mean_qspec=qspec_e5f10, var_qspec=qspec_e5f10)
 
     return loss, train, test
 
@@ -424,9 +424,53 @@ if __name__ == '__main__':
 
 # 24 classifier: 256,10 [128 1 256]
 
+q . k.t  = a
 
-# PC   . PC.T = PP (forward)
-# PP   . PC   = PC (grad query)
-# PP.T . PC   = PC (grad key)
+QC   . KC.T = QK  16x64   . 16x64.T = 16x16  16x16x64_NT  72,72,16
+QK   . KC   = QC  16x16   . 16x64   = 16x64  16x64x16_NN  16,80,80
+QK.T . QC   = KC  16x16.T . 16x64   = 16x64  16x64x16_TN  16,80,80
 
-# PP . PC = PC
+w . v = q
+
+QK   . VC   = QC  16x16   . 16x64   = 16x64  16x64x16_NN
+QC   . VC.T = QK  16x64   . 16x64.T = 16x16  16x16x64_NT
+QK.T . QC   = VC  16x16.T . 16x64   = 16x64  16x64x16_TN
+
+sequence length = 196
+batch size      = 128
+head state      = 64
+heads           = 4
+mlp mult        = 4
+
+      m,    n,    k
+128*196, 64*4, 64*4 # q
+128*196, 64*4, 64*4 # k
+128*196, 64*4, 64*4 # v
+    196,  196,   64  x 128*4 # qk (batched matmul)
+    196,   64,  196  x 128*4 # wv (batched matmul)
+128*196, 64*4, 64*4 # projection
+128*196,256*4, 64*4 # mlp
+128*196, 64*4,256*4 # mlp
+
+
+
+# NC   . CK   = NK
+# NK   . CK.T = NC
+# NC.T . NK   = CK
+
+
+# 1 D
+B, C, S
+
+B, C/2, 2, S
+
+B, C/2, S, 2
+
+# 2 D
+B, C, S
+
+B, H, W, S
+
+B, H/2, W/2, S, 2, 2
+
+B, C/4, S*4

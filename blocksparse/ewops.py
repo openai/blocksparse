@@ -149,6 +149,16 @@ def ew_z_xb_grad(op, dz):
 
     raise ValueError("bad op code")
 
+############################## Filter Infinity/Nans + scale #####################################
+
+filter_infinity_op = _op_module.filter_infinity
+
+def filter_infinity(x, scale=1.0, zero_nans=True):
+    return filter_infinity_op(x, scale, zero_nans=zero_nans)
+
+@ops.RegisterGradient("FilterInfinity")
+def filter_infinity_grad(op, dy):
+    return filter_infinity_op(dy, op.inputs[1], zero_nans=op.get_attr("zero_nans")), None
 
 ############################## Float Cast #####################################
 

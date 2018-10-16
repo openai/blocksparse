@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_xprop(
         new_lut_size += warp_non_zero;
     }
     //lut_size = new_lut_size;
-    # if CUDA_VERSION >= 9020
+# if CUDA_VERSION >= 9020
     asm volatile ("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(lut_size) : "r"(new_lut_size));
 # else
     asm volatile ("shfl.idx.b32 %0, %1, 0, 0x1f;" : "=r"(lut_size) : "r"(new_lut_size));
@@ -383,7 +383,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
         new_lut_size += warp_non_zero;
     }
     //lut_size = new_lut_size;
-    # if CUDA_VERSION >= 9020
+# if CUDA_VERSION >= 9020
     asm volatile ("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(lut_size) : "r"(new_lut_size));
 # else
     asm volatile ("shfl.idx.b32 %0, %1, 0, 0x1f;" : "=r"(lut_size) : "r"(new_lut_size));

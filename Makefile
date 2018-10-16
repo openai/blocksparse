@@ -48,13 +48,14 @@ CCFLAGS=-std=c++11 -O3 -fPIC -DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) 
 
 NVCCFLAGS=-DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) -O3 -Xcompiler -fPIC -std=c++11 --prec-div=false --prec-sqrt=false \
 	-arch=sm_61 \
-  	-gencode=arch=compute_35,code=sm_35 \
- 	-gencode=arch=compute_50,code=sm_50 \
- 	-gencode=arch=compute_52,code=sm_52 \
 	-gencode=arch=compute_60,code=sm_60 \
 	-gencode=arch=compute_61,code=sm_61 \
 	-gencode=arch=compute_70,code=sm_70 \
 	-gencode=arch=compute_61,code=compute_61
+
+#  	-gencode=arch=compute_35,code=sm_35 \
+# 	-gencode=arch=compute_50,code=sm_50 \
+# 	-gencode=arch=compute_52,code=sm_52 \
 
 OBJS=\
 	$(TARGET)/batch_norm_op.o \
@@ -80,6 +81,7 @@ CU_OBJS=\
 	$(TARGET)/blocksparse_l2_norm_op_gpu.cu.o \
 	$(TARGET)/blocksparse_matmul_op_gpu.cu.o \
 	$(TARGET)/blocksparse_matmul_gated_op_gpu.cu.o \
+	$(TARGET)/blocksparse_transformer_op_gpu.cu.o \
 	$(TARGET)/cwise_linear_op_gpu.cu.o \
 	$(TARGET)/edge_bias_op_gpu.cu.o \
 	$(TARGET)/ew_op_gpu.cu.o \
@@ -108,3 +110,54 @@ $(TARGET)/%.o: src/%.cc src/*.h $(TARGET)/blocksparse_kernels.h
 	g++ $(CCFLAGS) -c $< -o $@
 
 
+# bazel-0.17.1-installer-linux-x86_64.sh (--user)
+# NVIDIA-Linux-x86_64-396.37.run
+# cuda_9.2.148_396.37_linux
+# cudnn-9.2-linux-x64-v7.2.1.38.tgz
+# nccl_2.2.13-1+cuda9.2_x86_64.txz
+
+# apt-get install mpich
+
+# uncomment:
+# https://github.com/tensorflow/tensorflow/blob/r1.10/tensorflow/core/kernels/batch_matmul_op_real.cc#L35
+
+
+# ls -l /usr/local
+# lrwxrwxrwx  1 root  root    19 Jul 14 13:11 cuda -> /usr/local/cuda-9.2/
+# drwxr-xr-x 18 root  root  4096 Sep 14 16:12 cuda-9.2/
+# lrwxrwxrwx  1 root  root    39 Jul 12 17:01 nccl -> /usr/local/nccl_2.2.13-1+cuda9.2_x86_64/
+# drwxr-xr-x  4 root  root  4096 Jul 12 16:27 nccl_2.2.13-1+cuda9.2_x86_64/
+
+# export TF_NEED_CUDA=1
+# export TF_NEED_MKL=0
+# export TF_NEED_GCP=0
+# export TF_NEED_HDFS=0
+# export TF_NEED_OPENCL=0
+# export TF_NEED_AWS=0
+# export TF_NEED_JEMALLOC=0
+# export TF_NEED_KAFKA=0
+# export TF_NEED_OPENCL_SYCL=0
+# export TF_NEED_COMPUTECPP=0
+# export TF_CUDA_CLANG=0
+# export TF_NEED_TENSORRT=0
+# export TF_ENABLE_XLA=0
+# export TF_NEED_GDR=0
+# export TF_NEED_VERBS=0
+# export TF_NEED_MPI=0
+# export TF_CUDA_VERSION="9.2"
+# export TF_CUDNN_VERSION="7.2"
+# export TF_NCCL_VERSION="2.2"
+# export TF_CUDA_COMPUTE_CAPABILITIES="6.0,7.0"
+# export GCC_HOST_COMPILER_PATH="/usr/bin/gcc"
+# export CUDA_TOOLKIT_PATH="/usr/local/cuda"
+# export CUDNN_INSTALL_PATH="/usr/local/cuda"
+# export NCCL_INSTALL_PATH="/usr/local/nccl"
+
+# alias tfbuild0="bazel build --config=opt --config=cuda //tensorflow/tools/pip_package:build_pip_package"
+# alias tfbuild1="bazel-bin/tensorflow/tools/pip_package/build_pip_package ~"
+# alias tfbuild2="pip uninstall tensorflow"
+# alias tfbuild3="pip install ~/tensorflow-*.whl"
+
+# git clone blocksparse
+# make compile
+# pip install dist/*.whl

@@ -35,6 +35,7 @@ class MatMulTest(tf.test.TestCase):
                 np.random.seed(int(time()))
                 cpuX = np.random.normal(loc=0.1, scale=1.0, size=shape).astype(np.float16).astype(np.float32)
                 cpuE = np.random.normal(loc=0.2, scale=1.0, size=shape).astype(np.float16).astype(np.float32)
+                cpuU = np.dot(cpuX.astype(np.float64).T, cpuE.astype(np.float64)).astype(np.float32)
 
                 for dtype in (tf.float32, tf.float16):  #tf.float16, tf.bfloat16
 
@@ -52,14 +53,17 @@ class MatMulTest(tf.test.TestCase):
                             xf, ef = x, e
 
                         u0 = dw_matmul_large_n(xf, ef)
-                        u1 = tf.matmul(x, e, transpose_a=True, transpose_b=False)
+                        u1 = tf.matmul(xf, ef, transpose_a=True, transpose_b=False)
 
-                        # if dtype is not tf.float32:
-                        #     u1 = ew.float_cast(u1, dtype=tf.float32, dx_dtype=dtype)
+                        if dtype is not tf.float32:
+                            u1 = ew.float_cast(u1, dtype=tf.float32, dx_dtype=dtype)
 
                         u0, u1 = sess.run( [ u0, u1 ], feed_dict )
 
-                    for op, dev, cpu in [("matmul", u0, u1)]:
+                    for op, dev, cpu in [
+                        ("custom", u0, cpuU),
+                        ("cublas", u1, cpuU),
+                    ]:
 
                         dif     = np.abs(cpu - dev)
                         avgval  = np.average(abs(cpu))

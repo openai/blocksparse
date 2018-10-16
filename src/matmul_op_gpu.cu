@@ -255,23 +255,22 @@ __global__ void __launch_bounds__(256) hmma_gemm_64x64x32_TN_vec8(float* U, cons
         for (int i = 0; i < 2; i++)
             for (int j = 0; j < 4; j++)
             {
-                *(int2*)&fragC[i].x[j*4] = *(int2*)&hShare[readCs + i*16 + j*4*80];
-                *(int2*)&fragK[i].x[j*4] = *(int2*)&hShare[readKs + i*16 + j*4*80];
+                *(uint2*)&fragC[i].x[j*4] = *(uint2*)&hShare[readCs + i*16 + j*4*80];
+                *(uint2*)&fragK[i].x[j*4] = *(uint2*)&hShare[readKs + i*16 + j*4*80];
             }
 
-        mma_sync(fragU[0][0], fragC[0], fragK[0], fragU[0][0], true);
-        mma_sync(fragU[1][0], fragC[1], fragK[0], fragU[1][0], true);
-        mma_sync(fragU[1][1], fragC[1], fragK[1], fragU[1][1], true);
-        mma_sync(fragU[0][1], fragC[0], fragK[1], fragU[0][1], true);
+        mma_sync(fragU[0][0], fragC[0], fragK[0], fragU[0][0], false);
+        mma_sync(fragU[1][0], fragC[1], fragK[0], fragU[1][0], false);
+        mma_sync(fragU[1][1], fragC[1], fragK[1], fragU[1][1], false);
+        mma_sync(fragU[0][1], fragC[0], fragK[1], fragU[0][1], false);
 
     } while (n < N);
 
     asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid  ) :);
     asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(idx_K) :);
     asm volatile ("mov.u32 %0, %ctaid.y;" : "=r"(idx_C) :);
-    tid31 = tid & 31;
 
-    uint storU = (tid & 224) + ((tid31 & 1) + (tid31 & 4)*2 + (tid31 & 16)/4)*272 + (tid31 & 2) + (tid31 & 8);
+    uint storU = (tid & 224) + ((tid & 1) + (tid & 4)*2 + (tid & 16)/4)*272 + (tid & 2) + (tid & 8);
     uint readU = (tid & 127) + (tid & 128) * (272*8/128);
 
     // leaving vector math

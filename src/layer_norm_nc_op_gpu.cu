@@ -461,8 +461,8 @@ __global__ void layer_norm_segmented_nc(
             Share[tid] = zero;
         __syncthreads();
     }
-    uint s = blockIdx.x;
-    uint n = blockIdx.y;
+    uint n = blockIdx.x;
+    uint s = blockIdx.y;
     uint t = (tid & 0x3e0)*U + (tid & 31); // 0x3e0 = -32 & 1023
     uint k = s*K + t;
     uint m = s*N + n;
@@ -565,7 +565,7 @@ bool LayerNormSegmentedForward_NC(CUstream stream, int SMs,
     const float* b,
     float epsilon, uint N, uint S, uint K, float rcpK, int relu)
 {
-    dim3 grid(S, N, 1);
+    dim3 grid(N, S, 1);
 
     if ((K & 3) == 0)
     {
@@ -628,9 +628,9 @@ __global__ void __launch_bounds__(32) layer_norm_segmented_dg_db_nc(
     uint N, uint SK, uint SKz, uint K, int relu)
 {
     uint tid = threadIdx.x;
-    uint bk  = blockIdx.x;
-    uint bs  = blockIdx.y;
-    uint bn  = blockIdx.z;
+    uint bn  = blockIdx.x;
+    uint bk  = blockIdx.y;
+    uint bs  = blockIdx.z;
 
     uint t = bk*32 + tid;
     uint k = bs*K + t;
@@ -643,7 +643,7 @@ __global__ void __launch_bounds__(32) layer_norm_segmented_dg_db_nc(
         bias = __ldg(add_ptr_u(Bias, k));
     }
     #pragma unroll 1
-    for (uint n = bn, m = bs*N + bn, nk = bn*SK + k; n < N; n += gridDim.z, m += gridDim.z, nk += SKz)
+    for (uint n = bn, m = bs*N + bn, nk = bn*SK + k; n < N; n += gridDim.x, m += gridDim.x, nk += SKz)
     {
         float    x = load(add_ptr_u(X,  nk), 0, b);
         float   dy = load(add_ptr_u(DY, nk), 0, b);
@@ -660,7 +660,7 @@ __global__ void __launch_bounds__(32) layer_norm_segmented_dg_db_nc(
     {
         DG = add_ptr_u(DG, k);
         DB = add_ptr_u(DB, k);
-        if (gridDim.z == 1)
+        if (gridDim.x == 1)
         {
             __stg(DG, dg);
             __stg(DB, db);
@@ -704,8 +704,8 @@ __global__ void layer_norm_segmented_dx_nc(
             Share[tid] = zero;
         __syncthreads();
     }
-    uint s = blockIdx.x;
-    uint n = blockIdx.y;
+    uint n = blockIdx.x;
+    uint s = blockIdx.y;
     uint t = (tid & 0x3e0)*U + (tid & 31); // 0x3e0 = -32 & 1023
     uint k = s*K + t;
     uint m = s*N + n;
@@ -821,9 +821,9 @@ bool LayerNormSegmentedBackward_NC(CUstream stream, int SMs,
         cuMemsetD32Async((CUdeviceptr)dg, 0, S*K, stream);
         cuMemsetD32Async((CUdeviceptr)db, 0, S*K, stream);
     }
-    layer_norm_segmented_dg_db_nc<T><<<dim3(gridK,S,gridN),32,0,stream>>>(dg, db, dy, x, g, b, mean, rstd, N, S*K, S*K*gridN, K, relu);
+    layer_norm_segmented_dg_db_nc<T><<<dim3(gridN,gridK,S),32,0,stream>>>(dg, db, dy, x, g, b, mean, rstd, N, S*K, S*K*gridN, K, relu);
 
-    dim3 grid(S, N, 1);
+    dim3 grid(N, S, 1);
     if ((K & 3) == 0 && K >= 512)
     {
                    V* DX = (      V*)dx;

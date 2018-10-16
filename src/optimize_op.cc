@@ -17,8 +17,185 @@ using perftools::gputools::cuda::CUDAStream;
 
 Status UnchangedShape(shape_inference::InferenceContext* ctx);
 
+template <typename T, typename V>
+bool Adafactor(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const T* grad, float scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, bool sat_infs, bool zero_nans);
 
-template <typename TG, typename TR> bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, float* param, TR* mean, TR* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, bool zero_nans);
+REGISTER_OP("Adafactor2d")
+    .Input("param: Ref(float)")
+    .Input("cv: Ref(float)")
+    .Input("rv: Ref(float)")
+    .Input("grad: T")
+    .Input("decay: float")         // scalar host tensor
+    .Input("learning_rate: float") // scalar host tensor
+    .Input("grad_scale: float")    // scalar host tensor
+    .Input("clip_thresh: float")   // scalar host tensor
+    .Output("out_param: Ref(float)")
+    .Output("out_cv: Ref(float)")
+    .Output("out_rv: Ref(float)")
+    .Output("temp_x: float")
+    .Output("temp_m: float")
+    .Attr("T: {float, half, bfloat16}")
+    .Attr("epsilon: float = 1e-30")
+    .Attr("sat_infs: bool = false")
+    .Attr("zero_nans: bool = true")
+    .SetShapeFn([](InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      c->set_output(1, c->input(1));
+      c->set_output(2, c->input(2));
+      c->set_output(3, c->input(3));
+      c->set_output(4, c->MakeShape({ c->MakeDim(2) }) );
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Apply the Adafactor optimizer on 2d tensors.
+    )doc");
+
+template <typename T, typename V1, typename V4>
+class Adafactor2dOp : public OpKernel {
+ public:
+  explicit Adafactor2dOp(OpKernelConstruction* ctx) : OpKernel(ctx), SMs_(0) {
+
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("epsilon",   &epsilon_   ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("sat_infs",  &sat_infs_  ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_nans", &zero_nans_ ));
+  }
+  void Compute(OpKernelContext* ctx) override
+  {
+    if (SMs_ == 0)
+      SMs_ = GetCountSMs();
+
+    ctx->forward_ref_input_to_ref_output(0, 0);
+    ctx->forward_ref_input_to_ref_output(1, 1);
+    ctx->forward_ref_input_to_ref_output(2, 2);
+
+    const Tensor& grad  = ctx->input(3);
+    const Tensor& decay = ctx->input(4);
+    const Tensor& lr    = ctx->input(5);
+    const Tensor& scal  = ctx->input(6);
+    const Tensor& clip  = ctx->input(7);
+
+    Tensor param = ctx->mutable_input(0, false);
+    Tensor cv    = ctx->mutable_input(1, true);
+    Tensor rv    = ctx->mutable_input(2, false);
+
+    OP_REQUIRES(ctx, param.dims() == 2, errors::InvalidArgument("only applies to 2d params"));
+
+    uint C = param.dim_size(0);
+    uint K = param.dim_size(1);
+
+    OP_REQUIRES(ctx, cv.shape().num_elements() == K, errors::InvalidArgument("bad cv shape"));
+    OP_REQUIRES(ctx, rv.shape().num_elements() == C, errors::InvalidArgument("bad rv shape"));
+
+    Tensor* x; OP_REQUIRES_OK(ctx, ctx->allocate_output(3,  param.shape(),      &x));
+    Tensor* m; OP_REQUIRES_OK(ctx, ctx->allocate_output(4,  TensorShape({ 2 }), &m));
+
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
+
+    Adafactor<V1,V4>(stream, SMs_,
+      cv.flat<float>().data(),
+      rv.flat<float>().data(),
+      x->flat<float>().data(),
+      m->flat<float>().data(),
+      param.flat<float>().data(),
+      (const V1*)grad.flat<T>().data(),
+      scal.scalar<float>()(), lr.scalar<float>()(), decay.scalar<float>()(), epsilon_, clip.scalar<float>()(), C, K, sat_infs_, zero_nans_
+    );
+  }
+  uint SMs_;
+  bool zero_nans_, sat_infs_;
+  float epsilon_;
+};
+REGISTER_KERNEL_BUILDER(Name("Adafactor2d").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T").HostMemory("decay").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_thresh"), Adafactor2dOp<FLOAT,float,float4>);
+REGISTER_KERNEL_BUILDER(Name("Adafactor2d").Device(DEVICE_GPU).TypeConstraint<EHALF>("T").HostMemory("decay").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_thresh"), Adafactor2dOp<EHALF,ehalf,ehalf4>);
+REGISTER_KERNEL_BUILDER(Name("Adafactor2d").Device(DEVICE_GPU).TypeConstraint<BHALF>("T").HostMemory("decay").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_thresh"), Adafactor2dOp<BHALF,bhalf,bhalf4>);
+
+
+REGISTER_OP("Adafactor1d")
+    .Input("param: Ref(float)")
+    .Input("cv: Ref(float)")
+    .Input("grad: T")
+    .Input("decay: float")         // scalar host tensor
+    .Input("learning_rate: float") // scalar host tensor
+    .Input("grad_scale: float")    // scalar host tensor
+    .Input("clip_thresh: float")   // scalar host tensor
+    .Output("out_param: Ref(float)")
+    .Output("out_cv: Ref(float)")
+    .Output("temp_x: float")
+    .Output("temp_m: float")
+    .Attr("T: {float, half, bfloat16}")
+    .Attr("epsilon: float = 1e-30")
+    .Attr("sat_infs: bool = false")
+    .Attr("zero_nans: bool = true")
+    .SetShapeFn([](InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      c->set_output(1, c->input(1));
+      c->set_output(2, c->input(2));
+      c->set_output(3, c->MakeShape({ c->MakeDim(2) }) );
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Apply the Adafactor optimizer on 1d tensors.
+    )doc");
+
+template <typename T, typename V1, typename V4>
+class Adafactor1dOp : public OpKernel {
+ public:
+  explicit Adafactor1dOp(OpKernelConstruction* ctx) : OpKernel(ctx), SMs_(0) {
+
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("epsilon",   &epsilon_   ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("sat_infs",  &sat_infs_  ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_nans", &zero_nans_ ));
+  }
+  void Compute(OpKernelContext* ctx) override
+  {
+    if (SMs_ == 0)
+      SMs_ = GetCountSMs();
+
+    ctx->forward_ref_input_to_ref_output(0, 0);
+    ctx->forward_ref_input_to_ref_output(1, 1);
+
+    const Tensor& grad  = ctx->input(2);
+    const Tensor& decay = ctx->input(3);
+    const Tensor& lr    = ctx->input(4);
+    const Tensor& scal  = ctx->input(5);
+    const Tensor& clip  = ctx->input(6);
+
+    Tensor param = ctx->mutable_input(0, false);
+    Tensor cv    = ctx->mutable_input(1, false);
+
+    OP_REQUIRES(ctx, param.dims() == 1 || (param.dims() == 2 && param.dim_size(0) == 1), errors::InvalidArgument("only applies to 1d params"));
+
+    uint C = 1;
+    uint K = param.shape().num_elements();
+
+    OP_REQUIRES(ctx, cv.shape().num_elements() == K, errors::InvalidArgument("bad cv shape"));
+
+    Tensor* x; OP_REQUIRES_OK(ctx, ctx->allocate_output(2,  param.shape(),      &x));
+    Tensor* m; OP_REQUIRES_OK(ctx, ctx->allocate_output(3,  TensorShape({ 2 }), &m));
+
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
+
+    Adafactor<V1,V4>(stream, SMs_,
+      cv.flat<float>().data(),
+      NULL,
+      x->flat<float>().data(),
+      m->flat<float>().data(),
+      param.flat<float>().data(),
+      (const V1*)grad.flat<T>().data(),
+      scal.scalar<float>()(), lr.scalar<float>()(), decay.scalar<float>()(), epsilon_, clip.scalar<float>()(), C, K, sat_infs_, zero_nans_
+    );
+  }
+  uint SMs_;
+  bool zero_nans_, sat_infs_;
+  float epsilon_;
+};
+REGISTER_KERNEL_BUILDER(Name("Adafactor1d").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T").HostMemory("decay").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_thresh"), Adafactor1dOp<FLOAT,float,float4>);
+REGISTER_KERNEL_BUILDER(Name("Adafactor1d").Device(DEVICE_GPU).TypeConstraint<EHALF>("T").HostMemory("decay").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_thresh"), Adafactor1dOp<EHALF,ehalf,ehalf4>);
+REGISTER_KERNEL_BUILDER(Name("Adafactor1d").Device(DEVICE_GPU).TypeConstraint<BHALF>("T").HostMemory("decay").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_thresh"), Adafactor1dOp<BHALF,bhalf,bhalf4>);
+
+
+
+template <typename TG, typename TR> bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, float* param, TR* mean, TR* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, bool sat_infs, bool zero_nans);
 
 REGISTER_OP("Adam")
     .Input("grad: TG")
@@ -36,6 +213,7 @@ REGISTER_OP("Adam")
     .Attr("decay_mean: float = 0.9")
     .Attr("decay_var: float = 0.999")
     .Attr("epsilon: float = 0.00000001") // 1e-8
+    .Attr("sat_infs: bool = false")
     .Attr("zero_nans: bool = false")
     .Attr("lazy_update: bool = false")
     .SetShapeFn([](InferenceContext* c) {
@@ -56,6 +234,7 @@ class AdamOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("decay_mean",  &decay_mean_ ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("decay_var",   &decay_var_  ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("epsilon",     &epsilon_    ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("sat_infs",    &sat_infs_   ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_nans",   &zero_nans_  ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("lazy_update", &lazy_update_));
   }
@@ -97,11 +276,11 @@ class AdamOp : public OpKernel {
       param.flat<float>().data(),
       (VR*)mean.flat<TR>().data(),
       (VR*)var.flat<TR>().data(),
-      lr.scalar<float>()(), decay_mean_, decay_var_, epsilon_, scal.scalar<float>()(), clip.scalar<float>()(), size, K, zero_nans_
+      lr.scalar<float>()(), decay_mean_, decay_var_, epsilon_, scal.scalar<float>()(), clip.scalar<float>()(), size, K, sat_infs_, zero_nans_
     );
   }
   uint SMs_;
-  bool zero_nans_, lazy_update_;
+  bool zero_nans_, lazy_update_, sat_infs_;
   float decay_mean_, decay_var_, epsilon_;
 };
 REGISTER_KERNEL_BUILDER(Name("Adam").Device(DEVICE_GPU).TypeConstraint<FLOAT>("TG").TypeConstraint<FLOAT>("TR").HostMemory("learning_rate").HostMemory("grad_scale").HostMemory("clip_sigma"), AdamOp<FLOAT,float,FLOAT,float>);

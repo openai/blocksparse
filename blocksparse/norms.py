@@ -268,3 +268,10 @@ def _magic64u(d):
     if magic != 1:
         shift -= 32
     return (magic, shift)
+
+# for d in range(1,1000000):
+#     magic, shift = _magic32u(0x7fffffff, d)
+#     if shift < 32 or len(hex(magic)) > 10:
+#         if magic != 1:
+#             print(d, magic, shift)
+
