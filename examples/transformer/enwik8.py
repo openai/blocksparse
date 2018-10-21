@@ -14,8 +14,8 @@ import numpy as np
 import tensorflow as tf
 from mpi4py import MPI
 from blocksparse.transformer import BlocksparseTransformer
-from blocksparse.norms       import layer_norm
 from blocksparse.optimize    import AdamOptimizer, AdafactorOptimizer
+from blocksparse.norms       import layer_norm
 from blocksparse.embed       import embedding_lookup
 from blocksparse.ewops       import bias_relu, float_cast
 from blocksparse.nccl        import allreduce, group_allreduce, sync_variables_op
@@ -57,6 +57,7 @@ def conv1d(x, scope, nf, relu=False):
         return y
 
 # fine sparse structure
+# within each block this mask is applied to force the softmax output to zero where the mask is zero
 def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
     """Prohibit positions in sub-blocks from attending to indices in the future.
     Note: query_idx and key_idx are absolute indices rather than relative to
@@ -70,6 +71,8 @@ def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
     return mask
 
 # coarse sparse structure
+# only layout==1 blocks are computed and materialized in memory
+# block sizes of 16, 32 and 64 are supported (64 being most appropriate for dense attention)
 def get_blocksparse_attention_ops(n_timesteps, n_heads):
     blocksize = 64
     n_time_blocks = n_timesteps // blocksize

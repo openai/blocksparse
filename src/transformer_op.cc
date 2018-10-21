@@ -445,7 +445,8 @@ REGISTER_OP("BlocksparseTransformerNT")
     .Input("nt_lut: int32")
     .Input("nn_lut: int32")
     .Input("tn_lut: int32")
-    .Output("c: half")
+    .Output("c: CT")
+    .Attr("CT: {half, bfloat16}")
     .Attr("heads: int")
     .Attr("blocks: int")
     .Attr("blk_size: int")
@@ -496,7 +497,7 @@ REGISTER_OP("BlocksparseTransformerTN")
 Multiply the blocksparse matrix "a.T" by the dense matrix "b" and produce dense output "c".
 )doc");
 
-bool blocksparse_transformer_nt(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
+template <typename CT, typename CV> bool blocksparse_transformer_nt(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, CT* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
 bool blocksparse_transformer_xn(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim, uint op, uint magic, uint shift, uint max_blks);
 
 
@@ -504,7 +505,7 @@ bool blocksparse_transformer_xn(CUstream stream, const uint2* lut, const ehalf* 
 #define NN_OP 1
 #define TN_OP 2
 
-template <uint OP>
+template <typename CT, typename CV1, typename CV4, uint OP>
 class BlocksparseTransformerOp : public OpKernel {
  public:
   explicit BlocksparseTransformerOp(OpKernelConstruction* ctx) : OpKernel(ctx), major_(0), magic_(0), shift_(0), head_state_(0)
@@ -574,7 +575,7 @@ class BlocksparseTransformerOp : public OpKernel {
     const uint2* l_ptr = (const uint2*)lut.flat<int32>().data();
     const ehalf* a_ptr = (const ehalf*)a.flat<EHALF>().data();
     const ehalf* b_ptr = (const ehalf*)b.flat<EHALF>().data();
-          ehalf* c_ptr = (      ehalf*)c->flat<EHALF>().data();
+            CV1* c_ptr = (        CV1*)c->tensor_data().data();
 
     CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
@@ -582,7 +583,7 @@ class BlocksparseTransformerOp : public OpKernel {
     if (bench_) bench = new Benchmark(stream, bench_string_, 0, flops_ * (float)(batch_dim * state_dim), repeat_);
 
     for (int r = 0; r < repeat_; r++)
-      blocksparse_transformer_nt(stream, l_ptr, a_ptr, b_ptr, c_ptr, blk_size_, blocks_, batch_dim, ctx_blks_, heads_, head_state_, lut_heads, lut_dim);
+      blocksparse_transformer_nt<CV1,CV4>(stream, l_ptr, a_ptr, b_ptr, c_ptr, blk_size_, blocks_, batch_dim, ctx_blks_, heads_, head_state_, lut_heads, lut_dim);
 
     if (bench) delete bench;
   }
@@ -627,7 +628,7 @@ class BlocksparseTransformerOp : public OpKernel {
     const uint2* l_ptr = (const uint2*)lut.flat<int32>().data();
     const ehalf* a_ptr = (const ehalf*)a.flat<EHALF>().data();
     const ehalf* b_ptr = (const ehalf*)b.flat<EHALF>().data();
-          ehalf* c_ptr = (      ehalf*)c->flat<EHALF>().data();
+          ehalf* c_ptr = (      ehalf*)c->tensor_data().data();
 
     CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
@@ -644,15 +645,16 @@ class BlocksparseTransformerOp : public OpKernel {
   char bench_string_[256];
 };
 
-REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerNT").Device(DEVICE_GPU),BlocksparseTransformerOp<NT_OP>);
-REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerNN").Device(DEVICE_GPU),BlocksparseTransformerOp<NN_OP>);
-REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerTN").Device(DEVICE_GPU),BlocksparseTransformerOp<TN_OP>);
+REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerNT").Device(DEVICE_GPU).TypeConstraint<EHALF>("CT"),BlocksparseTransformerOp<EHALF,ehalf,ehalf4,NT_OP>);
+REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerNT").Device(DEVICE_GPU).TypeConstraint<BHALF>("CT"),BlocksparseTransformerOp<BHALF,bhalf,bhalf4,NT_OP>);
+REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerNN").Device(DEVICE_GPU),BlocksparseTransformerOp<EHALF,ehalf,ehalf4,NN_OP>);
+REGISTER_KERNEL_BUILDER(Name("BlocksparseTransformerTN").Device(DEVICE_GPU),BlocksparseTransformerOp<EHALF,ehalf,ehalf4,TN_OP>);
 
 
 bool BlocksparseMaskedSoftmax(CUstream stream,
     const uint2* lut,
     const  char* mask,
-    const ehalf* x,
+    const bhalf* x,
           ehalf* y,
     uint block_size, uint blocks,
     uint batch_dim,  uint head_dim, uint ctx_blks,
@@ -660,7 +662,7 @@ bool BlocksparseMaskedSoftmax(CUstream stream,
     uint mask_heads, float scale);
 
 REGISTER_OP("BlocksparseMaskedSoftmax")
-    .Input("x: half")
+    .Input("x: bfloat16")
     .Input("scale: float")
     .Input("lut: int32")
     .Input("mask: MT")
@@ -676,7 +678,7 @@ Blocksparse softmax with mask
 )doc");
 
 REGISTER_OP("BlocksparseSoftmax")
-    .Input("x: half")
+    .Input("x: bfloat16")
     .Input("scale: float")
     .Input("lut: int32")
     .Output("y: half")
@@ -733,7 +735,7 @@ class BlocksparseMaskedSoftmaxOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->allocate_output(0, x.shape(), &y));
 
     const uint2* l_ptr = (const uint2*)lut.flat<int32>().data();
-    const ehalf* x_ptr = (const ehalf*)x.flat<EHALF>().data();
+    const bhalf* x_ptr = (const bhalf*)x.flat<BHALF>().data();
           ehalf* y_ptr = (      ehalf*)y->flat<EHALF>().data();
     float scale = s.scalar<float>()();
 

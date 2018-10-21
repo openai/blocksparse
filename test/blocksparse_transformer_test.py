@@ -17,7 +17,7 @@ bench  = 0
 batch = 2
 heads = 2
 ctx   = 16
-state = 64*2
+state = 64*1
 scale = 1.0 / np.sqrt(state)
 
 config = tf.ConfigProto(
@@ -72,8 +72,6 @@ class BlocksparseTransformerTest(tf.test.TestCase):
                 qf = ew.float_cast(q, dtype=tf.float16)
                 kf = ew.float_cast(k, dtype=tf.float16)
                 vf = ew.float_cast(v, dtype=tf.float16)
-                ef = ew.float_cast(e, dtype=tf.float16)
-
 
                 w = bst.query_key_op(qf, kf)
                 w = bst.softmax(w, scale=scale)
@@ -90,8 +88,8 @@ class BlocksparseTransformerTest(tf.test.TestCase):
                 y = ew.float_cast(y, dtype=tf.float32)
                 Y = ew.float_cast(Y, dtype=tf.float32)
 
-                y, (dq, dk, dv) = sess.run( [ y, tf.gradients(y, [q, k, v], ef) ], feed_dict )
-                Y, (DQ, DK, DV) = sess.run( [ Y, tf.gradients(Y, [q, k, v], ef) ], feed_dict )
+                y, (dq, dk, dv) = sess.run( [ y, tf.gradients(y, [q, k, v], e) ], feed_dict )
+                Y, (DQ, DK, DV) = sess.run( [ Y, tf.gradients(Y, [q, k, v], e) ], feed_dict )
 
                 print("testBlocksparseTransformerDense", bsize)
                 if not bench:
@@ -137,7 +135,6 @@ class BlocksparseTransformerTest(tf.test.TestCase):
                 qf = ew.float_cast(q, dtype=tf.float16)
                 kf = ew.float_cast(k, dtype=tf.float16)
                 vf = ew.float_cast(v, dtype=tf.float16)
-                ef = ew.float_cast(e, dtype=tf.float16)
 
                 w = bst.query_key_op(qf, kf)
                 w = bst.masked_softmax(w, scale=scale)
@@ -145,7 +142,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
 
                 y = ew.float_cast(y, dtype=tf.float32)
 
-                dq, dk, dv = tf.gradients(y, [q, k, v], ef)
+                dq, dk, dv = tf.gradients(y, [q, k, v], e)
                 y, dq, dk, dv = sess.run( [ y, dq, dk, dv ], feed_dict )
 
                 W = bst.nt_test(cpuQ, cpuK)
@@ -173,7 +170,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
     def testBlocksparseSoftmax(self):
 
         with self.test_session(config=config) as sess, tf.device("/gpu:0"):
-            for bsize in ( 16, 32, 64 ): # 16, 32, 64
+            for bsize in ( 16, 32, 64, ): # 16, 32, 64
 
                 # define outer block structure for blocksparse matmul
                 layout = np.ones([1, ctx, ctx], dtype=np.bool)
@@ -198,8 +195,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
                 e = tf.placeholder(tf.float32, cpuE.shape)
                 feed_dict = { x: cpuX, e: cpuE }
 
-                xf = ew.float_cast(x, dtype=tf.float16)
-                ef = ew.float_cast(e, dtype=tf.float16)
+                xf = ew.float_cast(x, dtype=tf.bfloat16)
 
                 y = bst.masked_softmax(xf, scale=scale)
 

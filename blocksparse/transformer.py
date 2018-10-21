@@ -242,12 +242,12 @@ class BlocksparseTransformer(object):
     # TODO: support save restore of this object..
     # but for now just rely on hyperparameter regeneration of the object state
     # def __getstate__(self):
-    #     return (self.layout, self.blk_size, self.softmax_mask, self.z_order, self.name)
+    #     return (self.layout, self.blk_size, self.softmax_mask, self.name)
 
     # def __setstate__(self, state):
     #     self.__init__(*state)
 
-    def __init__(self, layout, block_size=64, heads=None, mask_callback=None, z_order=False, name=None):
+    def __init__(self, layout, block_size=64, heads=None, mask_callback=None, name=None):
 
         if len(layout.shape) == 2:
             assert heads is not None, "heads must be explicitly specified when using shared layouts per head"
@@ -263,7 +263,6 @@ class BlocksparseTransformer(object):
 
         #self.layout       = layout > 0  # save boolean version for serialization purposes, TODO: save packbits or csr version
         self.blk_size     = block_size
-        self.z_order      = z_order
         self.name         = name
         self.heads        = heads
         self.lut_heads    = layout.shape[0]
@@ -292,16 +291,8 @@ class BlocksparseTransformer(object):
             else:
                 assert len(bs) == blocks, "number of layout blocks must be equal across heads"
 
-            if z_order:
-                # morton order (z-order) the blocks for efficient L2 cache utilization on the nt op
-                # This doesn't always speed things up so make optional
-                nt_list = list()
-                for _, b in sorted( [ (morton(xs[b], ys[b]), b) for b in range(blocks) ] ):
-                    nt_list.append( (ys[b], xs[b]) )
-            else:
-                # make blocks contiguous along the rows
-                nt_list = sorted( zip(ys, xs) )
-
+            # make blocks contiguous along the rows
+            nt_list = sorted( zip(ys, xs) )
             ys = [b[0] for b in nt_list]
             xs = [b[1] for b in nt_list]
 
@@ -482,7 +473,7 @@ class BlocksparseTransformer(object):
     def nt_op(self, a, b, name=None, bench=0):
 
         return blocksparse_transformer_nt(
-            a, b, self.nt_lut, self.nn_lut, self.tn_lut,
+            a, b, self.nt_lut, self.nn_lut, self.tn_lut, CT=tf.float16,
             heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
             nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
         )
@@ -506,7 +497,7 @@ class BlocksparseTransformer(object):
     def query_key_op(self, q, k, name=None, bench=0):
 
         return blocksparse_transformer_nt(
-            q, k, self.nt_lut, self.nn_lut, self.tn_lut,
+            q, k, self.nt_lut, self.nn_lut, self.tn_lut, CT=tf.bfloat16,
             heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
             nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
         )
@@ -575,7 +566,7 @@ def blocksparse_transformer_nn_grad(op, dy):
     w, v, nt_lut, nn_lut, tn_lut = op.inputs
 
     dw = blocksparse_transformer_nt(
-        dy, v, nt_lut, nn_lut, tn_lut,
+        dy, v, nt_lut, nn_lut, tn_lut, CT=tf.float16,
         heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks,
         nn_max=nn_max, tn_max=tn_max, bench=bench)
 

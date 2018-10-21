@@ -12,6 +12,7 @@
 // N64: N even mult of 64
 // A is sparse, B is dense, C is dense
 
+// 32x64x16 warp tile
 template <uint OP_A, bool N64>
 __global__ void __launch_bounds__(256) hgemm_blocksparse_64x64x64_xn_sdd(
     const uint2* __restrict__ Lut,
@@ -497,12 +498,12 @@ __global__ void __launch_bounds__(64) hgemm_blocksparse_16x64x16_xn_sdd(
 // A is dense, B is dense, C is sparse
 
 // 32x32x32 warp tile
-template <bool K64>
+template <typename CT, typename CV, bool K64>
 __global__ void __launch_bounds__(256) hgemm_blocksparse_64x64x64_nt_dds(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
-          ehalf*              C,
+             CT*              C,
     uint szCtxHeadState,  uint szHeadState, uint szState,
     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
     uint loops)
@@ -596,7 +597,7 @@ __global__ void __launch_bounds__(256) hgemm_blocksparse_64x64x64_nt_dds(
 
     uint loadC   = tyc*stdC + txc*4;
     uint storC   = fragmentC<OP_N,OP_T>::get_idx(tid, stdC, (tid & 224));
-    uint offsetC = idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*64*64 + tid*4;
+    C += idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*64*64 + tid*4;
 
     for (int m = 0; m < 2; m++)
     {
@@ -606,147 +607,29 @@ __global__ void __launch_bounds__(256) hgemm_blocksparse_64x64x64_nt_dds(
         __syncthreads();
 
         for (int i = 0; i < 2; i++)
-            *(uint2*)&C[offsetC + 64*(i*32 + m*16)] = to_half4(
-                ew_add(
+        {
+            float4 sum4 = ew_add(
                     *(float4*)&fShare[loadC + i*64 + 0*128],
                     *(float4*)&fShare[loadC + i*64 + 1*128]
-                )
-            );
+                );
+            store((CV*)(C + 64*(i*32 + m*16)), sum4);
+        }
     }
 }
 
-// 32x64x16 warp tile
-// this is slower than 32x32x32 warp tile for small number of loops
-// template <bool K64>
-// __global__ void __launch_bounds__(256) hgemm_blocksparse_64x64x64_nt_dds2(
-//     const uint2* __restrict__ Lut,
-//     const ehalf* __restrict__ A,
-//     const ehalf* __restrict__ B,
-//           ehalf*              C,
-//     uint szCtxHeadState,  uint szHeadState, uint szState,
-//     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
-//     uint loops)
-// {
-//     const uint stdA = 64+8;
-//     const uint stdB = 64+8;
-//     const uint stdC = 512+4;
 
-//     __shared__ float fShare[stdC*16];
-//     ehalf* hShare = (ehalf*)fShare;
-
-//     uint tid   = threadIdx.x;
-//     uint bid   = blockIdx.x; // blockid
-//     uint idx_B = blockIdx.y; // batch dim
-//     uint idx_H = blockIdx.z; // head dim
-
-//     // each head can optionally have its own lut
-//     uint2 lut_head = Lut[idx_H*szLut + bid];
-
-//     uint tx = tid % 8;
-//     uint ty = tid / 8;
-//     uint k  = tx  * 8;
-
-//     uint idx_M = lut_head.x;
-//     uint idx_N = lut_head.y;
-//     uint offsetA00 = idx_B*szCtxHeadState + (idx_M*64 + ty)*szHeadState + idx_H*szState + k;
-//     uint offsetB00 = idx_B*szCtxHeadState + (idx_N*64 + ty)*szHeadState + idx_H*szState + k;
-//     uint offsetA32 = offsetA00 + szHeadState*32;
-//     uint offsetB32 = offsetB00 + szHeadState*32;
-
-//     uint storA = ty*stdA + k;
-//     uint storB = ty*stdB + k;
-//     uint loadA = fragmentA<OP_N>::get_idx(tid, stdA, (tid & 192)*16/64 + stdA*(tid & 32));
-//     uint loadB = fragmentB<OP_T>::get_idx(tid, stdB, (tid & 192)*16/64 + stdA*64);
-
-//     fragmentC<OP_N,OP_T> fragC[2][4];
-
-//     uint loop = 0;
-//     #pragma unroll 1
-//     do
-//     {
-//         asm volatile (".pragma \"nounroll\";"::); // ptxas, don't get clever
-
-//         uint4 a00 = {0}, a32 = {0};
-//         uint4 b00 = {0}, b32 = {0};
-//         if (K64 || k < szState)
-//         {
-//             a00 = *(uint4*)&A[offsetA00];
-//             a32 = *(uint4*)&A[offsetA32];
-//             b00 = *(uint4*)&B[offsetB00];
-//             b32 = *(uint4*)&B[offsetB32];
-//         }
-//         offsetA00 += 64;
-//         offsetA32 += 64;
-//         offsetB00 += 64;
-//         offsetB32 += 64;
-//         if (!K64)
-//             k += 64;
-
-//         __syncthreads();
-//         *(uint4*)&hShare[storA +  0*stdA +  0*stdA] = a00;
-//         *(uint4*)&hShare[storA + 32*stdA +  0*stdA] = a32;
-//         *(uint4*)&hShare[storB +  0*stdB + 64*stdA] = b00;
-//         *(uint4*)&hShare[storB + 32*stdB + 64*stdA] = b32;
-//         __syncthreads();
-
-//         fragmentA<OP_N> fragA[2];
-//         fragmentB<OP_T> fragB[4];
-//         for (int i = 0; i < 2; i++)
-//             fragA[i].load(hShare, loadA + stdA*i*16, stdA);
-
-//         for (int i = 0; i < 4; i++)
-//             fragB[i].load(hShare, loadB + stdB*i*16, stdB);
-
-//         for (int i = 0; i < 2; i++)
-//             for (int j = 0; j < 4; j++)
-//                 fragC[i][j].mma_sync(fragA[i], fragB[j]);
-
-//     } while (++loop < loops);
-
-//     asm volatile ("mov.u32 %0, %tid.x;"   : "=r"(tid)   :);
-//     asm volatile ("mov.u32 %0, %ctaid.x;" : "=r"(bid)   :);
-//     asm volatile ("mov.u32 %0, %ctaid.y;" : "=r"(idx_B) :);
-//     asm volatile ("mov.u32 %0, %ctaid.z;" : "=r"(idx_H) :);
-
-//     uint txc = tid % 16;
-//     uint tyc = tid / 16;
-
-//     uint loadC   = tyc*stdC + txc*4;
-//     uint storC   = fragmentC<OP_N,OP_T>::get_idx(tid, stdC, (tid & 224)*2);
-//     uint offsetC = idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*64*64 + tid*4;
-
-//     for (int i = 0; i < 2; i++)
-//     {
-//         __syncthreads();
-//         for (int j = 0; j < 4; j++)
-//             fragC[i][j].store(fShare, storC + j*16, stdC);
-//         __syncthreads();
-
-//         for (int j = 0; j < 2; j++)
-//             *(uint2*)&C[offsetC + 64*(j*32 + i*16)] = to_half4(
-//                 ew_add(
-//                     ew_add(
-//                         *(float4*)&fShare[loadC + j*64 + 0*128],
-//                         *(float4*)&fShare[loadC + j*64 + 1*128]),
-//                     ew_add(
-//                         *(float4*)&fShare[loadC + j*64 + 2*128],
-//                         *(float4*)&fShare[loadC + j*64 + 3*128])
-//                 )
-//             );
-//     }
-// }
 
 // C = A * B.T
 // Dims: M, N, K
 // K64: K even mult of 64
 // A is dense, B is dense, C is sparse
 
-template <bool K64>
+template <typename CT, typename CV, bool K64>
 __global__ void __launch_bounds__(128) hgemm_blocksparse_32x32x64_nt_dds(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
-          ehalf*              C,
+             CT*              C,
     uint szCtxHeadState,  uint szHeadState, uint szState,
     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
     uint loops)
@@ -836,7 +719,7 @@ __global__ void __launch_bounds__(128) hgemm_blocksparse_32x32x64_nt_dds(
     ty = tid / 8;
     uint loadC   = ty*stdC + tx*4;
     uint storC   = fragmentC<OP_N,OP_T>::get_idx(tid, stdC, (tid & 96));
-    uint offsetC = idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*32*32 + tid*4;
+    C += idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*32*32 + tid*4;
 
     for (int i = 0; i < 2; i++)
     {
@@ -853,7 +736,7 @@ __global__ void __launch_bounds__(128) hgemm_blocksparse_32x32x64_nt_dds(
                 *(float4*)&fShare[loadC + 64],
                 *(float4*)&fShare[loadC + 96]));
 
-        *(uint2*)&C[offsetC + i*4*128] = to_half4(sum4);
+        store((CV*)(C + i*4*128), sum4);
     }
 }
 
@@ -863,12 +746,12 @@ __global__ void __launch_bounds__(128) hgemm_blocksparse_32x32x64_nt_dds(
 // K64: K even mult of 64
 // dds: A is dense, B is dense, C is sparse
 
-template <bool K64>
+template <typename CT, typename CV, bool K64>
 __global__ void __launch_bounds__(64) hgemm_blocksparse_16x16x64_nt_dds(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
-          ehalf*              C,
+             CT*              C,
     uint szCtxHeadState,  uint szHeadState, uint szState,
     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
     uint loops)
@@ -957,7 +840,7 @@ __global__ void __launch_bounds__(64) hgemm_blocksparse_16x16x64_nt_dds(
     ty = tid / 4;
     uint loadC   = ty*stdC + tx*4;
     uint storC   = fragmentC<OP_N,OP_T>::get_idx(tid, stdC, (tid & 32)/2);
-    uint offsetC = idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*16*16 + tid*4;
+    C += idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + bid*16*16 + tid*4;
 
     __syncthreads();
     fragC.store(fShare, storC, stdC);
@@ -967,7 +850,7 @@ __global__ void __launch_bounds__(64) hgemm_blocksparse_16x16x64_nt_dds(
         *(float4*)&fShare[loadC +  0],
         *(float4*)&fShare[loadC + 16]);
 
-    *(uint2*)&C[offsetC] = to_half4(sum4);
+        store((CV*)C, sum4);
 }
 
 #else // __CUDA_ARCH__ >= 700
@@ -1008,36 +891,36 @@ __global__ void __launch_bounds__(64) hgemm_blocksparse_16x64x16_xn_sdd(
 {
     *C = 0;
 }
-template <bool K64>
+template <typename CT, typename CV, bool K64>
 __global__ void __launch_bounds__(256) hgemm_blocksparse_64x64x64_nt_dds(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
-          ehalf*              C,
+             CT*              C,
     uint szCtxHeadState,  uint szHeadState, uint szState,
     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
     uint loops)
 {
     *C = 0;
 }
-template <bool K64>
+template <typename CT, typename CV, bool K64>
 __global__ void __launch_bounds__(128) hgemm_blocksparse_32x32x64_nt_dds(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
-          ehalf*              C,
+             CT*              C,
     uint szCtxHeadState,  uint szHeadState, uint szState,
     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
     uint loops)
 {
     *C = 0;
 }
-template <bool K64>
+template <typename CT, typename CV, bool K64>
 __global__ void __launch_bounds__(64) hgemm_blocksparse_16x16x64_nt_dds(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
-          ehalf*              C,
+             CT*              C,
     uint szCtxHeadState,  uint szHeadState, uint szState,
     uint szHeadBlocksBlk, uint szBlocksBlk, uint szLut,
     uint loops)
@@ -1094,11 +977,12 @@ bool blocksparse_transformer_xn(CUstream stream,
     return true;
 }
 
+template <typename CT, typename CV>
 bool blocksparse_transformer_nt(CUstream stream,
     const uint2* lut,
     const ehalf* a,
     const ehalf* b,
-          ehalf* c,
+             CT* c,
     uint block_size, uint blocks,
     uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim,
     uint lut_heads, uint lut_dim)
@@ -1117,24 +1001,26 @@ bool blocksparse_transformer_nt(CUstream stream,
 
     dim3 grid(blocks, batch_dim, head_dim);
     if (block_size == 16)
-        hgemm_blocksparse_16x16x64_nt_dds<false><<<grid, 64,0,stream>>>(lut, a, b, c, szCtxHeadState, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+        hgemm_blocksparse_16x16x64_nt_dds<CT,CV,false><<<grid, 64,0,stream>>>(lut, a, b, c, szCtxHeadState, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
     else if (block_size == 32)
-        hgemm_blocksparse_32x32x64_nt_dds<false><<<grid,128,0,stream>>>(lut, a, b, c, szCtxHeadState, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+        hgemm_blocksparse_32x32x64_nt_dds<CT,CV,false><<<grid,128,0,stream>>>(lut, a, b, c, szCtxHeadState, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
     else
-        hgemm_blocksparse_64x64x64_nt_dds<false><<<grid,256,0,stream>>>(lut, a, b, c, szCtxHeadState, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+        hgemm_blocksparse_64x64x64_nt_dds<CT,CV,false><<<grid,256,0,stream>>>(lut, a, b, c, szCtxHeadState, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
 
     // cudaError_t error = cudaGetLastError();
     // printf("%s\n%s\n", cudaGetErrorName(error), cudaGetErrorString(error));
 
     return true;
 }
+template bool blocksparse_transformer_nt<ehalf,ehalf4>(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
+template bool blocksparse_transformer_nt<bhalf,bhalf4>(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, bhalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
 
 
 template <uint U, uint BSIZE, typename MASKT>
 __global__ void blocksparse_masked_softmax(
     const uint2* __restrict__ Lut,
     const MASKT* __restrict__ Mask,
-    const ehalf* __restrict__ X,
+    const bhalf* __restrict__ X,
           ehalf*              Y,
     uint blocks, uint szLut, uint szMask, uint szHead, uint szBatch, float scale, uint shfl_init, uint use_mask)
 {
@@ -1391,10 +1277,10 @@ __global__ void blocksparse_masked_softmax_grad(
 typedef unsigned long long uint64;
 
 template <uint UNROLL>
-__global__ void blocksparse_masked_softmax_64x64(
+__global__ void __launch_bounds__(1024,2) blocksparse_masked_softmax_64x64(
     const uint2*  __restrict__ Lut,
     const uint64* __restrict__ Mask,
-    const ehalf*  __restrict__ X,
+    const bhalf*  __restrict__ X,
           ehalf*               Y,
     uint blocks, uint szLut, uint szMask, uint szHead, uint szBatch, float scale, uint shfl_init, uint max_lut, uint use_mask)
 {
@@ -1444,15 +1330,23 @@ __global__ void blocksparse_masked_softmax_64x64(
 
     uint lut_idx = (tid & (1024-32))*UNROLL/32;
     uint tidx    = (tid & 31)*2;
-    uint offset  = idx_B*szBatch + idx_H*szHead + idx_q*64 + tidx;
+    uint offset  = idx_B*szBatch + idx_H*szHead + idx_q*64 + tidx + LutOffset[lut_idx];
+    X += offset;
 
-    ehalf2 xval[UNROLL];
+    bhalf2 xval[UNROLL];
     #pragma unroll
-    for (int i = 0; i < UNROLL; i++)
+    for (uint i = 0; i < UNROLL; i++)
     {
-        xval[i].x = 0xfc00fc00; // -inf, -inf
-        if (lut_idx + i < lut_size)
-            xval[i] = __ldg((const ehalf2*)(X + (offset + LutOffset[lut_idx + i])));
+        asm (
+            "{                            \n\t"
+            ".reg .pred p;                \n\t"
+            ".reg .s64 X, offset;         \n\t"
+            "setp.lt.u32 p, %3, %4;       \n\t"
+            "mov.b64 offset, {%2, 0};     \n\t"
+            "add.s64 X, %1, offset;       \n\t"
+            "mov.u32 %0, 0xff80ff80;      \n\t" // -inf, -inf
+            "@p ld.global.nc.u32 %0, [X]; \n\t"
+            "}" :"=r"(xval[i].x) : "l"(X), "r"(i*64*64*2), "r"(lut_idx + i), "r"(lut_size));
     }
 
     // split the 64 bit mask by half warp
@@ -1465,21 +1359,19 @@ __global__ void blocksparse_masked_softmax_64x64(
     {
         uint mask32 = LutMask32[(lut_idx + i)*2 + tid16];
         if ((mask32 & mask0) == 0)
-            xval[i].x = (xval[i].x & 0xffff0000) | 0x0000fc00;
+            xval[i].x = (xval[i].x & 0xffff0000) | 0x0000ff80; // 0x0000fc00
         if ((mask32 & mask1) == 0)
-            xval[i].x = (xval[i].x & 0x0000ffff) | 0xfc000000;
+            xval[i].x = (xval[i].x & 0x0000ffff) | 0xff800000;
     }
-
 
     // reduce within thread
     float Xmax[UNROLL];
     for (int i = 0; i < UNROLL; i++)
         Xmax[i] = ew_max(to_float(xval[i]));
 
-    for (int j = UNROLL/2; j > 0; j >>= 1)
-        for (int i = 0; i < j; i++)
-            Xmax[i] = fmaxf(Xmax[i], Xmax[i+j]);
     float xmax = Xmax[0];
+    for (int i = 1; i < UNROLL; i++)
+        xmax = fmaxf(Xmax[i], xmax);
 
     // reduce within warp
     for (int i = 16; i > 0; i >>= 1)
@@ -1507,24 +1399,16 @@ __global__ void blocksparse_masked_softmax_64x64(
     }
 
     // subtract xmax and compute exponent
-    float2 Xval[UNROLL];
+    float exp_sum = 0;
     for (int i = 0; i < UNROLL; i++)
     {
         // use fast approx math: e**x == 2**(x * log2(e))
-        Xval[i] = ew_mul(ew_sub(to_float(xval[i]), xmax), scale);
-        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(Xval[i].x) :);
-        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(Xval[i].y) :);
+        float2 Xval = ew_mul(ew_sub(to_float(xval[i]), xmax), scale);
+        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(Xval.x) :);
+        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(Xval.y) :);
+        exp_sum += ew_sum(Xval);
+        xval[i] = to_bhalf(Xval);
     }
-
-    // reduce within thread
-    float Xsum[UNROLL];
-    for (int i = 0; i < UNROLL; i++)
-        Xsum[i] = ew_sum(Xval[i]);
-
-    for (int j = UNROLL/2; j > 0; j >>= 1)
-        for (int i = 0; i < j; i++)
-            Xsum[i] = Xsum[i] + Xsum[i+j];
-    float exp_sum = Xsum[0];
 
     // reduce within warp
     for (int i = 16; i > 0; i >>= 1)
@@ -1554,21 +1438,27 @@ __global__ void blocksparse_masked_softmax_64x64(
     float rcp_exp_sum = exp_sum;
     asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(rcp_exp_sum) :);
 
+    Y += offset;
+
     #pragma unroll
     for (int i = 0; i < UNROLL; i++)
     {
-        ehalf2 out = to_ehalf(ew_mul(Xval[i], rcp_exp_sum));
-
-        uint offsetY = offset + LutOffset[lut_idx + i];
-
-        if (lut_idx + i < lut_size)
-            __stg((ehalf2*)(Y + offsetY), out);
+        ehalf2 y = to_ehalf(ew_mul(to_float(xval[i]), rcp_exp_sum));
+        asm (
+            "{                            \n\t"
+            ".reg .pred p;                \n\t"
+            ".reg .s64 X, offset;         \n\t"
+            "setp.lt.u32 p, %3, %4;       \n\t"
+            "mov.b64 offset, {%1, 0};     \n\t"
+            "add.s64 X, %0, offset;       \n\t"
+            "@p st.global.wb.u32 [X], %2; \n\t"
+            "}" :: "l"(Y), "r"(i*64*64*2), "r"(y.x), "r"(lut_idx + i), "r"(lut_size));
     }
 }
 
 
 template <uint UNROLL>
-__global__ void blocksparse_masked_softmax_64x64_grad(
+__global__ void __launch_bounds__(1024,2) blocksparse_masked_softmax_64x64_grad(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ DY,
     const ehalf* __restrict__ Y,
@@ -1603,31 +1493,35 @@ __global__ void blocksparse_masked_softmax_64x64_grad(
 
     uint lut_idx = (tid & (1024-32))*UNROLL/32;
     uint tidx    = (tid & 31)*2;
-    uint offset  = idx_B*szBatch + idx_H*szHead + idx_q*64 + tidx;
+    uint offset  = idx_B*szBatch + idx_H*szHead + idx_q*64 + tidx + LutOffset[lut_idx];
+    DY += offset;
+    Y  += offset;
 
     ehalf2 dy[UNROLL], y[UNROLL];
     #pragma unroll
-    for (int i = 0; i < UNROLL; i++)
+    for (uint i = 0; i < UNROLL; i++)
     {
-        dy[i].x = y[i].x = 0;
-        if (lut_idx + i < lut_size)
-        {
-            uint offsetY = offset + LutOffset[lut_idx + i];
-            dy[i] = __ldg((const ehalf2*)(DY + offsetY));
-            y[i]  = __ldg((const ehalf2*)(Y  + offsetY));
-        }
+        dy[i].x = 0;
+         y[i].x = 0;
+        asm (
+            "{                             \n\t"
+            ".reg .pred p;                 \n\t"
+            ".reg .s64 DY, Y, offset;      \n\t"
+            "setp.lt.u32 p, %5, %6;        \n\t"
+            "mov.b64 offset, {%4, 0};      \n\t"
+            "add.s64 DY, %2, offset;       \n\t"
+            "add.s64 Y,  %3, offset;       \n\t"
+            "mov.u32 %0, 0;                \n\t"
+            "mov.u32 %1, 0;                \n\t"
+            "@p ld.global.nc.u32 %0, [DY]; \n\t"
+            "@p ld.global.nc.u32 %1, [Y];  \n\t"
+            "}" : "=r"(dy[i].x), "=r"(y[i].x) : "l"(DY), "l"(Y), "r"(i*64*64*2), "r"(lut_idx + i), "r"(lut_size));
     }
 
     // compute dy * y and start reduction
-    float dyy[UNROLL];
+    float sum_dyy = 0.0f;
     for (int i = 0; i < UNROLL; i++)
-        dyy[i] = ew_sum(ew_mul(to_float(dy[i]), to_float(y[i])));
-
-    // reduce within thread
-    for (int j = UNROLL/2; j > 0; j >>= 1)
-        for (int i = 0; i < j; i++)
-            dyy[i] = dyy[i] + dyy[i+j];
-    float sum_dyy = dyy[0];
+        sum_dyy += ew_sum(ew_mul(to_float(dy[i]), to_float(y[i])));
 
     // reduce within warp
     for (int i = 16; i > 0; i >>= 1)
@@ -1654,18 +1548,22 @@ __global__ void blocksparse_masked_softmax_64x64_grad(
         __syncthreads();
         sum_dyy = Sum[0];
     }
+    DX += offset;
 
-    // dx = (dy - sum_dyy) * y * scale
     #pragma unroll
-    for (int i = 0; i < UNROLL; i++)
+    for (uint i = 0; i < UNROLL; i++)
     {
         // dx = (dy - sum_dyy) * y * scale
-        float2 dx = ew_mul(ew_mul(ew_sub(to_float(dy[i]), sum_dyy), to_float(y[i])), scale);
-        if (lut_idx + i < lut_size)
-        {
-            uint offsetX = offset + LutOffset[lut_idx + i];
-            __stg((ehalf2*)(DX + offsetX), to_ehalf(dx));
-        }
+        ehalf2 dx = to_ehalf(ew_mul(ew_mul(ew_sub(to_float(dy[i]), sum_dyy), to_float(y[i])), scale));
+        asm (
+            "{                             \n\t"
+            ".reg .pred p;                 \n\t"
+            ".reg .s64 DX, offset;         \n\t"
+            "setp.lt.u32 p, %3, %4;        \n\t"
+            "mov.b64 offset, {%1, 0};      \n\t"
+            "add.s64 DX, %0, offset;       \n\t"
+            "@p st.global.wb.u32 [DX], %2; \n\t"
+            "}" :: "l"(DX), "r"(i*64*64*2), "r"(dx.x), "r"(lut_idx + i), "r"(lut_size));
     }
 }
 
@@ -1674,7 +1572,7 @@ __global__ void blocksparse_masked_softmax_64x64_grad(
 bool BlocksparseMaskedSoftmax(CUstream stream,
     const uint2* lut,
     const  char* mask,
-    const ehalf* x,
+    const bhalf* x,
           ehalf* y,
     uint block_size, uint blocks,
     uint batch_dim,  uint head_dim, uint ctx_blks,
