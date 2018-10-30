@@ -14,10 +14,10 @@ ones   = 0
 out    = 0
 bench  = 0
 
-batch = 2
-heads = 2
+batch = 4
+heads = 4
 ctx   = 16
-state = 64*1
+state = 64*8
 scale = 1.0 / np.sqrt(state)
 
 config = tf.ConfigProto(
@@ -44,7 +44,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
     def testBlocksparseTransformerDense(self):
 
         with self.test_session(config=config) as sess, tf.device("/gpu:0"):
-            for bsize in (16, 32, 64):
+            for bsize in (8, 16, 32, 64):
 
                 layout = np.ones([heads, ctx, ctx], dtype=np.bool)
                 bst = trans.BlocksparseTransformer(layout, block_size=bsize)
@@ -104,7 +104,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
     def testBlocksparseTransformerSparse(self):
 
         with self.test_session(config=config) as sess, tf.device("/gpu:0"):
-            for bsize in (16, 32, 64):
+            for bsize in (8, 16, 32, 64):
 
                 layout = np.ones([heads, ctx, ctx], dtype=np.bool)
                 for q, k in np.ndindex(ctx, ctx):
@@ -170,7 +170,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
     def testBlocksparseSoftmax(self):
 
         with self.test_session(config=config) as sess, tf.device("/gpu:0"):
-            for bsize in ( 16, 32, 64, ): # 16, 32, 64
+            for bsize in ( 8, 16, 32, 64, ): # 16, 32, 64
 
                 # define outer block structure for blocksparse matmul
                 layout = np.ones([1, ctx, ctx], dtype=np.bool)
@@ -218,7 +218,7 @@ class BlocksparseTransformerTest(tf.test.TestCase):
     def testBlocksparseTransformerMatmul(self):
 
         with self.test_session(config=config) as sess, tf.device("/gpu:0"):
-            for bsize in (16, 32, 64): # 16, 32, 64
+            for bsize in (8, 16, 32, 64): # 8, 16, 32, 64
 
                 layout = np.ones([1, ctx, ctx], dtype=np.bool)
                 for q, k in np.ndindex(ctx, ctx):
@@ -260,11 +260,9 @@ class BlocksparseTransformerTest(tf.test.TestCase):
                 nn = ew.float_cast(nn, dtype=tf.float32)
                 tn = ew.float_cast(tn, dtype=tf.float32)
 
-                #dx, db = tf.gradients(y, [x, b], e)
-
                 print("testBlocksparseTransformerMatmul", bsize)
 
-                nt, nn, tn = sess.run( [ nt, nn, tn ], feed_dict )
+                nt, nn, tn = sess.run( [ nt, nn, tn ], feed_dict ) # nt, nn, tn
 
                 if not bench:
 
@@ -293,10 +291,10 @@ class BlocksparseTransformerTest(tf.test.TestCase):
 
         if out:
             dim = cpu.shape[-1]
-            np.savetxt("out.txt",  dif.reshape((-1,dim)), fmt='%.5f')
-            np.savetxt("outC.txt", cpu.reshape((-1,dim)), fmt='%.5f')
-            np.savetxt("outD.txt", dev.reshape((-1,dim)), fmt='%.5f')
-            exit()
+            np.savetxt("%s_dif.txt" % op, dif.reshape((-1,dim)), fmt='%.0f')
+            np.savetxt("%s_cpu.txt" % op, cpu.reshape((-1,dim)), fmt='%.0f')
+            np.savetxt("%s_dev.txt" % op, dev.reshape((-1,dim)), fmt='%.0f')
+            #exit()
 
 
 if __name__ == "__main__":

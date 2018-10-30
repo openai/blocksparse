@@ -56,8 +56,10 @@ def conv1d(x, scope, nf, relu=False):
 
         return y
 
-# fine sparse structure
-# within each block this mask is applied to force the softmax output to zero where the mask is zero
+# Fine sparse structure
+# Within each block this mask is applied to force the softmax output to zero where the mask is zero
+# This is defined a callback to avoid having to instantiate the full mask in memory at one time.
+# The callback value is immediately converted to bits internally.
 def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
     """Prohibit positions in sub-blocks from attending to indices in the future.
     Note: query_idx and key_idx are absolute indices rather than relative to
@@ -70,9 +72,9 @@ def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
                 mask[q, k] = 0
     return mask
 
-# coarse sparse structure
-# only layout==1 blocks are computed and materialized in memory
-# block sizes of 16, 32 and 64 are supported (64 being most appropriate for dense attention)
+# Coarse sparse structure
+# Only layout==1 blocks are computed and materialized in memory
+# Block sizes of 16, 32 and 64 are supported (64 being most appropriate for dense attention)
 def get_blocksparse_attention_ops(n_timesteps, n_heads):
     blocksize = 64
     n_time_blocks = n_timesteps // blocksize
@@ -189,8 +191,8 @@ def model(xs, ys):
                 if "embed" in param.op.name:
                     # for input embedding, only update param + running stats when embedding vector was selected by input
                     # more stable learning for rarely used embedding entries
-                    if "x" in param.op.name:
-                        grad.lazy = True
+                    # if "x" in param.op.name:
+                    #     grad.lazy = True
                     adam_grads.append( (grad, param) )
                 else:
                     fact_grads.append( (grad, param) )

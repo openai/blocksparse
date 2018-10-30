@@ -48,17 +48,37 @@ __device__ __forceinline__ uint2 to_half4(float4 v)
 #define OP_N 0
 #define OP_T 1
 
-template <uint OP_A>
+#define m16n16k16 0
+#define m8n32k16  1
+#define m8n8k16   2 // run inside of m16n16k16
+
+
+template <uint OP_A, uint TILE>
 struct fragmentA
 {
     uint x[8];
     __device__ __forceinline__ static uint get_idx(uint tid, uint stride, uint offset=0)
     {
-        uint idx;
-        if (OP_A == OP_T)
-            idx = (tid & 3)*stride + (tid & 4)*2 + (tid & 16)/4 + offset;
-        else
-            idx = ((tid & 3) + (tid & 4)*2 + (tid & 16)/4) * stride + offset;
+        uint idx = 0;
+        if (TILE == m16n16k16)
+        {
+            if (OP_A == OP_T)
+                idx = (tid & 3)*stride + (tid & 4)*2 + (tid & 16)/4 + offset;
+            else
+                idx = ((tid & 3) + (tid & 4)*2 + (tid & 16)/4) * stride + offset;
+        }
+        else if (TILE == m8n32k16)
+        {
+            if (OP_A == OP_T)
+                idx = (tid & 3)*stride + (tid & 16)/4 + offset;
+            else
+                idx = ((tid & 3) + (tid & 16)/4) * stride + offset;
+        }
+        else if (TILE == m8n8k16)
+        {
+            if (OP_A == OP_N)
+                idx = ((tid & 3) + (tid & 16)/4) * stride + offset;
+        }
         return idx;
     }
     __device__ __forceinline__ void load(ehalf* hShare, uint idx, uint stride)
@@ -68,21 +88,36 @@ struct fragmentA
                 *(uint2*)&x[i*2] = *(uint2*)&hShare[idx + i*4*stride];
         else
             for (int i = 0; i < 2; i++)
-                *(uint4*)&x[i*4] = *(uint4*)&hShare[idx + i*8];
+                // for m8n32k16 we concatonate two 8x8 blocks together to form an 8x16 block
+                // but the k dim is not contiguous accross the 2 blocks
+                *(uint4*)&x[i*4] = *(uint4*)&hShare[idx + (TILE == m8n32k16 ? i*64 : i*8)];
     }
 };
 
-template <uint OP_B>
+template <uint OP_B, uint TILE>
 struct fragmentB
 {
     uint x[8];
     __device__ __forceinline__ static uint get_idx(uint tid, uint stride, uint offset=0)
     {
-        uint idx;
-        if (OP_B == OP_N)
-            idx = (tid & 3)*stride + (tid & 8)*1 + (tid & 16)/4 + offset;
-        else
-            idx = ((tid & 3) + (tid & 8)*1 + (tid & 16)/4) * stride + offset;
+        uint idx = 0;
+        if (TILE == m16n16k16)
+        {
+            if (OP_B == OP_N)
+                idx = (tid & 3)*stride + (tid & 8)*1 + (tid & 16)/4 + offset;
+            else
+                idx = ((tid & 3) + (tid & 8)*1 + (tid & 16)/4) * stride + offset;
+        }
+        else if (TILE == m8n32k16)
+        {
+            if (OP_B == OP_N)
+                idx = (tid & 3)*stride + (tid & 4)*2 + (tid & 8)*2 + (tid & 16)/4 + offset;
+        }
+        else if (TILE == m8n8k16)
+        {
+            if (OP_B == OP_T)
+                idx = ((tid & 3) + (tid & 16)/4) * stride + offset;
+        }
         return idx;
     }
     __device__ __forceinline__ void load(ehalf* hShare, uint idx, uint stride)
@@ -96,66 +131,128 @@ struct fragmentB
     }
 };
 
-template <uint OP_A, uint OP_B>
+template <uint OP_A, uint OP_B, uint TILE>
 struct fragmentC
 {
     float x[8];
     __device__ __forceinline__ fragmentC()
     {
         for (int i = 0; i < 8; i++)
-            asm volatile ("mov.b32 %0, 0;" : "=f"(x[i]) :);
             //x[i] = 0.0f;
+            asm volatile ("mov.b32 %0, 0;" : "=f"(x[i]) :);
     }
     __device__ __forceinline__ static uint get_idx(uint tid, uint stride, uint offset=0)
     {
-        return ((tid & 1) + (tid & 4)*2 + (tid & 16)/4)*stride + (tid & 2) + (tid & 8) + offset;
+        uint idx = 0;
+        if (TILE == m16n16k16)
+            idx = ((tid & 1) + (tid & 4)*2 + (tid & 16)/4)*stride + (tid & 2) + (tid & 8) + offset;
+        else if (TILE == m8n32k16)
+            idx = ((tid & 1) + (tid & 16)/4)*stride + (tid & 2) + (tid & 4)*2 + (tid & 8)*2 + offset;
+        else if (TILE == m8n8k16)
+            idx = ((tid & 1) + (tid & 16)/4)*stride + (tid & 2) + offset;
+        return idx;
     }
     __device__ __forceinline__ void store(ehalf* hShare, uint idx, uint stride)
     {
-        for (int i = 0; i < 2; i++)
-            for (int j = 0; j < 2; j++)
-                *(uint*)&hShare[idx + i*4 + j*2*stride] = to_half2(&x[i*4 + j*2]);
+        if (TILE == m8n8k16)
+        {
+            // only upper left 8x8 quandrant of 16x16 tile is valid (threads 0,1,2,3,16,17,18,19)
+            bool valid = (threadIdx.x & 12) == 0;
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                {
+                    uint x2 = to_half2(&x[i*4 + j*2]);
+                    if (valid)
+                        *(uint*)&hShare[idx + i*4 + j*2*stride] = x2;
+                }
+        }
+        else
+        {
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                    *(uint*)&hShare[idx + i*4 + j*2*stride] = to_half2(&x[i*4 + j*2]);
+        }
     }
     __device__ __forceinline__ void store(float* fShare, uint idx, uint stride)
     {
-        for (int i = 0; i < 2; i++)
-            for (int j = 0; j < 2; j++)
-                *(float2*)&fShare[idx + i*4 + j*2*stride] = *(float2*)&x[i*4 + j*2];
+        if (TILE == m8n8k16)
+        {
+            // only upper left 8x8 quandrant of 16x16 tile is valid (threads 0,1,2,3,16,17,18,19)
+            bool valid = (threadIdx.x & 12) == 0;
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                    if (valid)
+                        *(float2*)&fShare[idx + i*4 + j*2*stride] = *(float2*)&x[i*4 + j*2];
+        }
+        else
+        {
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 2; j++)
+                    *(float2*)&fShare[idx + i*4 + j*2*stride] = *(float2*)&x[i*4 + j*2];
+        }
     }
-    __device__ __forceinline__ void mma_sync(fragmentA<OP_A> &fragA, fragmentB<OP_B> &fragB)
+    __device__ __forceinline__ void mma_sync(fragmentA<OP_A,TILE> &fragA, fragmentB<OP_B,TILE> &fragB)
     {
-        if (OP_A == OP_N && OP_B == OP_N)
+        if (TILE == m16n16k16 || TILE == m8n8k16)
         {
-            asm("wmma.mma.sync.m16n16k16.row.row.f32.f32            \n\t"
-                "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                "+f"(x[0]), "+f"(x[1]), "+f"(x[2]), "+f"(x[3]), "+f"(x[4]), "+f"(x[5]), "+f"(x[6]), "+f"(x[7]) :
-                "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            if (OP_A == OP_N && OP_B == OP_N)
+            {
+                asm("wmma.mma.sync.m16n16k16.row.row.f32.f32            \n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
+                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
+                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
+                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
+                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
+                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            }
+            if (OP_A == OP_T && OP_B == OP_N)
+            {
+                asm("wmma.mma.sync.m16n16k16.col.row.f32.f32            \n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
+                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
+                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
+                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
+                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
+                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            }
+            if (OP_A == OP_N && OP_B == OP_T)
+            {
+                asm("wmma.mma.sync.m16n16k16.row.col.f32.f32            \n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
+                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
+                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
+                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
+                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
+                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            }
         }
-        if (OP_A == OP_T && OP_B == OP_N)
+        else if (TILE == m8n32k16)
         {
-            asm("wmma.mma.sync.m16n16k16.col.row.f32.f32            \n\t"
-                "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                "+f"(x[0]), "+f"(x[1]), "+f"(x[2]), "+f"(x[3]), "+f"(x[4]), "+f"(x[5]), "+f"(x[6]), "+f"(x[7]) :
-                "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
-        }
-        if (OP_A == OP_N && OP_B == OP_T)
-        {
-            asm("wmma.mma.sync.m16n16k16.row.col.f32.f32            \n\t"
-                "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                "+f"(x[0]), "+f"(x[1]), "+f"(x[2]), "+f"(x[3]), "+f"(x[4]), "+f"(x[5]), "+f"(x[6]), "+f"(x[7]) :
-                "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            if (OP_A == OP_N && OP_B == OP_N)
+            {
+                asm("wmma.mma.sync.m8n32k16.row.row.f32.f32             \n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
+                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
+                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
+                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
+                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
+                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            }
+            if (OP_A == OP_T && OP_B == OP_N)
+            {
+                asm("wmma.mma.sync.m8n32k16.col.row.f32.f32             \n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
+                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
+                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
+                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
+                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
+                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
+                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
+            }
         }
     }
 };

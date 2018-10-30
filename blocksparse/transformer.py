@@ -257,7 +257,7 @@ class BlocksparseTransformer(object):
         if heads is None:
             heads = layout.shape[0]
 
-        assert block_size in (16,32,64), "Block sizes of 16, 32 and 64 currently supported"
+        assert block_size in (8,16,32,64), "Block sizes of 8, 16, 32 and 64 currently supported"
         assert len(layout.shape) == 3, "bad layout shape: " + str(layout.shape)
         assert layout.shape[1] == layout.shape[2], "layout should be square"
 
@@ -291,7 +291,7 @@ class BlocksparseTransformer(object):
             else:
                 assert len(bs) == blocks, "number of layout blocks must be equal across heads"
 
-            # make blocks contiguous along the rows
+            # make blocks contiguous along the rows (softmax code leverages this for increased performance)
             nt_list = sorted( zip(ys, xs) )
             ys = [b[0] for b in nt_list]
             xs = [b[1] for b in nt_list]
@@ -326,8 +326,10 @@ class BlocksparseTransformer(object):
             dtype = np.uint64
         elif self.blk_size == 32:
             dtype = np.uint32
-        else:
+        elif self.blk_size == 16:
             dtype = np.uint16
+        else:
+            dtype = np.uint8
 
         masks = []
         # for now assume one softmax mask per sparsity specificaiton
