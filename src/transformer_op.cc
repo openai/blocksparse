@@ -434,8 +434,17 @@ Status nt_shape(InferenceContext* ctx)
 }
 Status xn_shape(InferenceContext* ctx)
 {
-    // keys, queries, values all have same shape
-    ctx->set_output(0, ctx->input(1));
+    int ctx_blks_c, blk_size;
+    TF_RETURN_IF_ERROR(ctx->GetAttr("ctx_blks_c", &ctx_blks_c));
+    TF_RETURN_IF_ERROR(ctx->GetAttr("blk_size",   &blk_size));
+    ShapeHandle b = ctx->input(1);
+
+    // (batch, ctx_size, state_size)
+    ctx->set_output(0, ctx->MakeShape({
+      ctx->Dim(b, 0),
+      ctx->MakeDim(ctx_blks_c * blk_size),
+      ctx->Dim(b, 2)
+    }));
     return Status::OK();
 }
 
@@ -450,7 +459,9 @@ REGISTER_OP("BlocksparseTransformerNT")
     .Attr("heads: int")
     .Attr("blocks: int")
     .Attr("blk_size: int")
-    .Attr("ctx_blks: int")
+    .Attr("ctx_blks_a: int")
+    .Attr("ctx_blks_b: int")
+    .Attr("ctx_blks_c: int = 0")
     .Attr("nn_max: int")
     .Attr("tn_max: int")
     .Attr("bench: int = 0")
@@ -469,7 +480,9 @@ REGISTER_OP("BlocksparseTransformerNN")
     .Attr("heads: int")
     .Attr("blocks: int")
     .Attr("blk_size: int")
-    .Attr("ctx_blks: int")
+    .Attr("ctx_blks_a: int = 0")
+    .Attr("ctx_blks_b: int")
+    .Attr("ctx_blks_c: int")
     .Attr("nn_max: int")
     .Attr("tn_max: int")
     .Attr("bench: int = 0")
@@ -488,7 +501,9 @@ REGISTER_OP("BlocksparseTransformerTN")
     .Attr("heads: int")
     .Attr("blocks: int")
     .Attr("blk_size: int")
-    .Attr("ctx_blks: int")
+    .Attr("ctx_blks_a: int = 0")
+    .Attr("ctx_blks_b: int")
+    .Attr("ctx_blks_c: int")
     .Attr("nn_max: int")
     .Attr("tn_max: int")
     .Attr("bench: int = 0")
@@ -497,8 +512,8 @@ REGISTER_OP("BlocksparseTransformerTN")
 Multiply the blocksparse matrix "a.T" by the dense matrix "b" and produce dense output "c".
 )doc");
 
-template <typename CT, typename CV2, typename CV4> bool blocksparse_transformer_nt(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, CT* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
-bool blocksparse_transformer_xn(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim, uint op, uint magic, uint shift, uint max_blks);
+template <typename CT, typename CV2, typename CV4> bool blocksparse_transformer_nt(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, CT* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks_a, uint ctx_blks_b, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
+bool blocksparse_transformer_xn(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks_b, uint ctx_blks_c, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim, uint op, uint magic, uint shift, uint max_blks);
 
 
 #define NT_OP 0
@@ -510,13 +525,15 @@ class BlocksparseTransformerOp : public OpKernel {
  public:
   explicit BlocksparseTransformerOp(OpKernelConstruction* ctx) : OpKernel(ctx), major_(0), magic_(0), shift_(0), head_state_(0)
   {
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("heads",    &heads_    ));
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("blocks",   &blocks_   ));
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("blk_size", &blk_size_ ));
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("ctx_blks", &ctx_blks_ ));
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("nn_max",   &nn_max_   ));
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("tn_max",   &tn_max_   ));
-        OP_REQUIRES_OK(ctx, ctx->GetAttr("bench",    &bench_    ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("heads",      &heads_      ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("blocks",     &blocks_     ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("blk_size",   &blk_size_   ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("ctx_blks_a", &ctx_blks_a_ ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("ctx_blks_b", &ctx_blks_b_ ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("ctx_blks_c", &ctx_blks_c_ ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("nn_max",     &nn_max_     ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("tn_max",     &tn_max_     ));
+        OP_REQUIRES_OK(ctx, ctx->GetAttr("bench",      &bench_      ));
         repeat_ = bench_ ? bench_ : 1;
         flops_ = (float)(blocks_ * blk_size_ * blk_size_);
   }
@@ -528,8 +545,12 @@ class BlocksparseTransformerOp : public OpKernel {
       OP_REQUIRES(ctx, major_ >= 7, errors::InvalidArgument("Tensorcore GPU required"));
       if (bench_)
       {
-        const char* op = OP == NT_OP ? "NT" : OP == NN_OP ? "NN" : "TN";
-        sprintf(bench_string_, "op:%s bsize:%dx%d blocks:%6d ctx:%5d", op, blk_size_, blk_size_, blocks_, ctx_blks_);
+        const char* op; // =  ? "NT" : OP == NN_OP ? "NN" : "TN";
+        int ctx_blks_q, ctx_blks_k;
+             if (OP == NT_OP) { ctx_blks_q = ctx_blks_a_; ctx_blks_k = ctx_blks_b_; op = "NT"; }
+        else if (OP == NN_OP) { ctx_blks_q = ctx_blks_c_; ctx_blks_k = ctx_blks_b_; op = "NN"; }
+        else                  { ctx_blks_q = ctx_blks_b_; ctx_blks_k = ctx_blks_c_; op = "TN"; }
+        sprintf(bench_string_, "op:%s bsize:%02dx%02d blocks:%6d ctx:%5dq%5dk", op, blk_size_, blk_size_, blocks_, ctx_blks_q, ctx_blks_k);
       }
     }
     if (OP == NT_OP)
@@ -550,18 +571,18 @@ class BlocksparseTransformerOp : public OpKernel {
     uint lut_heads = lut.dim_size(0);
     uint lut_dim   = lut.dim_size(1);
     uint batch_dim = a.dim_size(0);
-    uint ctx_dim   = a.dim_size(1);
     uint state_dim = a.dim_size(2);
 
     if (head_state_ == 0)
     {
       OP_REQUIRES(ctx,
         b.dim_size(0) == batch_dim &&
-        b.dim_size(1) == ctx_dim   &&
         b.dim_size(2) == state_dim, errors::InvalidArgument("Mismatched Shapes"));
 
+      OP_REQUIRES(ctx, a.dim_size(1) == ctx_blks_a_ * blk_size_, errors::InvalidArgument("Bad A context length"));
+      OP_REQUIRES(ctx, b.dim_size(1) == ctx_blks_b_ * blk_size_, errors::InvalidArgument("Bad B context length"));
+
       OP_REQUIRES(ctx, (state_dim & 7) == 0,                  errors::InvalidArgument("Head state dim must be multiple of 8, and ideally a multiple of 64"));
-      OP_REQUIRES(ctx, ctx_dim == ctx_blks_ * blk_size_,      errors::InvalidArgument("Bad context length"));
       OP_REQUIRES(ctx, lut_heads == heads_ || lut_heads == 1, errors::InvalidArgument("Bad head dim"));
       OP_REQUIRES(ctx, state_dim % heads_ == 0,               errors::InvalidArgument("state_dim not evenly divisible by number of heads"));
       head_state_ = state_dim / heads_;
@@ -583,7 +604,7 @@ class BlocksparseTransformerOp : public OpKernel {
     if (bench_) bench = new Benchmark(stream, bench_string_, 0, flops_ * (float)(batch_dim * state_dim), repeat_);
 
     for (int r = 0; r < repeat_; r++)
-      blocksparse_transformer_nt<CV1,CV2,CV4>(stream, l_ptr, a_ptr, b_ptr, c_ptr, blk_size_, blocks_, batch_dim, ctx_blks_, heads_, head_state_, lut_heads, lut_dim);
+      blocksparse_transformer_nt<CV1,CV2,CV4>(stream, l_ptr, a_ptr, b_ptr, c_ptr, blk_size_, blocks_, batch_dim, ctx_blks_a_, ctx_blks_b_, heads_, head_state_, lut_heads, lut_dim);
 
     if (bench) delete bench;
   }
@@ -599,7 +620,6 @@ class BlocksparseTransformerOp : public OpKernel {
     uint lut_heads = lut.dim_size(0);
     uint lut_dim   = lut.dim_size(1);
     uint batch_dim = b.dim_size(0);
-    uint ctx_dim   = b.dim_size(1);
     uint state_dim = b.dim_size(2);
 
     if (head_state_ == 0)
@@ -609,12 +629,12 @@ class BlocksparseTransformerOp : public OpKernel {
         a.dim_size(1) == heads_    &&
         a.dim_size(2) == blocks_   &&
         a.dim_size(3) == blk_size_ &&
-        a.dim_size(4) == blk_size_, errors::InvalidArgument("Mismatched a shape"));
+        a.dim_size(4) == blk_size_, errors::InvalidArgument("Mismatched A shape"));
 
-      OP_REQUIRES(ctx, (state_dim & 7) == 0,                  errors::InvalidArgument("Head state dim must be multiple of 8, and ideally a multiple of 64"));
-      OP_REQUIRES(ctx, ctx_dim == ctx_blks_ * blk_size_,      errors::InvalidArgument("Bad context length"));
-      OP_REQUIRES(ctx, lut_heads == heads_ || lut_heads == 1, errors::InvalidArgument("Bad head dim"));
-      OP_REQUIRES(ctx, state_dim % heads_ == 0,               errors::InvalidArgument("state_dim not evenly divisible by number of heads"));
+      OP_REQUIRES(ctx, (state_dim & 7) == 0,                     errors::InvalidArgument("Head state dim must be multiple of 8, and ideally a multiple of 64"));
+      OP_REQUIRES(ctx, b.dim_size(1) == ctx_blks_b_ * blk_size_, errors::InvalidArgument("Bad B context length"));
+      OP_REQUIRES(ctx, lut_heads == heads_ || lut_heads == 1,    errors::InvalidArgument("Bad head dim"));
+      OP_REQUIRES(ctx, state_dim % heads_ == 0,                  errors::InvalidArgument("state_dim not evenly divisible by number of heads"));
       head_state_ = state_dim / heads_;
 
       uint div = CEIL_DIV(head_state_, 64);
@@ -623,7 +643,8 @@ class BlocksparseTransformerOp : public OpKernel {
     }
 
     Tensor* c;
-    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, b.shape(), &c));
+    TensorShape shapeC({batch_dim, ctx_blks_c_ * blk_size_, state_dim});
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, shapeC, &c));
 
     const uint2* l_ptr = (const uint2*)lut.flat<int32>().data();
     const ehalf* a_ptr = (const ehalf*)a.flat<EHALF>().data();
@@ -636,11 +657,11 @@ class BlocksparseTransformerOp : public OpKernel {
     if (bench_) bench = new Benchmark(stream, bench_string_, 0, flops_ * (float)(batch_dim * state_dim), repeat_);
 
     for (int r = 0; r < repeat_; r++)
-      blocksparse_transformer_xn(stream, l_ptr, a_ptr, b_ptr, c_ptr, blk_size_, blocks_, batch_dim, ctx_blks_, heads_, head_state_, lut_heads, lut_dim, op, magic_, shift_, max_lut);
+      blocksparse_transformer_xn(stream, l_ptr, a_ptr, b_ptr, c_ptr, blk_size_, blocks_, batch_dim, ctx_blks_b_, ctx_blks_c_, heads_, head_state_, lut_heads, lut_dim, op, magic_, shift_, max_lut);
 
     if (bench) delete bench;
   }
-  int major_, heads_, blocks_, blk_size_, ctx_blks_, nn_max_, tn_max_, bench_, repeat_, flops_;
+  int major_, heads_, blocks_, blk_size_, ctx_blks_a_, ctx_blks_b_, ctx_blks_c_, nn_max_, tn_max_, bench_, repeat_, flops_;
   uint magic_, shift_, head_state_;
   char bench_string_[256];
 };
@@ -853,3 +874,125 @@ REGISTER_KERNEL_BUILDER(Name("BlocksparseMaskedSoftmaxGrad").Device(DEVICE_GPU).
 REGISTER_KERNEL_BUILDER(Name("BlocksparseMaskedSoftmaxGrad").Device(DEVICE_GPU).HostMemory("scale").TypeConstraint<uint32>("MT"),BlocksparseMaskedSoftmaxGradOp);
 REGISTER_KERNEL_BUILDER(Name("BlocksparseMaskedSoftmaxGrad").Device(DEVICE_GPU).HostMemory("scale").TypeConstraint<uint64>("MT"),BlocksparseMaskedSoftmaxGradOp);
 REGISTER_KERNEL_BUILDER(Name("BlocksparseSoftmaxGrad").Device(DEVICE_GPU).HostMemory("scale"),BlocksparseMaskedSoftmaxGradOp);
+
+
+template <typename TL> bool SoftmaxCrossEntropy(CUstream stream, ehalf* grad, float* loss, const ehalf* logits, const TL* labels, uint N, uint K);
+
+REGISTER_OP("SoftmaxCrossEntropy")
+    .Input("logits: half")
+    .Input("labels: TL")
+    .Output("loss: float")
+    .Output("grad: half")
+    .Attr("TL: { uint8, uint16, int32 }")
+    .SetShapeFn([](InferenceContext* ctx) {
+
+      ShapeHandle logits = ctx->input(0);
+
+      int rank = ctx->Rank(logits) - 1;
+      if (rank > 0)
+      {
+        std::vector<DimensionHandle> dims;
+        dims.reserve(rank);
+        for (int i = 0; i < rank; ++i)
+            dims.emplace_back(ctx->Dim(logits, i));
+
+        ctx->set_output(0, ctx->MakeShape(dims));
+        ctx->set_output(1, logits);
+      }
+      return Status::OK();
+    })
+    .Doc(R"doc(
+SoftmaxCrossEntropy
+)doc");
+
+template <typename TL>
+class SoftmaxCrossEntropyOp : public OpKernel
+{
+ public:
+  explicit SoftmaxCrossEntropyOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}
+  void Compute(OpKernelContext* ctx) override
+  {
+
+    const Tensor& logits = ctx->input(0);
+    const Tensor& labels = ctx->input(1);
+
+    uint rank = logits.dims() - 1;
+
+    uint K = logits.dim_size(rank);
+    uint N  = 1;
+    TensorShape l_shape;
+
+    for (uint i = 0; i < rank; i++)
+    {
+      N *= logits.dim_size(i);
+      l_shape.AddDim(logits.dim_size(i));
+    }
+
+    OP_REQUIRES(ctx, N == labels.shape().num_elements(), errors::InvalidArgument("Bad labels shape"));
+    OP_REQUIRES(ctx, (K & 7) == 0 || (K < 256 && (K & 1) == 0), errors::InvalidArgument("Feature dim needs to be multiple of 8 or multiple of 2 if less than 256"));
+    OP_REQUIRES(ctx, K <= 65536,   errors::InvalidArgument("Feature dim needs to be less than 64k"));
+
+    Tensor* loss = nullptr;
+    Tensor* grad = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, l_shape, &loss));
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(1, logits.shape(), &grad));
+
+
+    const ehalf* logits_ptr = (const ehalf*)logits.flat<EHALF>().data();
+    const    TL* labels_ptr = (const    TL*)labels.flat<TL>().data();
+          float*   loss_ptr = (float*)loss->flat<float>().data();
+          ehalf*   grad_ptr = (ehalf*)grad->flat<EHALF>().data();
+
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
+
+    SoftmaxCrossEntropy<TL>(stream, grad_ptr, loss_ptr, logits_ptr, labels_ptr, N, K);
+  }
+};
+
+REGISTER_KERNEL_BUILDER(Name("SoftmaxCrossEntropy").Device(DEVICE_GPU).TypeConstraint<uint8 >("TL"),SoftmaxCrossEntropyOp<uint8 >);
+REGISTER_KERNEL_BUILDER(Name("SoftmaxCrossEntropy").Device(DEVICE_GPU).TypeConstraint<uint16>("TL"),SoftmaxCrossEntropyOp<uint16>);
+REGISTER_KERNEL_BUILDER(Name("SoftmaxCrossEntropy").Device(DEVICE_GPU).TypeConstraint< int32>("TL"),SoftmaxCrossEntropyOp< int32>);
+
+
+
+bool SoftmaxCrossEntropyGrad(CUstream stream, uint SMs, ehalf* dx, const float* dy, const ehalf* y, uint NK, uint K);
+
+REGISTER_OP("SoftmaxCrossEntropyGrad")
+    .Input("y: half")
+    .Input("dy: float")
+    .Output("dx: half")
+    .SetShapeFn(UnchangedShape)
+    .Doc(R"doc(
+SoftmaxCrossEntropyGrad
+)doc");
+
+class SoftmaxCrossEntropyGradOp : public OpKernel
+{
+ public:
+  explicit SoftmaxCrossEntropyGradOp(OpKernelConstruction* ctx) : OpKernel(ctx), SMs_(0) {}
+  void Compute(OpKernelContext* ctx) override
+  {
+    if (SMs_ == 0)
+      SMs_ = GetCountSMs();
+
+    const Tensor&  y = ctx->input(0);
+    const Tensor& dy = ctx->input(1);
+
+    uint K  = y.dim_size(y.dims() - 1);
+    uint NK = y.shape().num_elements();
+
+    Tensor* dx = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, y.shape(), &dx));
+
+    const ehalf*  y_ptr = (const ehalf*)y.flat<EHALF>().data();
+    const float* dy_ptr = (const float*)dy.flat<float>().data();
+          ehalf* dx_ptr = (ehalf*)dx->flat<EHALF>().data();
+
+    CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
+
+    SoftmaxCrossEntropyGrad(stream, SMs_, dx_ptr, dy_ptr, y_ptr, NK, K);
+  }
+  uint SMs_;
+};
+
+REGISTER_KERNEL_BUILDER(Name("SoftmaxCrossEntropyGrad").Device(DEVICE_GPU),SoftmaxCrossEntropyGradOp);

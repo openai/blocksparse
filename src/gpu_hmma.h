@@ -1,4 +1,5 @@
-#include "gpu_types.h"
+#ifndef GPU_HMMA_H
+#define GPU_HMMA_H
 
 __device__ __forceinline__ uint div64(uint value, uint magic, uint shift)
 {
@@ -18,7 +19,7 @@ __device__ __forceinline__ uint div64(uint value, uint magic, uint shift)
     return result;
 }
 
-__device__ __forceinline__ uint to_half2(float* val)
+__device__ __forceinline__ uint to_half2(float* v)
 {
     uint ret;
     asm("{                     \n\t"
@@ -26,10 +27,20 @@ __device__ __forceinline__ uint to_half2(float* val)
         "cvt.rn.f16.f32 a, %1; \n\t"
         "cvt.rn.f16.f32 b, %2; \n\t"
         "mov.b32 %0, {a, b};   \n\t"
-        "}" : "=r"(ret) : "f"(val[0]),"f"(val[1]));
+        "}" : "=r"(ret) : "f"(v[0]),"f"(v[1]));
     return ret;
 }
-
+__device__ __forceinline__ uint to_half2(float2 v)
+{
+    uint ret;
+    asm("{                     \n\t"
+        ".reg .f16 a, b;       \n\t"
+        "cvt.rn.f16.f32 a, %1; \n\t"
+        "cvt.rn.f16.f32 b, %2; \n\t"
+        "mov.b32 %0, {a, b};   \n\t"
+        "}" : "=r"(ret) : "f"(v.x),"f"(v.y));
+    return ret;
+}
 __device__ __forceinline__ uint2 to_half4(float4 v)
 {
     uint2 r;
@@ -45,12 +56,69 @@ __device__ __forceinline__ uint2 to_half4(float4 v)
     return r;
 }
 
+__device__ __forceinline__ uint  load_half2(const ehalf* a)
+{
+    uint r;
+    asm volatile ("ld.global.nc.u32 %0, [%1];" : "=r"(r) : "l"(a));
+    return r;
+}
+__device__ __forceinline__ uint2 load_half4(const ehalf* a)
+{
+    uint2 r;
+    asm volatile ("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(a));
+    return r;
+}
+__device__ __forceinline__ uint4 load_half8(const ehalf* a)
+{
+    uint4 r;
+    asm volatile ("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];" : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(a));
+    return r;
+}
+
+__device__ __forceinline__ void store_half2(const ehalf* a, uint  v)
+{
+    asm volatile ("st.global.wb.u32 [%0], %1;" :: "l"(a), "r"(v));
+}
+__device__ __forceinline__ void store_half4(const ehalf* a, uint2 v)
+{
+    asm volatile ("st.global.wb.v2.u32 [%0], {%1, %2};" :: "l"(a), "r"(v.x), "r"(v.y));
+}
+__device__ __forceinline__ void store_half8(const ehalf* a, uint4 v)
+{
+    asm volatile ("st.global.wb.v4.u32 [%0], {%1, %2, %3, %4};" :: "l"(a), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+}
+
+__device__ __forceinline__ void zero_half2(const ehalf* a)
+{
+    asm volatile ("st.global.wb.u32 [%0], 0;" :: "l"(a));
+}
+__device__ __forceinline__ void zero_half4(const ehalf* a)
+{
+    asm volatile ("st.global.wb.v2.u32 [%0], {0, 0};" :: "l"(a));
+}
+__device__ __forceinline__ void zero_half8(const ehalf* a)
+{
+    asm volatile ("st.global.wb.v4.u32 [%0], {0, 0, 0, 0};" :: "l"(a));
+}
+
+__device__ __forceinline__ void reduce_half2(const ehalf* a, uint v)
+{
+# if CUDA_VERSION >= 9020
+    asm volatile ("red.gpu.global.add.noftz.f16x2 [%0], %1;" :: "l"(a), "r"(v) :);
+# else
+    // Not enabled in older versions of cuda.. just let the lib compile
+    // TODO: thwow a warning here.
+    asm volatile ("st.global.wb.u32 [%0], %1;" :: "l"(a), "r"(v));
+# endif
+}
+
+
 #define OP_N 0
 #define OP_T 1
 
-#define m16n16k16 0
-#define m8n32k16  1
-#define m8n8k16   2 // run inside of m16n16k16
+#define M16N16K16 0
+#define M8N32K16  1
+#define M8N8K16   2 // run inside of M16N16K16
 
 
 template <uint OP_A, uint TILE>
@@ -60,21 +128,21 @@ struct fragmentA
     __device__ __forceinline__ static uint get_idx(uint tid, uint stride, uint offset=0)
     {
         uint idx = 0;
-        if (TILE == m16n16k16)
+        if (TILE == M16N16K16)
         {
             if (OP_A == OP_T)
                 idx = (tid & 3)*stride + (tid & 4)*2 + (tid & 16)/4 + offset;
             else
                 idx = ((tid & 3) + (tid & 4)*2 + (tid & 16)/4) * stride + offset;
         }
-        else if (TILE == m8n32k16)
+        else if (TILE == M8N32K16)
         {
             if (OP_A == OP_T)
                 idx = (tid & 3)*stride + (tid & 16)/4 + offset;
             else
                 idx = ((tid & 3) + (tid & 16)/4) * stride + offset;
         }
-        else if (TILE == m8n8k16)
+        else if (TILE == M8N8K16)
         {
             if (OP_A == OP_N)
                 idx = ((tid & 3) + (tid & 16)/4) * stride + offset;
@@ -88,9 +156,9 @@ struct fragmentA
                 *(uint2*)&x[i*2] = *(uint2*)&hShare[idx + i*4*stride];
         else
             for (int i = 0; i < 2; i++)
-                // for m8n32k16 we concatonate two 8x8 blocks together to form an 8x16 block
+                // for M8N32K16 we concatonate two 8x8 blocks together to form an 8x16 block
                 // but the k dim is not contiguous accross the 2 blocks
-                *(uint4*)&x[i*4] = *(uint4*)&hShare[idx + (TILE == m8n32k16 ? i*64 : i*8)];
+                *(uint4*)&x[i*4] = *(uint4*)&hShare[idx + (TILE == M8N32K16 ? i*64 : i*8)];
     }
 };
 
@@ -101,19 +169,19 @@ struct fragmentB
     __device__ __forceinline__ static uint get_idx(uint tid, uint stride, uint offset=0)
     {
         uint idx = 0;
-        if (TILE == m16n16k16)
+        if (TILE == M16N16K16)
         {
             if (OP_B == OP_N)
                 idx = (tid & 3)*stride + (tid & 8)*1 + (tid & 16)/4 + offset;
             else
                 idx = ((tid & 3) + (tid & 8)*1 + (tid & 16)/4) * stride + offset;
         }
-        else if (TILE == m8n32k16)
+        else if (TILE == M8N32K16)
         {
             if (OP_B == OP_N)
                 idx = (tid & 3)*stride + (tid & 4)*2 + (tid & 8)*2 + (tid & 16)/4 + offset;
         }
-        else if (TILE == m8n8k16)
+        else if (TILE == M8N8K16)
         {
             if (OP_B == OP_T)
                 idx = ((tid & 3) + (tid & 16)/4) * stride + offset;
@@ -144,17 +212,17 @@ struct fragmentC
     __device__ __forceinline__ static uint get_idx(uint tid, uint stride, uint offset=0)
     {
         uint idx = 0;
-        if (TILE == m16n16k16)
+        if (TILE == M16N16K16)
             idx = ((tid & 1) + (tid & 4)*2 + (tid & 16)/4)*stride + (tid & 2) + (tid & 8) + offset;
-        else if (TILE == m8n32k16)
+        else if (TILE == M8N32K16)
             idx = ((tid & 1) + (tid & 16)/4)*stride + (tid & 2) + (tid & 4)*2 + (tid & 8)*2 + offset;
-        else if (TILE == m8n8k16)
+        else if (TILE == M8N8K16)
             idx = ((tid & 1) + (tid & 16)/4)*stride + (tid & 2) + offset;
         return idx;
     }
     __device__ __forceinline__ void store(ehalf* hShare, uint idx, uint stride)
     {
-        if (TILE == m8n8k16)
+        if (TILE == M8N8K16)
         {
             // only upper left 8x8 quandrant of 16x16 tile is valid (threads 0,1,2,3,16,17,18,19)
             bool valid = (threadIdx.x & 12) == 0;
@@ -175,7 +243,7 @@ struct fragmentC
     }
     __device__ __forceinline__ void store(float* fShare, uint idx, uint stride)
     {
-        if (TILE == m8n8k16)
+        if (TILE == M8N8K16)
         {
             // only upper left 8x8 quandrant of 16x16 tile is valid (threads 0,1,2,3,16,17,18,19)
             bool valid = (threadIdx.x & 12) == 0;
@@ -191,68 +259,32 @@ struct fragmentC
                     *(float2*)&fShare[idx + i*4 + j*2*stride] = *(float2*)&x[i*4 + j*2];
         }
     }
+
+#define MMA_SYNC(tile, opA, opB) \
+    asm("wmma.mma.sync." tile "." opA "." opB ".f32.f32     \n\t"   \
+        "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"   \
+        "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"   \
+        "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"   \
+        "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" : \
+        "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) : \
+        "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),  \
+        "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]))
+
     __device__ __forceinline__ void mma_sync(fragmentA<OP_A,TILE> &fragA, fragmentB<OP_B,TILE> &fragB)
     {
-        if (TILE == m16n16k16 || TILE == m8n8k16)
+        if (TILE == M16N16K16 || TILE == M8N8K16)
         {
-            if (OP_A == OP_N && OP_B == OP_N)
-            {
-                asm("wmma.mma.sync.m16n16k16.row.row.f32.f32            \n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
-                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
-            }
-            if (OP_A == OP_T && OP_B == OP_N)
-            {
-                asm("wmma.mma.sync.m16n16k16.col.row.f32.f32            \n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
-                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
-            }
-            if (OP_A == OP_N && OP_B == OP_T)
-            {
-                asm("wmma.mma.sync.m16n16k16.row.col.f32.f32            \n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
-                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
-            }
+            if (OP_A == OP_N && OP_B == OP_N) MMA_SYNC("m16n16k16", "row", "row");
+            if (OP_A == OP_T && OP_B == OP_N) MMA_SYNC("m16n16k16", "col", "row");
+            if (OP_A == OP_N && OP_B == OP_T) MMA_SYNC("m16n16k16", "row", "col");
         }
-        else if (TILE == m8n32k16)
+        else if (TILE == M8N32K16)
         {
-            if (OP_A == OP_N && OP_B == OP_N)
-            {
-                asm("wmma.mma.sync.m8n32k16.row.row.f32.f32             \n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
-                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
-            }
-            if (OP_A == OP_T && OP_B == OP_N)
-            {
-                asm("wmma.mma.sync.m8n32k16.col.row.f32.f32             \n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"
-                    "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"
-                    "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"
-                    "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 };\n\t" :
-                    "+f"(     x[0]), "+f"(     x[1]), "+f"(     x[2]), "+f"(     x[3]), "+f"(     x[4]), "+f"(     x[5]), "+f"(     x[6]), "+f"(     x[7]) :
-                    "r"(fragA.x[0]), "r"(fragA.x[1]), "r"(fragA.x[2]), "r"(fragA.x[3]), "r"(fragA.x[4]), "r"(fragA.x[5]), "r"(fragA.x[6]), "r"(fragA.x[7]),
-                    "r"(fragB.x[0]), "r"(fragB.x[1]), "r"(fragB.x[2]), "r"(fragB.x[3]), "r"(fragB.x[4]), "r"(fragB.x[5]), "r"(fragB.x[6]), "r"(fragB.x[7]));
-            }
+            if (OP_A == OP_N && OP_B == OP_N) MMA_SYNC("m8n32k16", "row", "row");
+            if (OP_A == OP_T && OP_B == OP_N) MMA_SYNC("m8n32k16", "col", "row");
         }
     }
 };
+
+
+#endif // GPU_HMMA_H

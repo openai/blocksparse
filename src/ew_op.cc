@@ -418,26 +418,30 @@ REGISTER_KERNEL_BUILDER(Name("EwDxdgDzxg").Device(DEVICE_GPU).TypeConstraint<BHA
 
 
 
-template <typename T, typename V> bool FilterInfinity(CUstream stream, uint SMs, T* grad, uint size, float scale, bool zero_nans);
+template <typename T, typename V> bool FilterTensor(CUstream stream, uint SMs, T* y, const T* x, uint size, float scale, float saturate, bool zero_infs, bool zero_nans);
 
-REGISTER_OP("FilterInfinity")
+REGISTER_OP("FilterTensor")
     .Input("x: T")
     .Input("scale: float")    // scalar host tensor
     .Output("y: T")
     .Attr("T: {half, float, bfloat16}")
-    .Attr("zero_nans: bool = true")
+    .Attr("saturate: float = 0.0")
+    .Attr("zero_infs: bool = false")
+    .Attr("zero_nans: bool = false")
     .SetShapeFn(UnchangedShape)
     .Doc(R"doc(
-scale tensor, saturate infinities, optionally filter nans.
+scale tensor, saturate or zero infinities, zero nans.
 )doc");
 
 template <typename T, typename V1, typename V4>
-class FilterInfinityOp : public OpKernel
+class FilterTensorOp : public OpKernel
 {
  public:
-  explicit FilterInfinityOp(OpKernelConstruction* ctx) : OpKernel(ctx), SMs_(0)
+  explicit FilterTensorOp(OpKernelConstruction* ctx) : OpKernel(ctx), SMs_(0)
   {
-    OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_nans", &zero_nans_ ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("saturate",   &saturate_   ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_infs",  &zero_infs_  ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("zero_nans",  &zero_nans_  ));
   }
   void Compute(OpKernelContext* ctx) override
   {
@@ -445,22 +449,29 @@ class FilterInfinityOp : public OpKernel
       SMs_ = GetCountSMs();
 
     const Tensor& x = ctx->input(0);
-    float scale = ctx->input(1).scalar<float>()();
-    ctx->set_output(0, x);
-    int size = x.shape().num_elements();
+    float scale     = ctx->input(1).scalar<float>()();
+    int   size      = x.shape().num_elements();
 
-    V1* x_ptr = (V1*)x.flat<T>().data();
+    Tensor* y = nullptr;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, x.shape(), &y));
+
+
+    const V1* x_ptr = (const V1*)x.flat<T>().data();
+          V1* y_ptr = (      V1*)y->flat<T>().data();
 
     CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
-    FilterInfinity<V1,V4>(stream, SMs_, x_ptr, size, scale, zero_nans_);
+    //printf("scale: %f\n", scale);
+
+    FilterTensor<V1,V4>(stream, SMs_, y_ptr, x_ptr, size, scale, saturate_, zero_infs_, zero_nans_);
   }
-  bool zero_nans_;
+  float saturate_;
+  bool zero_infs_, zero_nans_;
   uint SMs_;
 };
-REGISTER_KERNEL_BUILDER(Name("FilterInfinity").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T").HostMemory("scale"),FilterInfinityOp<FLOAT,float,float4>);
-REGISTER_KERNEL_BUILDER(Name("FilterInfinity").Device(DEVICE_GPU).TypeConstraint<EHALF>("T").HostMemory("scale"),FilterInfinityOp<EHALF,ehalf,ehalf4>);
-REGISTER_KERNEL_BUILDER(Name("FilterInfinity").Device(DEVICE_GPU).TypeConstraint<BHALF>("T").HostMemory("scale"),FilterInfinityOp<BHALF,bhalf,bhalf4>);
+REGISTER_KERNEL_BUILDER(Name("FilterTensor").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T").HostMemory("scale"),FilterTensorOp<FLOAT,float,float4>);
+REGISTER_KERNEL_BUILDER(Name("FilterTensor").Device(DEVICE_GPU).TypeConstraint<EHALF>("T").HostMemory("scale"),FilterTensorOp<EHALF,ehalf,ehalf4>);
+REGISTER_KERNEL_BUILDER(Name("FilterTensor").Device(DEVICE_GPU).TypeConstraint<BHALF>("T").HostMemory("scale"),FilterTensorOp<BHALF,bhalf,bhalf4>);
 
 
 

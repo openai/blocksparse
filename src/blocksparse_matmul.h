@@ -19,17 +19,28 @@ cudaError_t BsmmGatedXprop_CN(const TX* X, const TW* W, TY* Y, bsmm_params* para
 template <CTYPE3(TX, TE, TU)>
 cudaError_t BsmmGatedUpdat_CN(const TX* X, const TE* E, TU* U, bsmm_params* params);
 
+cudaError_t hgemm_blocksparse_xn_sdd(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params, uint op);
+cudaError_t hgemm_blocksparse_xn_sdd(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params, uint op);
+cudaError_t hgemm_blocksparse_xn_sdd(const float* X, const float* W, float* Y, bsmm_params* params, uint op);
+cudaError_t hgemm_blocksparse_nt_dds(const ehalf* X, const ehalf* E, ehalf* U, bsmm_params* params);
+cudaError_t hgemm_blocksparse_nt_dds(const bhalf* X, const bhalf* E, bhalf* U, bsmm_params* params);
+cudaError_t hgemm_blocksparse_nt_dds(const float* X, const float* E, float* U, bsmm_params* params);
+
+
 template <CTYPE3(TA,TB,TC)>
 class BlocksparseMatmul
 {
 public:
-    BlocksparseMatmul(bsmm_params* params) : params_(params) {}
+    BlocksparseMatmul(bsmm_params* params) : params_(params), major_(0) {}
     virtual ~BlocksparseMatmul() {}
 
     virtual Status Compute(const TA* A, const TB* B, TC* C) =0;
 
     bsmm_params* params_;
+    int major_;
 };
+
+int GetCountSMsVersion(int* major, int* minor);
 
 
 template <CTYPE3(TA,TB,TC)>
@@ -41,11 +52,17 @@ public:
 
     virtual Status Compute(const TA* A, const TB* B, TC* C)
     {
+        if (this->major_ == 0)
+            GetCountSMsVersion(&this->major_, NULL);
+
         cudaError_t res;
-        if (this->params_->Gate == NULL)
-            res = BsmmXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        if (this->major_ >= 7 && std::is_same<TA, ehalf>::value)
+            res = hgemm_blocksparse_xn_sdd(A, B, C, this->params_, 1);
         else
-            res = BsmmGatedXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+            if (this->params_->Gate == NULL)
+                res = BsmmXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+            else
+                res = BsmmGatedXprop_CN<true,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
 
         if (cudaSuccess != res)
             return errors::Internal(cudaGetErrorString(res));
@@ -61,11 +78,17 @@ public:
 
     virtual Status Compute(const TA* A, const TB* B, TC* C)
     {
+        if (this->major_ == 0)
+            GetCountSMsVersion(&this->major_, NULL);
+
         cudaError_t res;
-        if (this->params_->Gate == NULL)
-            res = BsmmXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        if (this->major_ >= 7 && std::is_same<TA, ehalf>::value)
+            res = hgemm_blocksparse_xn_sdd(A, B, C, this->params_, 0);
         else
-            res = BsmmGatedXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+            if (this->params_->Gate == NULL)
+                res = BsmmXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+            else
+                res = BsmmGatedXprop_CN<false,VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
 
         if (cudaSuccess != res)
             return errors::Internal(cudaGetErrorString(res));
@@ -81,11 +104,17 @@ public:
 
     virtual Status Compute(const TA* A, const TB* B, TC* C)
     {
+        if (this->major_ == 0)
+            GetCountSMsVersion(&this->major_, NULL);
+
         cudaError_t res;
-        if (this->params_->Gate == NULL)
-            res = BsmmUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+        if (this->major_ >= 7 && std::is_same<TA, ehalf>::value)
+            res = hgemm_blocksparse_nt_dds(A, B, C, this->params_);
         else
-            res = BsmmGatedUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+            if (this->params_->Gate == NULL)
+                res = BsmmUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
+            else
+                res = BsmmGatedUpdat_CN<VTYPE3(TA,TB,TC)>(A, B, C, this->params_);
 
         if (cudaSuccess != res)
             return errors::Internal(cudaGetErrorString(res));

@@ -12,6 +12,438 @@ from tensorflow.python.framework import ops
 data_files_path = tf.resource_loader.get_data_files_path()
 _op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
 
+
+############################## Blocksparse Transformer #####################################
+
+
+import scipy.sparse as sparse
+
+blocksparse_transformer_nt = _op_module.blocksparse_transformer_nt
+blocksparse_transformer_nn = _op_module.blocksparse_transformer_nn
+blocksparse_transformer_tn = _op_module.blocksparse_transformer_tn
+
+blocksparse_masked_softmax      = _op_module.blocksparse_masked_softmax
+blocksparse_masked_softmax_grad = _op_module.blocksparse_masked_softmax_grad
+
+blocksparse_softmax      = _op_module.blocksparse_softmax
+blocksparse_softmax_grad = _op_module.blocksparse_softmax_grad
+
+# save a bit of gpu memory by only creating one copy of identical constant lookup tables
+g_lookup_cache = dict(nt=list(), nn=list(), tn=list(), sm=list())
+
+def get_constant(lut, name):
+    global g_lookup_cache
+
+    default_graph = tf.get_default_graph()
+    for np_entry, tf_entry in g_lookup_cache[name]:
+        if np_entry.dtype == lut.dtype and np_entry.shape == lut.shape and tf_entry.graph is default_graph:
+            if np.abs(np_entry.astype(np.int64) - lut.astype(np.int64)).sum() == 0:
+                # found an exact match
+                return tf_entry
+
+    tf_entry = tf.constant(lut, name=name+"_lut")
+    g_lookup_cache[name].append( (lut, tf_entry) )
+    return tf_entry
+
+
+class BlocksparseTransformer(object):
+
+    # TODO: support save restore of this object..
+    # but for now just rely on hyperparameter regeneration of the object state
+    # def __getstate__(self):
+    #     return (self.layout, self.blk_size, self.softmax_mask, self.name)
+
+    # def __setstate__(self, state):
+    #     self.__init__(*state)
+
+    def __init__(self, layout, block_size=64, heads=None, mask_callback=None, name=None):
+
+        if len(layout.shape) == 2:
+            assert heads is not None, "heads must be explicitly specified when using shared layouts per head"
+            # broadcast same layout over all heads
+            layout = np.expand_dims(layout, 0)
+
+        if heads is None:
+            heads = layout.shape[0]
+
+        assert block_size in (8,16,32,64), "Block sizes of 8, 16, 32 and 64 currently supported"
+        assert len(layout.shape) == 3, "bad layout shape: " + str(layout.shape)
+
+        #self.layout       = layout > 0  # save boolean version for serialization purposes, TODO: save packbits or csr version
+        self.blk_size     = block_size
+        self.name         = name
+        self.heads        = heads
+        self.lut_heads    = layout.shape[0]
+        self.ctx_blks_q   = layout.shape[1]
+        self.ctx_blks_k   = layout.shape[2]
+        self.blk_shape    = (block_size, block_size)
+        self.nn_max       = 0
+        self.tn_max       = 0
+
+        if layout.dtype != np.int32:
+            layout = layout.astype(np.int32)
+
+        self.nt_lut  = list()
+        self.nn_lut  = list()
+        self.tn_lut  = list()
+        self.nt_list = list()
+        self.nn_list = list()
+        self.tn_list = list()
+        blocks = None
+        for head in range(layout.shape[0]):
+
+            # convert to csr for vastly more efficient python iteration on large sparse layouts
+            csr = sparse.csr_matrix(layout[head,:,:])
+            ys, xs, bs = sparse.find(csr) # xs is in sorted order by default
+            if blocks is None:
+                blocks = len(bs)
+            else:
+                assert len(bs) == blocks, "number of layout blocks must be equal across heads"
+
+            # make blocks contiguous along the rows (softmax code leverages this for increased performance)
+            nt_list = sorted( zip(ys, xs) )
+            ys = [b[0] for b in nt_list]
+            xs = [b[1] for b in nt_list]
+
+            nt_lut = np.array(nt_list, dtype=np.int32)
+            nn_lut, nn_list, nn_max = self.xn_lut(ys, xs, blocks, self.ctx_blks_q)
+            tn_lut, tn_list, tn_max = self.xn_lut(xs, ys, blocks, self.ctx_blks_k)
+
+            self.nt_lut.append(nt_lut)
+            self.nn_lut.append(nn_lut)
+            self.tn_lut.append(tn_lut)
+            self.nt_list.append(nt_list)
+            self.nn_list.append(nn_list)
+            self.tn_list.append(tn_list)
+            self.nn_max = max(self.nn_max, nn_max)
+            self.tn_max = max(self.tn_max, tn_max)
+
+        self.blocks = blocks
+        self.nt_lut = np.array(self.nt_lut, dtype=np.int32)
+        self.nn_lut = np.array(self.nn_lut, dtype=np.int32)
+        self.tn_lut = np.array(self.tn_lut, dtype=np.int32)
+
+        if mask_callback is not None:
+            self.init_softmax_mask(mask_callback)
+        else:
+            self.softmax_mask    = None
+            self.softmax_mask_np = None
+
+    def init_softmax_mask(self, mask_callback):
+
+        if self.blk_size == 64:
+            dtype = np.uint64
+        elif self.blk_size == 32:
+            dtype = np.uint32
+        elif self.blk_size == 16:
+            dtype = np.uint16
+        else:
+            dtype = np.uint8
+
+        masks = []
+        # for now assume one softmax mask per sparsity specificaiton
+        for h in range(self.lut_heads):
+            head_mask = []
+            for b, (q, k) in enumerate(self.nt_list[h]):
+                mask = mask_callback(self.blk_shape, h, q, k, b)
+                bits = np.packbits(mask.reshape(-1,8)[:,::-1]).view(dtype)
+                head_mask.append(bits)
+            masks.append(head_mask)
+
+        # numpy mask for test code
+        self.softmax_mask_np = np.array(masks, dtype=dtype) # heads, blocks, blk_size
+        # tf mask for kernels.  Transpose to:                 heads, blk_size, blocks
+        self.softmax_mask = np.transpose(self.softmax_mask_np, [0, 2, 1]).copy()
+
+    def xn_lut(self, ys, xs, blocks, ctx_blks):
+
+        # build list of y's connected to each x and map to block id
+        py_lut = [list() for y in range(ctx_blks)]
+        for b in range(blocks):
+            py_lut[ ys[b] ].append(( b, xs[b] ))
+
+        # build header into variable lengh lookup tables (luts)
+        # the header contains the offset and size of the lut for that output block
+        max_lut = 0
+        offset  = ctx_blks
+        np_lut  = np.empty((offset + blocks, 2), dtype=np.int32)
+
+        for i, lut in enumerate(py_lut):
+            np_lut[i] = offset,  len(lut)
+            max_lut = max(max_lut, len(lut))
+            for entry in lut:
+                np_lut[offset] = entry
+                offset += 1
+
+        return np_lut, py_lut, max_lut
+
+    # return the coordinate (q, k) in the layout that corresponds to a given block id
+    def block_coord(self, block, head=0): return self.nt_list[head][block]
+
+    def nt_test(self, A, B):
+        # A and B have shape (batch, ctx_size, state_size)
+        # reshape to         (batch, ctx_blks, blk_size, heads, head_state)
+        shapeA = list(A.shape)
+        shapeB = list(B.shape)
+        shapeA[1:] = [self.ctx_blks_q, self.blk_size, self.heads, shapeA[2]//self.heads]
+        shapeB[1:] = [self.ctx_blks_k, self.blk_size, self.heads, shapeB[2]//self.heads]
+        batch_size = shapeA[0]
+
+        A = A.reshape(shapeA)
+        B = B.reshape(shapeB)
+        C = np.empty([batch_size, self.heads, self.blocks, self.blk_size, self.blk_size], dtype=np.float32)
+        for n in range(batch_size):
+            for h in range(self.heads):
+                lut_head = h if self.lut_heads > 1 else 0
+                for b, (y, x) in enumerate(self.nt_list[lut_head]):
+                    C[n,h,b,:,:] = np.dot( A[n,y,:,h,:], B[n,x,:,h,:].T )
+        return C
+
+    def nn_test(self, A, B):
+        # B and C have shape (batch, ctx_size, state_size)
+        # reshape to         (batch, ctx_blks, blk_size, heads, head_state)
+        shapeB     = list(B.shape)
+        state_size = shapeB[2]
+        shapeB[1:] = [self.ctx_blks_k, self.blk_size, self.heads, state_size//self.heads]
+        shapeC     = list(shapeB)
+        shapeC[1:] = [self.ctx_blks_q, self.blk_size, self.heads, state_size//self.heads]
+        batch_size = shapeC[0]
+
+        B = B.reshape(shapeB)
+        C = np.zeros(shapeC, dtype=np.float32)
+        for n in range(batch_size):
+            for h in range(self.heads):
+                lut_head = h if self.lut_heads > 1 else 0
+                for x, lut in enumerate(self.nn_list[lut_head]):
+                    for b, y in lut:
+                        C[n,x,:,h,:] += np.dot( A[n,h,b,:,:], B[n,y,:,h,:] )
+        return C.reshape([batch_size, self.ctx_blks_q * self.blk_size, state_size])
+
+    def tn_test(self, A, B):
+        # B and C have shape (batch, ctx_size, state_size)
+        # reshape to         (batch, ctx_blks, blk_size, heads, head_state)
+        shapeB     = list(B.shape)
+        state_size = shapeB[2]
+        shapeB[1:] = [self.ctx_blks_q, self.blk_size, self.heads, state_size//self.heads]
+        shapeC     = list(shapeB)
+        shapeC[1:] = [self.ctx_blks_k, self.blk_size, self.heads, state_size//self.heads]
+        batch_size = shapeC[0]
+
+        B = B.reshape(shapeB)
+        C = np.zeros(shapeC, dtype=np.float32)
+        for n in range(batch_size):
+            for h in range(self.heads):
+                lut_head = h if self.lut_heads > 1 else 0
+                for x, lut in enumerate(self.tn_list[lut_head]):
+                    for b, y in lut:
+                        C[n,x,:,h,:] += np.dot( A[n,h,b,:,:].T, B[n,y,:,h,:] )
+        return C.reshape([batch_size, self.ctx_blks_k * self.blk_size, state_size])
+
+
+    def masked_softmax_test(self, x, scale=1.0):
+
+        y = np.empty_like(x)
+        m = self.softmax_mask_np # heads, blocks, blk_size
+        bsize = self.blk_size
+        for n in range(x.shape[0]):
+            for h in range(x.shape[1]):
+                hl = h if self.lut_heads > 1 else 0
+                for lut in self.nn_list[hl]:
+                    xm = np.full((len(lut), bsize * bsize), -np.finfo(np.float32).max, dtype=np.float32)
+                    for i, (b, k) in enumerate(lut):
+                        xb = x[n,h,b,:,:].reshape(-1)
+                        if m is None:
+                            # apply scale
+                            xm[i,:] = xb * scale
+                        else:
+                            # apply mask and scale to x block
+                            mask  = np.unpackbits(m[hl,b,:].view(np.uint8)).reshape(-1,8)[:,::-1].reshape(-1)
+                            nzIdx = np.nonzero(mask)
+                            xm[i,nzIdx] = xb[nzIdx] * scale
+                    # compute softmax for collection of k blocks
+                    xm = xm.reshape((len(lut), bsize, bsize))
+                    xm = np.exp(xm - np.max(xm, axis=(0,2), keepdims=True))
+                    ym = xm / np.sum(xm, axis=(0,2), keepdims=True)
+                    for i, (b, k) in enumerate(lut):
+                        y[n,h,b,:,:] = ym[i]
+        return y
+
+
+    def masked_softmax_grad_test(self, dy, y, scale=1.0):
+
+        dx = np.empty_like(dy)
+        for n in range(dy.shape[0]):
+            for h in range(dy.shape[1]):
+                hl = h if self.lut_heads > 1 else 0
+                for lut in self.nn_list[hl]:
+
+                    bs  = [ b for b, k in lut ]
+                    dyb = dy[n,h,bs,:,:]
+                    yb  =  y[n,h,bs,:,:]
+
+                    dxb = (dyb - np.sum(dyb * yb, axis=(0,2), keepdims=True)) * yb * scale
+
+                    for i, (b, k) in enumerate(lut):
+                        dx[n,h,b,:,:] = dxb[i,:,:]
+        return dx
+
+    def get_lut_constants(self):
+        return get_constant(self.nt_lut, name="nt"), get_constant(self.nn_lut, name="nn"), get_constant(self.tn_lut, name="tn")
+
+    def nt_op(self, a, b, name=None, bench=0):
+        nt_lut, nn_lut, tn_lut = self.get_lut_constants()
+
+        return blocksparse_transformer_nt(
+            a, b, nt_lut, nn_lut, tn_lut, CT=tf.float16,
+            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_a=self.ctx_blks_q, ctx_blks_b=self.ctx_blks_k,
+            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
+        )
+
+    def nn_op(self, a, b, name=None, bench=0):
+        nt_lut, nn_lut, tn_lut = self.get_lut_constants()
+
+        return blocksparse_transformer_nn(
+            a, b, nt_lut, nn_lut, tn_lut,
+            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_b=self.ctx_blks_k, ctx_blks_c=self.ctx_blks_q,
+            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
+        )
+
+    def tn_op(self, a, b, name=None, bench=0):
+        nt_lut, nn_lut, tn_lut = self.get_lut_constants()
+
+        return blocksparse_transformer_tn(
+            a, b, nt_lut, nn_lut, tn_lut,
+            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_b=self.ctx_blks_q, ctx_blks_c=self.ctx_blks_k,
+            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
+        )
+
+    def query_key_op(self, q, k, name=None, bench=0):
+        nt_lut, nn_lut, tn_lut = self.get_lut_constants()
+
+        return blocksparse_transformer_nt(
+            q, k, nt_lut, nn_lut, tn_lut, CT=tf.bfloat16,
+            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_a=self.ctx_blks_q, ctx_blks_b=self.ctx_blks_k,
+            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
+        )
+
+    def weight_value_op(self, w, v, name=None, bench=0):
+        nt_lut, nn_lut, tn_lut = self.get_lut_constants()
+
+        return blocksparse_transformer_nn(
+            w, v, nt_lut, nn_lut, tn_lut,
+            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_b=self.ctx_blks_k, ctx_blks_c=self.ctx_blks_q,
+            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
+        )
+
+    def masked_softmax(self, x, scale=1.0):
+        if self.softmax_mask is None:
+            return self.softmax(x, scale)
+
+        nn_lut  = get_constant(self.nn_lut,       name="nn")
+        sm_mask = get_constant(self.softmax_mask, name="sm")
+
+        return blocksparse_masked_softmax(x, scale, nn_lut, sm_mask, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks_q, lut_max=self.nn_max)
+
+    def softmax(self, x, scale=1.0):
+        nn_lut = get_constant(self.nn_lut, name="nn")
+
+        return blocksparse_softmax(x, scale, nn_lut, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks_q, lut_max=self.nn_max)
+
+
+#  w  = q    . k.T
+#  QK = QC   . KC.T   16x16 = 16x64   . 16x64.T
+#  QC = QK   . KC     16x64 = 16x16   . 16x64
+#  KC = QK.T . QC     16x64 = 16x16.T . 16x64
+
+@ops.RegisterGradient("BlocksparseTransformerNT")
+def blocksparse_transformer_nt_grad(op, dw):
+
+    heads      = op.get_attr("heads")
+    blocks     = op.get_attr("blocks")
+    blk_size   = op.get_attr("blk_size")
+    ctx_blks_q = op.get_attr("ctx_blks_a")
+    ctx_blks_k = op.get_attr("ctx_blks_b")
+    nn_max     = op.get_attr("nn_max")
+    tn_max     = op.get_attr("tn_max")
+    bench      = op.get_attr("bench")
+    q, k, nt_lut, nn_lut, tn_lut = op.inputs
+
+    dq = blocksparse_transformer_nn(
+        dw, k, nt_lut, nn_lut, tn_lut,
+        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_k, ctx_blks_c=ctx_blks_q,
+        nn_max=nn_max, tn_max=tn_max, bench=bench)
+
+    dk = blocksparse_transformer_tn(
+        dw, q, nt_lut, nn_lut, tn_lut,
+        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_q, ctx_blks_c=ctx_blks_k,
+        nn_max=nn_max, tn_max=tn_max, bench=bench)
+
+    return (dq, dk, None, None, None)
+
+#  y  = w    . v
+#  QC = QK   . VC     16x64 = 16x16   . 16x64
+#  QK = QC   . VC.T   16x16 = 16x64   . 16x64.T
+#  VC = QK.T . QC     16x64 = 16x16.T . 16x64
+
+@ops.RegisterGradient("BlocksparseTransformerNN")
+def blocksparse_transformer_nn_grad(op, dy):
+
+    heads      = op.get_attr("heads")
+    blocks     = op.get_attr("blocks")
+    blk_size   = op.get_attr("blk_size")
+    ctx_blks_k = op.get_attr("ctx_blks_b")
+    ctx_blks_q = op.get_attr("ctx_blks_c")
+    nn_max     = op.get_attr("nn_max")
+    tn_max     = op.get_attr("tn_max")
+    bench      = op.get_attr("bench")
+    w, v, nt_lut, nn_lut, tn_lut = op.inputs
+
+    dw = blocksparse_transformer_nt(
+        dy, v, nt_lut, nn_lut, tn_lut, CT=tf.float16,
+        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_a=ctx_blks_q, ctx_blks_b=ctx_blks_k,
+        nn_max=nn_max, tn_max=tn_max, bench=bench)
+
+    dv = blocksparse_transformer_tn(
+        w, dy, nt_lut, nn_lut, tn_lut,
+        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_q, ctx_blks_c=ctx_blks_k,
+        nn_max=nn_max, tn_max=tn_max, bench=bench)
+
+    return (dw, dv, None, None, None)
+
+
+@ops.RegisterGradient("BlocksparseMaskedSoftmax")
+def blocksparse_masked_softmax_op_grad(op, dy):
+
+    blocks   = op.get_attr("blocks")
+    blk_size = op.get_attr("blk_size")
+    ctx_blks = op.get_attr("ctx_blks")
+    lut_max  = op.get_attr("lut_max")
+    y        = op.outputs[0]
+    scale    = op.inputs[1]
+    lut      = op.inputs[2]
+    mask     = op.inputs[3]
+
+    dx = blocksparse_masked_softmax_grad(dy, y, scale, lut, mask, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks, lut_max=lut_max)
+
+    return (dx, None, None, None)
+
+@ops.RegisterGradient("BlocksparseSoftmax")
+def blocksparse_softmax_op_grad(op, dy):
+
+    blocks   = op.get_attr("blocks")
+    blk_size = op.get_attr("blk_size")
+    ctx_blks = op.get_attr("ctx_blks")
+    lut_max  = op.get_attr("lut_max")
+    y        = op.outputs[0]
+    scale    = op.inputs[1]
+    lut      = op.inputs[2]
+
+    dx = blocksparse_softmax_grad(dy, y, scale, lut, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks, lut_max=lut_max)
+
+    return (dx, None, None)
+
+
+
 ############################## Top-K #####################################
 
 
@@ -203,422 +635,20 @@ def transpose_0213(x):
 def transpose_0213_grad(op, dy):
     return transpose_0213_op(dy)
 
+############################## Softmax Cross Entropy #####################################
 
-############################## Blocksparse Transformer #####################################
 
+softmax_cross_entropy_op      = _op_module.softmax_cross_entropy
+softmax_cross_entropy_grad_op = _op_module.softmax_cross_entropy_grad
 
-import scipy.sparse as sparse
+def softmax_cross_entropy(logits=None, labels=None):
+    assert logits is not None and labels is not None
+    assert logits.shape[-1].value <= 65536, "use tf.sparse_softmax_cross_entropy_with_logits if feature dim is greater than 64k"
 
-blocksparse_transformer_nt = _op_module.blocksparse_transformer_nt
-blocksparse_transformer_nn = _op_module.blocksparse_transformer_nn
-blocksparse_transformer_tn = _op_module.blocksparse_transformer_tn
+    loss, _ = softmax_cross_entropy_op(logits, labels)
+    return loss
 
-blocksparse_masked_softmax      = _op_module.blocksparse_masked_softmax
-blocksparse_masked_softmax_grad = _op_module.blocksparse_masked_softmax_grad
+@ops.RegisterGradient("SoftmaxCrossEntropy")
+def softmax_cross_entropy_grad(op, dy, _):
+    return softmax_cross_entropy_grad_op(op.outputs[1], dy), None
 
-blocksparse_softmax      = _op_module.blocksparse_softmax
-blocksparse_softmax_grad = _op_module.blocksparse_softmax_grad
-
-# save a bit of gpu memory by only creating one copy of identical constant lookup tables
-g_lookup_cache = dict(nt=list(), nn=list(), tn=list(), sm=list())
-
-def get_constant(lut, name):
-    global g_lookup_cache
-
-    default_graph = tf.get_default_graph()
-    for np_entry, tf_entry in g_lookup_cache[name]:
-        if np_entry.dtype == lut.dtype and np_entry.shape == lut.shape and tf_entry.graph is default_graph:
-            if np.abs(np_entry.astype(np.int64) - lut.astype(np.int64)).sum() == 0:
-                # found an exact match
-                return tf_entry
-
-    tf_entry = tf.constant(lut, name=name+"_lut")
-    g_lookup_cache[name].append( (lut, tf_entry) )
-    return tf_entry
-
-
-class BlocksparseTransformer(object):
-
-    # TODO: support save restore of this object..
-    # but for now just rely on hyperparameter regeneration of the object state
-    # def __getstate__(self):
-    #     return (self.layout, self.blk_size, self.softmax_mask, self.name)
-
-    # def __setstate__(self, state):
-    #     self.__init__(*state)
-
-    def __init__(self, layout, block_size=64, heads=None, mask_callback=None, name=None):
-
-        if len(layout.shape) == 2:
-            assert heads is not None, "heads must be explicitly specified when using shared layouts per head"
-            # broadcast same layout over all heads
-            layout = np.expand_dims(layout, 0)
-
-        if heads is None:
-            heads = layout.shape[0]
-
-        assert block_size in (8,16,32,64), "Block sizes of 8, 16, 32 and 64 currently supported"
-        assert len(layout.shape) == 3, "bad layout shape: " + str(layout.shape)
-        assert layout.shape[1] == layout.shape[2], "layout should be square"
-
-        #self.layout       = layout > 0  # save boolean version for serialization purposes, TODO: save packbits or csr version
-        self.blk_size     = block_size
-        self.name         = name
-        self.heads        = heads
-        self.lut_heads    = layout.shape[0]
-        self.ctx_blks     = layout.shape[1]
-        self.blk_shape    = (block_size, block_size)
-        self.nn_max       = 0
-        self.tn_max       = 0
-
-        if layout.dtype != np.int32:
-            layout = layout.astype(np.int32)
-
-        self.nt_lut  = list()
-        self.nn_lut  = list()
-        self.tn_lut  = list()
-        self.nt_list = list()
-        self.nn_list = list()
-        self.tn_list = list()
-        blocks = None
-        for head in range(layout.shape[0]):
-
-            # convert to csr for vastly more efficient python iteration on large sparse layouts
-            csr = sparse.csr_matrix(layout[head,:,:])
-            ys, xs, bs = sparse.find(csr) # xs is in sorted order by default
-            if blocks is None:
-                blocks = len(bs)
-            else:
-                assert len(bs) == blocks, "number of layout blocks must be equal across heads"
-
-            # make blocks contiguous along the rows (softmax code leverages this for increased performance)
-            nt_list = sorted( zip(ys, xs) )
-            ys = [b[0] for b in nt_list]
-            xs = [b[1] for b in nt_list]
-
-            nt_lut = np.array(nt_list, dtype=np.int32)
-            nn_lut, nn_list, nn_max = self.xn_lut(ys, xs, blocks)
-            tn_lut, tn_list, tn_max = self.xn_lut(xs, ys, blocks)
-
-            self.nt_lut.append(nt_lut)
-            self.nn_lut.append(nn_lut)
-            self.tn_lut.append(tn_lut)
-            self.nt_list.append(nt_list)
-            self.nn_list.append(nn_list)
-            self.tn_list.append(tn_list)
-            self.nn_max = max(self.nn_max, nn_max)
-            self.tn_max = max(self.tn_max, tn_max)
-
-        self.blocks = blocks
-        self.nt_lut = get_constant(np.array(self.nt_lut, dtype=np.int32), name="nt")
-        self.nn_lut = get_constant(np.array(self.nn_lut, dtype=np.int32), name="nn")
-        self.tn_lut = get_constant(np.array(self.tn_lut, dtype=np.int32), name="tn")
-
-        if mask_callback is not None:
-            self.init_softmax_mask(mask_callback)
-        else:
-            self.softmax_mask    = None
-            self.softmax_mask_np = None
-
-    def init_softmax_mask(self, mask_callback):
-
-        if self.blk_size == 64:
-            dtype = np.uint64
-        elif self.blk_size == 32:
-            dtype = np.uint32
-        elif self.blk_size == 16:
-            dtype = np.uint16
-        else:
-            dtype = np.uint8
-
-        masks = []
-        # for now assume one softmax mask per sparsity specificaiton
-        for h in range(self.lut_heads):
-            head_mask = []
-            for b, (q, k) in enumerate(self.nt_list[h]):
-                mask = mask_callback(self.blk_shape, h, q, k, b)
-                bits = np.packbits(mask.reshape(-1,8)[:,::-1]).view(dtype)
-                head_mask.append(bits)
-            masks.append(head_mask)
-
-        # numpy mask for test code
-        self.softmax_mask_np = np.array(masks, dtype=dtype) # heads, blocks, blk_size
-        # tf mask for kernels.  Transpose to:      heads, blk_size, blocks
-        self.softmax_mask    = get_constant(np.transpose(self.softmax_mask_np, [0, 2, 1]).copy(), name="sm")
-
-    def xn_lut(self, ys, xs, blocks):
-
-        # build list of y's connected to each x and map to block id
-        py_lut = [list() for y in range(self.ctx_blks)]
-        for b in range(blocks):
-            py_lut[ ys[b] ].append(( b, xs[b] ))
-
-        # build header into variable lengh lookup tables (luts)
-        # the header contains the offset and size of the lut for that output block
-        max_lut = 0
-        offset  = self.ctx_blks
-        np_lut  = np.empty((offset + blocks, 2), dtype=np.int32)
-
-        for i, lut in enumerate(py_lut):
-            np_lut[i] = offset,  len(lut)
-            max_lut = max(max_lut, len(lut))
-            for entry in lut:
-                np_lut[offset] = entry
-                offset += 1
-
-        return np_lut, py_lut, max_lut
-
-    # return the coordinate (q, k) in the layout that corresponds to a given block id
-    def block_coord(self, block, head=0): return self.nt_list[head][block]
-
-    def nt_test(self, A, B):
-        # A and B have shape (batch, ctx_size, state_size)
-        # reshape to         (batch, ctx_blks, blk_size, heads, head_state)
-        shape = list(A.shape)
-        shape[1:] = [self.ctx_blks, self.blk_size, self.heads, shape[2]//self.heads]
-        batch_size = shape[0]
-
-        A = A.reshape(shape)
-        B = B.reshape(shape)
-        C = np.empty([batch_size, self.heads, self.blocks, self.blk_size, self.blk_size], dtype=np.float32)
-        for n in range(batch_size):
-            for h in range(self.heads):
-                lut_head = h if self.lut_heads > 1 else 0
-                for b, (y, x) in enumerate(self.nt_list[lut_head]):
-                    C[n,h,b,:,:] = np.dot( A[n,y,:,h,:], B[n,x,:,h,:].T )
-        return C
-
-    def nn_test(self, A, B):
-        # B and C have shape (batch, ctx_size, state_size)
-        # reshape to         (batch, ctx_blks, blk_size, heads, head_state)
-        shapeB = B.shape
-        shapeC = list(B.shape)
-        shapeC[1:] = [self.ctx_blks, self.blk_size, self.heads, shapeC[2]//self.heads]
-        batch_size = shapeC[0]
-
-        B = B.reshape(shapeC)
-        C = np.zeros(shapeC, dtype=np.float32)
-        for n in range(batch_size):
-            for h in range(self.heads):
-                lut_head = h if self.lut_heads > 1 else 0
-                for x, lut in enumerate(self.nn_list[lut_head]):
-                    for b, y in lut:
-                        C[n,x,:,h,:] += np.dot( A[n,h,b,:,:], B[n,y,:,h,:] )
-        return C.reshape(shapeB)
-
-    def tn_test(self, A, B):
-        # B and C have shape (batch, ctx_size, state_size)
-        # reshape to         (batch, ctx_blks, blk_size, heads, head_state)
-        shapeB = B.shape
-        shapeC = list(B.shape)
-        shapeC[1:] = [self.ctx_blks, self.blk_size, self.heads, shapeC[2]//self.heads]
-        batch_size = shapeC[0]
-
-        B = B.reshape(shapeC)
-        C = np.zeros(shapeC, dtype=np.float32)
-        for n in range(batch_size):
-            for h in range(self.heads):
-                lut_head = h if self.lut_heads > 1 else 0
-                for x, lut in enumerate(self.tn_list[lut_head]):
-                    for b, y in lut:
-                        C[n,x,:,h,:] += np.dot( A[n,h,b,:,:].T, B[n,y,:,h,:] )
-        return C.reshape(shapeB)
-
-
-    def masked_softmax_test(self, x, scale=1.0):
-
-        y = np.empty_like(x)
-        m = self.softmax_mask_np # heads, blocks, blk_size
-        bsize = self.blk_size
-        for n in range(x.shape[0]):
-            for h in range(x.shape[1]):
-                hl = h if self.lut_heads > 1 else 0
-                for lut in self.nn_list[hl]:
-                    xm = np.full((len(lut), bsize * bsize), -np.finfo(np.float32).max, dtype=np.float32)
-                    for i, (b, k) in enumerate(lut):
-                        xb = x[n,h,b,:,:].reshape(-1)
-                        if m is None:
-                            # apply scale
-                            xm[i,:] = xb * scale
-                        else:
-                            # apply mask and scale to x block
-                            mask  = np.unpackbits(m[hl,b,:].view(np.uint8)).reshape(-1,8)[:,::-1].reshape(-1)
-                            nzIdx = np.nonzero(mask)
-                            xm[i,nzIdx] = xb[nzIdx] * scale
-                    # compute softmax for collection of k blocks
-                    xm = xm.reshape((len(lut), bsize, bsize))
-                    xm = np.exp(xm - np.max(xm, axis=(0,2), keepdims=True))
-                    ym = xm / np.sum(xm, axis=(0,2), keepdims=True)
-                    for i, (b, k) in enumerate(lut):
-                        y[n,h,b,:,:] = ym[i]
-        return y
-
-
-    def masked_softmax_grad_test(self, dy, y, scale=1.0):
-
-        dx = np.empty_like(dy)
-        for n in range(dy.shape[0]):
-            for h in range(dy.shape[1]):
-                hl = h if self.lut_heads > 1 else 0
-                for lut in self.nn_list[hl]:
-
-                    bs  = [ b for b, k in lut ]
-                    dyb = dy[n,h,bs,:,:]
-                    yb  =  y[n,h,bs,:,:]
-
-                    dxb = (dyb - np.sum(dyb * yb, axis=(0,2), keepdims=True)) * yb * scale
-
-                    for i, (b, k) in enumerate(lut):
-                        dx[n,h,b,:,:] = dxb[i,:,:]
-        return dx
-
-    def nt_op(self, a, b, name=None, bench=0):
-
-        return blocksparse_transformer_nt(
-            a, b, self.nt_lut, self.nn_lut, self.tn_lut, CT=tf.float16,
-            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
-            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
-        )
-
-    def nn_op(self, a, b, name=None, bench=0):
-
-        return blocksparse_transformer_nn(
-            a, b, self.nt_lut, self.nn_lut, self.tn_lut,
-            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
-            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
-        )
-
-    def tn_op(self, a, b, name=None, bench=0):
-
-        return blocksparse_transformer_tn(
-            a, b, self.nt_lut, self.nn_lut, self.tn_lut,
-            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
-            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
-        )
-
-    def query_key_op(self, q, k, name=None, bench=0):
-
-        return blocksparse_transformer_nt(
-            q, k, self.nt_lut, self.nn_lut, self.tn_lut, CT=tf.bfloat16,
-            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
-            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
-        )
-
-    def weight_value_op(self, w, v, name=None, bench=0):
-
-        return blocksparse_transformer_nn(
-            w, v, self.nt_lut, self.nn_lut, self.tn_lut,
-            heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks,
-            nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
-        )
-
-    def masked_softmax(self, x, scale=1.0):
-        if self.softmax_mask is None:
-            return self.softmax(x, scale)
-        return blocksparse_masked_softmax(x, scale, self.nn_lut, self.softmax_mask, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks, lut_max=self.nn_max)
-
-    def softmax(self, x, scale=1.0):
-        return blocksparse_softmax(x, scale, self.nn_lut, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks, lut_max=self.nn_max)
-
-
-#  w  = q    . k.T
-#  QK = QC   . KC.T   16x16 = 16x64   . 16x64.T
-#  QC = QK   . KC     16x64 = 16x16   . 16x64
-#  KC = QK.T . QC     16x64 = 16x16.T . 16x64
-
-@ops.RegisterGradient("BlocksparseTransformerNT")
-def blocksparse_transformer_nt_grad(op, dw):
-
-    heads    = op.get_attr("heads")
-    blocks   = op.get_attr("blocks")
-    blk_size = op.get_attr("blk_size")
-    ctx_blks = op.get_attr("ctx_blks")
-    nn_max   = op.get_attr("nn_max")
-    tn_max   = op.get_attr("tn_max")
-    bench    = op.get_attr("bench")
-    q, k, nt_lut, nn_lut, tn_lut = op.inputs
-
-    dq = blocksparse_transformer_nn(
-        dw, k, nt_lut, nn_lut, tn_lut,
-        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks,
-        nn_max=nn_max, tn_max=tn_max, bench=bench)
-
-    dk = blocksparse_transformer_tn(
-        dw, q, nt_lut, nn_lut, tn_lut,
-        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks,
-        nn_max=nn_max, tn_max=tn_max, bench=bench)
-
-    return (dq, dk, None, None, None)
-
-#  y  = w    . v
-#  QC = QK   . VC     16x64 = 16x16   . 16x64
-#  QK = QC   . VC.T   16x16 = 16x64   . 16x64.T
-#  VC = QK.T . QC     16x64 = 16x16.T . 16x64
-
-@ops.RegisterGradient("BlocksparseTransformerNN")
-def blocksparse_transformer_nn_grad(op, dy):
-
-    heads    = op.get_attr("heads")
-    blocks   = op.get_attr("blocks")
-    blk_size = op.get_attr("blk_size")
-    ctx_blks = op.get_attr("ctx_blks")
-    nn_max   = op.get_attr("nn_max")
-    tn_max   = op.get_attr("tn_max")
-    bench    = op.get_attr("bench")
-    w, v, nt_lut, nn_lut, tn_lut = op.inputs
-
-    dw = blocksparse_transformer_nt(
-        dy, v, nt_lut, nn_lut, tn_lut, CT=tf.float16,
-        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks,
-        nn_max=nn_max, tn_max=tn_max, bench=bench)
-
-    dv = blocksparse_transformer_tn(
-        w, dy, nt_lut, nn_lut, tn_lut,
-        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks,
-        nn_max=nn_max, tn_max=tn_max, bench=bench)
-
-    return (dw, dv, None, None, None)
-
-
-@ops.RegisterGradient("BlocksparseMaskedSoftmax")
-def blocksparse_masked_softmax_op_grad(op, dy):
-
-    blocks   = op.get_attr("blocks")
-    blk_size = op.get_attr("blk_size")
-    ctx_blks = op.get_attr("ctx_blks")
-    lut_max  = op.get_attr("lut_max")
-    y        = op.outputs[0]
-    scale    = op.inputs[1]
-    lut      = op.inputs[2]
-    mask     = op.inputs[3]
-
-    dx = blocksparse_masked_softmax_grad(dy, y, scale, lut, mask, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks, lut_max=lut_max)
-
-    return (dx, None, None, None)
-
-@ops.RegisterGradient("BlocksparseSoftmax")
-def blocksparse_softmax_op_grad(op, dy):
-
-    blocks   = op.get_attr("blocks")
-    blk_size = op.get_attr("blk_size")
-    ctx_blks = op.get_attr("ctx_blks")
-    lut_max  = op.get_attr("lut_max")
-    y        = op.outputs[0]
-    scale    = op.inputs[1]
-    lut      = op.inputs[2]
-
-    dx = blocksparse_softmax_grad(dy, y, scale, lut, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks, lut_max=lut_max)
-
-    return (dx, None, None)
-
-
-# morton order (z-order)
-def morton(x, y):
-    answer = 0
-    bits = max(len(bin(x)), len(bin(y))) - 2
-    for i in range(bits):
-        mshifted = 1 << i;
-        shift = i
-        answer |= ((x & mshifted) << shift) | ((y & mshifted) << (shift + 1))
-        #print mshifted, shift, answer, bin(answer)
-    return answer

@@ -717,48 +717,46 @@ template bool DropoutBackward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* dx
 
 
 template <typename T, typename V>
-__global__ void filter_infinity(T* Grad, uint size, float scale, uint zero_nans)
+__global__ void filter_tensor(T* Y, const T* __restrict__ X, uint size, float scale, float saturate, uint zero_infs, uint zero_nans)
 {
     uint tid = threadIdx.x;
     uint bid = blockIdx.x;
 
-    for (uint i = bid*1024 + tid; i < size; i += gridDim.x*1024)
+    for (uint offset = bid*1024 + tid; offset < size; offset += gridDim.x*1024)
     {
-        V grad = load((const T*)Grad + i);
+        V x = load(X + offset);
 
-        grad = ew_mul(grad, scale);
-
-        // Nans => zero
+        if (zero_infs)
+            x = ew_zero_inf(x);
         if (zero_nans)
-            grad = ew_zero_nan(grad);
+            x = ew_zero_nan(x);
+        if (saturate != 0.0f)
+            x = ew_maximum(ew_minimum(x, saturate), -saturate);
 
-        // Saturate fp16 infinity values
-        if (std::is_same<T, ehalf4>::value || std::is_same<T, ehalf>::value)
-            grad = ew_maximum(ew_minimum(grad, 65504.0f), -65504.0f);
+        x = ew_mul(x, scale);
 
-        store(Grad + i, grad);
+        store(Y + offset, x);
     }
 }
-
 template <typename T, typename V>
-bool FilterInfinity(CUstream stream, uint SMs, T* grad, uint size, float scale, bool zero_nans)
+bool FilterTensor(CUstream stream, uint SMs, T* y, const T* x, uint size, float scale, float saturate, bool zero_infs, bool zero_nans)
 {
     if (size & 3)
     {
         uint grid = size > SMs*1024 ? SMs*2 : SMs;
-        filter_infinity<T,float><<<grid,1024,0,stream>>>(grad, size, scale, zero_nans);
+        filter_tensor<T,float><<<grid,1024,0,stream>>>(y, x, size, scale, saturate, zero_infs, zero_nans);
     }
     else
     {
         size >>= 2; // use vector loads
         uint grid = size > SMs*1024 ? SMs*2 : SMs;
-        filter_infinity<V,float4><<<grid,1024,0,stream>>>((V*)grad, size, scale, zero_nans);
+        filter_tensor<V,float4><<<grid,1024,0,stream>>>((V*)y, (const V*)x, size, scale, saturate, zero_infs, zero_nans);
     }
     return true;
 }
-template bool FilterInfinity<float,float4>(CUstream stream, uint SMs, float* grad, uint size, float scale, bool zero_nans);
-template bool FilterInfinity<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* grad, uint size, float scale, bool zero_nans);
-template bool FilterInfinity<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* grad, uint size, float scale, bool zero_nans);
+template bool FilterTensor<float,float4>(CUstream stream, uint SMs, float* y, const float* x, uint size, float scale, float saturate, bool zero_infs, bool zero_nans);
+template bool FilterTensor<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, const ehalf* x, uint size, float scale, float saturate, bool zero_infs, bool zero_nans);
+template bool FilterTensor<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, const bhalf* x, uint size, float scale, float saturate, bool zero_infs, bool zero_nans);
 
 
 

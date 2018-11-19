@@ -151,14 +151,19 @@ def ew_z_xb_grad(op, dz):
 
 ############################## Filter Infinity/Nans + scale #####################################
 
-filter_infinity_op = _op_module.filter_infinity
+filter_tensor_op = _op_module.filter_tensor
 
-def filter_infinity(x, scale=1.0, zero_nans=True):
-    return filter_infinity_op(x, scale, zero_nans=zero_nans)
+# set saturate to 65504.0 to saturate fp16 infinities
+def filter_tensor(x, scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
+    return filter_tensor_op(x, scale, saturate=float(saturate), zero_infs=zero_infs, zero_nans=zero_nans)
 
-@ops.RegisterGradient("FilterInfinity")
-def filter_infinity_grad(op, dy):
-    return filter_infinity_op(dy, op.inputs[1], zero_nans=op.get_attr("zero_nans")), None
+# alias to filter_tensor that just does scaling by host side scalar value
+def scale_tensor(x, scale=1.0):
+    return filter_tensor_op(x, scale)
+
+@ops.RegisterGradient("FilterTensor")
+def filter_tensor_grad(op, dy):
+    return filter_tensor_op(dy, op.inputs[1], saturate=op.get_attr("saturate"), zero_infs=op.get_attr("zero_infs"), zero_nans=op.get_attr("zero_nans")), None
 
 ############################## Float Cast #####################################
 

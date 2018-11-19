@@ -740,4 +740,225 @@ template bool Transpose_0213<ehalf>(CUstream stream, ehalf* y, const ehalf* x, u
 template bool Transpose_0213<bhalf>(CUstream stream, bhalf* y, const bhalf* x, uint D0, uint D1, uint D2, uint D3);
 
 
+__device__ __forceinline__ void xor1(ehalf8 &v)
+{
+    asm ("xor.b32 %0, %0, 0x00000001;" : "+r"(v.x) : );
+    asm ("xor.b32 %0, %0, 0x00000001;" : "+r"(v.y) : );
+    asm ("xor.b32 %0, %0, 0x00000001;" : "+r"(v.z) : );
+    asm ("xor.b32 %0, %0, 0x00000001;" : "+r"(v.w) : );
+}
+__device__ __forceinline__ void xor1(ehalf2 &v)
+{
+    asm ("xor.b32 %0, %0, 0x00000001;" : "+r"(v.x) : );
+}
+
+template <uint UNROLL, typename T, typename V, typename TL, uint BLOCKS>
+__global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
+    ehalf* Grad,
+    float* Loss,
+    const ehalf*  __restrict__ Logits,
+    const    TL*  __restrict__ Labels,
+    uint K)
+{
+    __shared__ float Max[32];
+    __shared__ float Sum[32];
+
+    uint tid   = threadIdx.x; // feature dim
+    uint idx_N = blockIdx.x;  // batch dim
+
+    const uint vsize = sizeof(V)/4;
+
+    uint k = ((tid & (1024-32))*UNROLL + (tid & 31))*vsize;
+    uint offset = idx_N*K + k;
+    Logits += offset;
+    asm("mov.b64 %0, %0;" : "+l"(Logits) : );
+
+    T logits[UNROLL];
+    #pragma unroll
+    for (uint i = 0; i < UNROLL; i++)
+    {
+        ew_set(logits[i], 0xfc00fc00); //-inf, -inf
+
+        if (k + i*vsize*32 < K)
+            logits[i] = __ldg((const T*)(Logits + i*vsize*32));
+    }
+
+    // reduce within thread
+    float Xmax[UNROLL];
+    for (int i = 0; i < UNROLL; i++)
+        Xmax[i] = ew_max(to_float(logits[i]));
+
+    float xmax = Xmax[0];
+    for (int i = 1; i < UNROLL; i++)
+        xmax = fmaxf(Xmax[i], xmax);
+
+    // reduce within warp
+    for (int i = 16; i > 0; i >>= 1)
+        xmax = fmaxf(xmax, shfl_xor(xmax, i));
+
+    if (blockDim.x > 32)
+    {
+        if (blockDim.x != 1024)
+        {
+            if (tid < 32)
+            {
+                Max[tid] = -FLT_MAX;
+                Sum[tid] = 0.0f;
+            }
+            __syncthreads();
+        }
+        if ((tid & 31) == 0)
+            Max[tid / 32] = xmax;
+        __syncthreads();
+
+        xmax = Max[tid & 31];
+        for (uint i = 16; i > 0; i >>= 1)
+            xmax = fmaxf(xmax, shfl_xor(xmax, i));
+    }
+
+    // subtract xmax and compute exponent
+    float exp_sum = 0;
+    T exp_max[UNROLL];
+    for (uint i = 0; i < UNROLL; i++)
+    {
+        V exp      = ew_exp_approx(ew_sub(to_float(logits[i]), xmax));
+        exp_sum   += ew_sum(exp);
+        exp_max[i] = to_ehalf(ew_mul(exp, 32768.0f)); // scale to maximize fp16 bit utilization
+        xor1(exp_max[i]); // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
+    }
+
+    // reduce within warp
+    for (int i = 16; i > 0; i >>= 1)
+        exp_sum += shfl_xor(exp_sum, i);
+
+    if (blockDim.x > 32)
+    {
+        if ((tid & 31) == 0)
+            Sum[tid/32] = exp_sum;
+        __syncthreads();
+
+        exp_sum = Sum[tid & 31];
+        for (uint i = 16; i > 0; i >>= 1)
+            exp_sum += shfl_xor(exp_sum, i);
+    }
+    float rcp_exp_sum = ew_rcp_approx(exp_sum) * (1.0f/32768.0f); // undo fp16 scaling
+
+    uint label = (uint)__ldg(Labels + idx_N);
+
+    Grad += offset;
+    asm("mov.b64 %0, %0;" : "+l"(Grad) : );
+    #pragma unroll
+    for (uint i = 0; i < UNROLL; i++)
+    {
+        if (k + i*vsize*32 < K)
+        {
+            xor1(exp_max[i]); // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
+            V softmax = ew_mul(to_float(exp_max[i]), rcp_exp_sum);
+            V loss    = ew_neg(ew_log_approx(softmax));
+
+            for (uint j = 0; j < vsize; j++)
+            {
+                if (k + i*vsize*32 + j == label)
+                {
+                    Max[0] = ((float*)&loss)[j];
+                    ((float*)&softmax)[j] -= 1.0f;
+                }
+                ((float*)&softmax)[j] *= 32768.0f; // scale to maximize fp16 bit utilization
+            }
+            __stg((T*)(Grad + i*vsize*32), to_ehalf(softmax));
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0)
+        Loss[idx_N] = Max[0];
+}
+
+template <typename TL>
+bool SoftmaxCrossEntropy(CUstream stream, ehalf* grad, float* loss, const ehalf* logits, const TL* labels, uint N, uint K)
+{
+         if (K > 1024*32) // <= 64k
+        softmax_cross_entropy<8,ehalf8,float8,TL,1><<<N,1024,0,stream>>>(grad, loss, logits, labels, K);
+    else if (K > 1024*16) // <= 32k
+        softmax_cross_entropy<4,ehalf8,float8,TL,1><<<N,1024,0,stream>>>(grad, loss, logits, labels, K);
+    else if (K > 1024* 8) // <= 16k
+        softmax_cross_entropy<2,ehalf8,float8,TL,2><<<N,1024,0,stream>>>(grad, loss, logits, labels, K);
+    else if (K >=  32* 8) // 256 <= K <= 8k
+    {
+        uint threads = CEIL_DIV(K, 32*8) * 32;
+        softmax_cross_entropy<1,ehalf8,float8,TL,2><<<N,threads,0,stream>>>(grad, loss, logits, labels, K);
+    }
+    else // K < 256
+    {
+        uint threads = CEIL_DIV(K, 32*2) * 32;
+        softmax_cross_entropy<1,ehalf2,float2,TL,2><<<N,threads,0,stream>>>(grad, loss, logits, labels, K);
+    }
+    return true;
+}
+
+template bool SoftmaxCrossEntropy<         int  >(CUstream stream, ehalf* grad, float* loss, const ehalf* logits, const          int*   labels, uint N, uint K);
+template bool SoftmaxCrossEntropy<unsigned short>(CUstream stream, ehalf* grad, float* loss, const ehalf* logits, const unsigned short* labels, uint N, uint K);
+template bool SoftmaxCrossEntropy<unsigned char >(CUstream stream, ehalf* grad, float* loss, const ehalf* logits, const unsigned char*  labels, uint N, uint K);
+
+template <typename T, typename V, uint THREADS>
+__global__ void softmax_cross_entropy_grad(T* DX, const float* __restrict__ DY, const T* Y, uint NK, uint K)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    #pragma unroll 1
+    for (uint nk = bid*THREADS + tid; nk < NK; nk += gridDim.x*THREADS)
+    {
+        uint n = nk / K;
+
+        V      y = load( Y + nk);
+        float dy = load(DY + n) * (1.0f/32768.0f); // undo fp16 scaling
+
+        store(DX + nk, ew_mul(y, dy));
+    }
+}
+
+bool SoftmaxCrossEntropyGrad(CUstream stream, uint SMs, ehalf* dx, const float* dy, const ehalf* y, uint NK, uint K)
+{
+    if (K >= 256)
+    {
+        NK >>= 3; // use vector loads
+        K  >>= 3; // use vector loads
+        uint grid = NK > SMs*256*2 ? SMs*4 : NK > SMs*256 ? SMs*2 : SMs;
+        softmax_cross_entropy_grad<ehalf8,float8,256><<<grid,256,0,stream>>>((ehalf8*)dx, dy, (const ehalf8*)y, NK, K);
+    }
+    else
+    {
+        NK >>= 1; // use vector loads
+        K  >>= 1; // use vector loads
+        uint grid = NK > SMs*256*4 ? SMs*8 : NK > SMs*256*2 ? SMs*4 : NK > SMs*256 ? SMs*2 : SMs;
+        softmax_cross_entropy_grad<ehalf2,float2,256><<<grid,256,0,stream>>>((ehalf2*)dx, dy, (const ehalf2*)y, NK, K);
+    }
+    return true;
+}
+
+
+// loss[j] = (log(sum_exp_logits) - logits[j]) * 1{ j == label }
+
+// exp_logits[j] / sum_exp_logits - 1{ j == label }
+
+// _CUDA_FP16_DECL__ __half hlog(const __half a) {
+//     __half val;
+//     asm("{.reg.b32         f, C;           \n"
+//         " .reg.b16         r,h;            \n"
+//         "  mov.b16         h,%1;           \n"
+//         "  cvt.f32.f16     f,h;            \n"
+//         "  lg2.approx.f32      f,f;        \n"
+//         "  mov.b32         C, 0x3f317218;  \n"
+//         "  mul.f32         f,f,C;          \n"
+//         "  cvt.rn.f16.f32      r,f;        \n"
+//         __SPEC_CASE(h, r, 0X160D, 0x9C00)
+//         __SPEC_CASE(h, r, 0X3BFE, 0x8010)
+//         __SPEC_CASE(h, r, 0X3C0B, 0x8080)
+//         __SPEC_CASE(h, r, 0X6051, 0x1C00)
+//         "  mov.b16         %0,r;           \n"
+//         "}": "=h"(__HALF_TO_US(val)) : "h"(__HALF_TO_CUS(a)));
+//     return val;
+
+
 #endif

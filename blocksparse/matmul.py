@@ -71,10 +71,13 @@ class BlocksparseMatMul(object):
                 segment_size = max(ceil_div(max_group,4), min_group*2)
             else:
                 segment_size = SEG_MAX # not worth segmenting
+            #print(max_group, min_group, segment_size, KB)
         #segment_size = SEG_MAX
 
         # don't creat any segments smaller than this
         seg_min = max(ceil_div(segment_size, 4), 4)
+
+        #segment_size = seg_min = 2
 
         if layout.dtype != np.int32:
             layout = layout.astype(np.int32)
@@ -201,12 +204,12 @@ class BlocksparseMatMul(object):
         # add in any empty k blocks at the end
         for k in range(KB):
             if k not in kset:
-                # supported by assembly kernels
-                #if self.axis == 1:
                 segs.append( (k, []) )
                 cols.append( (k, []) )
                 #else:
                 #    raise ValueError("sparsity mask has empty mappings.  Not yet supported with feature_axis=0")
+
+        #segs.sort(key=lambda x: len(x[1]), reverse=True)
 
         # bsmm lut
         offset = len(segs) * 4
@@ -375,7 +378,7 @@ class BlocksparseMatMul(object):
 
             return B.reshape(-1, N)
 
-    def updat_test(self, I, E, gate=None):
+    def updat_test(self, I, E, gate=None, dw_gated=False):
         U = np.zeros(self.w_shape)
         bsize = self.bsize
         if self.axis:
@@ -386,7 +389,7 @@ class BlocksparseMatMul(object):
         else:
             I = I.reshape((self.CB, bsize, -1))
             E = E.reshape((self.KB, bsize, -1))
-            if gate is None:
+            if not dw_gated or gate is None:
                 for w, (c, k) in enumerate(self.updat_list):
                     U[w,:,:] = np.dot( I[c,:,:], E[k,:,:].T ) # CN x KN.T = CK
             else:
@@ -439,7 +442,7 @@ class BlocksparseMatMul(object):
             gate = []
         else:
             gate = [gate]
-            assert self.bsize == 8 and self.axis == 0, "blocksparse gating only implemented for block_size 8 on axis 0"
+            #assert self.bsize == 8 and self.axis == 0, "blocksparse gating only implemented for block_size 8 on axis 0"
 
         O, _ = blocksparse_matmul(
             I, W, self.fprop_lut, self.bprop_lut, self.updat_lut, gate,

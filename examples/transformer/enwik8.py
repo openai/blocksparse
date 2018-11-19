@@ -13,15 +13,13 @@ import argparse
 import numpy as np
 import tensorflow as tf
 from mpi4py import MPI
-from blocksparse.transformer import BlocksparseTransformer
-from blocksparse.optimize    import AdamOptimizer, AdafactorOptimizer
+from blocksparse.transformer import BlocksparseTransformer, softmax_cross_entropy
+from blocksparse.optimize    import AdamOptimizer, AdafactorOptimizer, ClipGlobalNorm
 from blocksparse.norms       import layer_norm
 from blocksparse.embed       import embedding_lookup
-from blocksparse.ewops       import bias_relu, float_cast
+from blocksparse.ewops       import bias_relu, float_cast, scale_tensor
 from blocksparse.nccl        import allreduce, group_allreduce, sync_variables_op
 from blocksparse.quantize    import log_stats
-
-
 
 
 def layernorm(x, scope, epsilon=1e-5, relu=False):
@@ -58,8 +56,8 @@ def conv1d(x, scope, nf, relu=False):
 
 # Fine sparse structure
 # Within each block this mask is applied to force the softmax output to zero where the mask is zero
-# This is defined a callback to avoid having to instantiate the full mask in memory at one time.
-# The callback value is immediately converted to bits internally.
+# This is defined as a callback to avoid having to instantiate the full mask in memory at one time.
+# The callback value is immediately converted to a bit mask internally.
 def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
     """Prohibit positions in sub-blocks from attending to indices in the future.
     Note: query_idx and key_idx are absolute indices rather than relative to
@@ -74,12 +72,13 @@ def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
 
 # Coarse sparse structure
 # Only layout==1 blocks are computed and materialized in memory
-# Block sizes of 16, 32 and 64 are supported (64 being most appropriate for dense attention)
+# Block sizes of 8, 16, 32 and 64 are supported (64 being most appropriate for dense attention)
 def get_blocksparse_attention_ops(n_timesteps, n_heads):
     blocksize = 64
     n_time_blocks = n_timesteps // blocksize
     layout = np.ones([n_time_blocks, n_time_blocks], dtype=np.bool)
     # No query blocks may attend to key blocks in the future.
+    # Much more elaborate structures can be defined here aside from the usual lower triangular.
     for q_idx, k_idx in np.ndindex(n_time_blocks, n_time_blocks):
         if k_idx > q_idx:
             layout[q_idx, k_idx] = 0
@@ -140,49 +139,62 @@ def transformer_block(x, scope, n_head, n_timesteps):
         return m
 
 
-def model(xs, ys):
+def model(xs, ys, cost_scale, grad_scale):
 
     with tf.variable_scope("model"):
 
         with tf.device("/cpu:0"):
             global_step   = tf.Variable(1.0, trainable=False)
-            learning_rate = tf.minimum(global_step * tf.constant(1.0/hps.warmup_iters), 1.0) * tf.constant(hps.lr)
+            learning_rate = tf.minimum(global_step * tf.constant(1.0/hps.warmup_iters), tf.constant(1.0)) * tf.constant(hps.lr)
 
         with tf.device("/gpu:0"):
+
+            # Contains scope/var_name substrings we use to group gradients for all reduce
+            # You'll want to find groupings that are scheduled uniquely by tensorflow, otherwise allreduce could hang.
+            # The groups should be ordered in which the all-reduce is called.
+            # Any gradients not matching the substrings will get appended to the last group.
+            grad_groups = []
 
             # embed discrete inputs to continous space and add learned position embeddings
             with tf.variable_scope('embed'):
                 x_embed   = fp16(tf.get_variable("x",   [   hps.n_vocab,     hps.n_state], initializer=tf.random_normal_initializer(stddev=0.02)))
                 pos_embed = fp16(tf.get_variable('pos', [1, hps.n_timesteps, hps.n_state], initializer=tf.random_normal_initializer(stddev=0.01)))
                 h = embedding_lookup(x_embed, xs) + pos_embed
+                grad_groups.insert(0, 'embed')
 
             for l in range(hps.n_layer):
-                h = transformer_block(h, 'layer_%d' % l, hps.n_head, hps.n_timesteps)
+                layer_name = 'layer_%d' % l
+                h = transformer_block(h, layer_name, hps.n_head, hps.n_timesteps)
+                grad_groups.insert(0, layer_name)
 
             #average pool transformer features and apply linear classifier
             with tf.variable_scope('logits'):
                 h = tf.reshape(h, [-1, hps.n_state])
                 logits = tf.matmul(h, x_embed, transpose_b=True)
 
-            labels = tf.reshape(ys, [-1])
-            loss   = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=fp32(logits), labels=tf.cast(labels, tf.int32))
+
+            # labels = tf.reshape(ys, [-1])
+            # loss   = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=fp32(logits), labels=tf.cast(labels, tf.int32))
+            loss   = softmax_cross_entropy(logits=logits, labels=ys)
             loss   = tf.reduce_mean(loss)
 
             params = tf.trainable_variables()
-            grads  = tf.gradients(loss * hps.cost_scale, params)
-
-            mpi_scale = 1.0 / mpi_size
+            # use scale_tensor so we can keep the cost_scale a host side placeholder
+            grads  = tf.gradients(scale_tensor(loss, cost_scale), params)
 
             if mpi_size > 1:
-                loss = allreduce(loss) * mpi_scale
+                loss = allreduce(loss) * tf.constant(1.0 / mpi_size)
 
-                group_allreduce(grads, params, search_strings=["layer_%d" % l for l in range(hps.n_layer - 1, -1, -1)] + ["embed"], cast_all=tf.float16)
+                group_allreduce(grads, params, search_strings=grad_groups)
+
+            global_norm, norm_scale = ClipGlobalNorm(grads, grad_scale=grad_scale, clip_norm=hps.clip_norm)
 
             # for tuning fp16 cost scaling
             if hps.log_stats and mpi_rank == 0:
                 for i, (grad, param) in enumerate(zip(grads, params)):
                     name = param.op.name + "_" + "_".join(str(x) for x in param.shape.as_list())
                     grads[i] = log_stats(grad, tf.cast(global_step, tf.int32), logfile="scale_stats.txt", name=name)
+
 
             # use adafactor for most params and adam for embeddings
             fact_grads = list()
@@ -191,21 +203,22 @@ def model(xs, ys):
                 if "embed" in param.op.name:
                     # for input embedding, only update param + running stats when embedding vector was selected by input
                     # more stable learning for rarely used embedding entries
+                    # Note that we use the x_embed as the output logits projection, so there's little value to using lazy here.
                     # if "x" in param.op.name:
                     #     grad.lazy = True
                     adam_grads.append( (grad, param) )
                 else:
                     fact_grads.append( (grad, param) )
 
-            fact = AdafactorOptimizer(learning_rate=learning_rate, grad_scale=mpi_scale/hps.cost_scale, sat_infs=True)
-            adam = AdamOptimizer(     learning_rate=learning_rate, grad_scale=mpi_scale/hps.cost_scale, sat_infs=True)
+            fact = AdafactorOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale)
+            adam = AdamOptimizer(     learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale)
             train_op = tf.group(fact.apply_gradients(fact_grads), adam.apply_gradients(adam_grads))
 
         # update global step after we're done using it for this update
         with tf.control_dependencies([ train_op ]), tf.device("/cpu:0"):
             update_op = tf.assign_add(global_step, 1.0)
 
-        return loss, tf.group(train_op, update_op)
+        return loss, tf.group(train_op, update_op), global_norm, norm_scale
 
 
 def enwik8(path, n_train=int(90e6), n_valid=int(5e6), n_test=int(5e6)):
@@ -253,6 +266,8 @@ if __name__ == '__main__':
     parser.add_argument('--n_vocab',           type=int,   default=256)
     parser.add_argument('--lr',                type=float, default=0.0005)
     parser.add_argument('--cost_scale',        type=float, default=2.0**16)
+    parser.add_argument('--cost_count',        type=int,   default=2000)
+    parser.add_argument('--clip_norm',         type=float, default=1.0)
     parser.add_argument('--warmup_iters',      type=int,   default=1000)
     parser.add_argument('--enwik8_path',       type=str,   default='/home/scott/datasets/enwik8')
     parser.add_argument('--log_every_n_iters', type=int,   default=200)
@@ -271,10 +286,19 @@ if __name__ == '__main__':
     trainX, validX, testX = enwik8(hps.enwik8_path, n_train, n_valid, n_test)
 
     with tf.device("/gpu:0"):
-        X = tf.placeholder(tf.uint8, [hps.n_batch, hps.n_timesteps])
-        Y = tf.placeholder(tf.uint8, [hps.n_batch, hps.n_timesteps])
+        X = tf.placeholder(tf.uint8, shape=[hps.n_batch, hps.n_timesteps])
+        Y = tf.placeholder(tf.uint8, shape=[hps.n_batch, hps.n_timesteps])
 
-    loss, train_op = model(X, Y)
+    # cost_scale and grad_scale are host side scalars
+    with tf.device("/cpu:0"):
+        cost_scale = tf.placeholder(tf.float32, shape=[])
+        grad_scale = tf.constant(1.0) / (cost_scale * tf.constant(float(mpi_size)))
+
+    # initialize the cost_scale placeholder value
+    cur_cost_scale = hps.cost_scale
+    cost_count = 0
+
+    loss, train_op, gn, ns = model(X, Y, cost_scale, grad_scale)
 
     config = tf.ConfigProto()
     config.gpu_options.visible_device_list = str(mpi_rank)
@@ -290,24 +314,45 @@ if __name__ == '__main__':
         for i in range(hps.n_epochs):
             print_rank0(f'Starting epoch {i}')
             for x, y in iter_data(trainX, hps.n_timesteps, hps.n_batch, mpi_rank, mpi_size):
-                cost, _ = sess.run([loss, train_op], {X: x, Y: y})
+
+                cost, global_norm, norm_scale, _ = sess.run([loss, gn, ns, train_op], {X: x, Y: y, cost_scale: cur_cost_scale})
+
+                # slowly increase cost scale but quickly drop it when inf or nan is detected in the gradients
+                # norm_scale will be zero when this happens
+                if norm_scale == 0.0:
+                    cur_cost_scale *= 0.5
+                    cost_count      = 0
+                    print_rank0("fp16 saturation detected (%f), changing cost_scale to: 2^%.0f" % (global_norm, np.log2(cur_cost_scale)))
+                elif cost_count >= hps.cost_count:
+                    cur_cost_scale *= 2.0
+                    cost_count      = 0
+                    print_rank0("No fp16 saturation detected after %d iterations, changing cost_scale to: 2^%.0f" % (hps.cost_count, np.log2(cur_cost_scale)))
+                else:
+                    cost_count += 1
+
                 if iteration % hps.log_every_n_iters == 0:
-                    print_rank0('train iteration: %7d, loss: %.5f, bits per byte: %.5f' % (iteration, cost, cost/np.log(2)))
+                    print_rank0('train iteration: %7d, loss: %.5f, bits per byte: %.5f ns:%.5f gn:%.5f' % (iteration, cost, cost/np.log(2), norm_scale, global_norm))
                 iteration += 1
 
                 if hps.profile and iteration >= hps.profile:
                     exit()
 
+
             print_rank0('Calculating validation loss')
             valid_losses = []
             for x, y in iter_data(validX, hps.n_timesteps, hps.n_batch, mpi_rank, mpi_size):
-                valid_losses.append(sess.run(loss, {X: x, Y: y}))
+
+                valid_losses.append(sess.run(loss, {X: x, Y: y, cost_scale: cur_cost_scale}))
+
             avg_valid = sum(valid_losses) / len(valid_losses)
             print_rank0('Average validation loss: %.5f, bits per byte: %.5f' % (avg_valid, avg_valid/np.log(2)))
+
 
         print_rank0('Calculating test loss')
         test_losses = []
         for x, y in iter_data(testX, hps.n_timesteps, hps.n_batch, mpi_rank, mpi_size):
-            test_losses.append(sess.run(loss, {X: x, Y: y}))
+
+            test_losses.append(sess.run(loss, {X: x, Y: y, cost_scale: cur_cost_scale}))
+
         avg_test = sum(test_losses) / len(test_losses)
         print_rank0('Average test loss: %.5f, bits per byte: %.5f' % (avg_test, avg_test/np.log(2)))

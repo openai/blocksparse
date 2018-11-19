@@ -17,15 +17,16 @@ data_files_path = tf.resource_loader.get_data_files_path()
 _op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
 
 
-############################## Adam #####################################
+############################## Old Adam Implementation #####################################
 
 adam_op       = _op_module.adam
 adam_gated_op = _op_module.adam_gated
 
 
 def BlocksparseAdam(grads, params,
-        lr=0.001, decay_mean=0.9, decay_var=0.999, epsilon=1e-8, grad_scale=1.0, clip_sigma=0.0,
-        global_step=None, gated=False, param_qspec=None, mean_qspec=None, var_qspec=None):
+        lr=0.001, decay_mean=0.9, decay_var=0.999, epsilon=1e-8, clip_sigma=0.0, global_step=None, gated=False,
+        norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False,
+        param_qspec=None, mean_qspec=None, var_qspec=None):
 
     with tf.device("/cpu:0"), tf.variable_scope("adam_lr"):
 
@@ -34,13 +35,16 @@ def BlocksparseAdam(grads, params,
             t = t.assign_add(1.0)
         else:
             t = tf.cast(global_step.assign_add(1), tf.float32)
+        one = tf.constant(1.0)
 
-        lr = lr * tf.sqrt((1.0 - tf.pow(decay_var, t))) /  (1.0 - tf.pow(decay_mean, t))
+        lr = lr * tf.sqrt((one - tf.pow(decay_var, t))) /  (one - tf.pow(decay_mean, t))
 
         if type(grad_scale) is float:
             grad_scale = tf.constant(grad_scale)
         if type(clip_sigma) is float:
             clip_sigma = tf.constant(clip_sigma)
+
+    norm_scale = [] if norm_scale is None else [norm_scale]
 
     updates = list()
     for grad, param in zip(grads, params):
@@ -54,11 +58,13 @@ def BlocksparseAdam(grads, params,
 
         with tf.device("/gpu:0"), tf.variable_scope("adam/" + name):
             if gated and gate is not None:
-                op = adam_gated_op(gate, grad, param, mean, var, lr, grad_scale, clip_sigma,
-                        decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon)
+                op = adam_gated_op(gate, grad, param, mean, var, lr, grad_scale, clip_sigma, norm_scale,
+                        decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon,
+                        saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
             else:
-                op = adam_op(grad, param, mean, var, lr, grad_scale, clip_sigma,
-                        decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon)
+                op = adam_op(grad, param, mean, var, lr, grad_scale, clip_sigma, norm_scale,
+                        decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon,
+                        saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
 
             if param_qspec is not None:
                 updates.append(param.assign(quantize(op.out_param, param_qspec, name="param")))
@@ -74,12 +80,203 @@ def BlocksparseAdam(grads, params,
     return tf.group(*updates)
 
 def Adam(grads, params,
-        lr=0.001, decay_mean=0.9, decay_var=0.999, epsilon=1e-8, grad_scale=1.0, clip_sigma=0.0,
-        global_step=None, param_qspec=None, mean_qspec=None, var_qspec=None):
+        lr=0.001, decay_mean=0.9, decay_var=0.999, epsilon=1e-8, clip_sigma=0.0, global_step=None,
+        norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False,
+        param_qspec=None, mean_qspec=None, var_qspec=None):
 
     return BlocksparseAdam(grads, params,
-        lr=lr, decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon, grad_scale=grad_scale,
-        global_step=global_step, param_qspec=param_qspec, mean_qspec=mean_qspec, var_qspec=var_qspec)
+        lr=lr, decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon, global_step=global_step,
+        norm_scale=norm_scale, grad_scale=grad_scale, saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans,
+        param_qspec=param_qspec, mean_qspec=mean_qspec, var_qspec=var_qspec)
+
+
+############################## ClipAdamOptimizer #####################################
+
+
+class ClipAdamOptimizer(optimizer.Optimizer):
+    def __init__(self, learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, clip_sigmas=0.0, norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False, name="ClipAdam"):
+        super().__init__(False, name)
+        self.beta1      = beta1
+        self.beta2      = beta2
+        self.epsilon    = epsilon
+        self.saturate   = saturate
+        self.zero_infs  = zero_infs
+        self.zero_nans  = zero_nans
+        self.name       = name
+        self.norm_scale = [] if norm_scale is None else [norm_scale]
+
+        with tf.device("/cpu:0"), tf.variable_scope("adam_beta"):
+
+            if type(learning_rate) in (float, int):
+                learning_rate = tf.constant(float(learning_rate))
+            if type(clip_sigmas)   in (float, int):
+                clip_sigmas   = tf.constant(float(clip_sigmas))
+            if type(grad_scale)    in (float, int):
+                grad_scale    = tf.constant(float(grad_scale))
+            one = tf.constant(1.0)
+
+            self.beta1_t     = tf.constant(beta1)
+            self.beta2_t     = tf.constant(beta2)
+            self.beta1_power = tf.Variable(initial_value=beta1, name="beta1_power", trainable=False)
+            self.beta2_power = tf.Variable(initial_value=beta2, name="beta2_power", trainable=False)
+            self.clip_sigma  = clip_sigmas
+            self.grad_scale  = grad_scale
+            self.lr          = learning_rate * tf.sqrt(one - self.beta2_power) / (one - self.beta1_power)
+
+    def _get_beta_accumulators(self):
+        return self.beta1_power, self.beta2_power
+
+    def _non_slot_variables(self):
+        return self._get_beta_accumulators()
+
+    def _create_slots(self, params):
+        # Create slots for the first and second moments.
+        for param in params:
+            self._zeros_slot(param, "m", self.name + "Mean")
+            self._zeros_slot(param, "v", self.name + "Var")
+
+    def _apply_dense(self, grad, param):
+
+        m = self.get_slot(param, "m")
+        v = self.get_slot(param, "v")
+
+        return adam_op(grad, param, m, v, self.lr, self.grad_scale, self.clip_sigma, self.norm_scale,
+            decay_mean=self.beta1, decay_var=self.beta2, epsilon=self.epsilon,
+            saturate=self.saturate, zero_infs=self.zero_infs, zero_nans=self.zero_nans, lazy_emb=hasattr(grad, "lazy")).out_param
+
+    def _apply_sparse(self, grad, param):
+        raise NotImplementedError("Sparse gradient updates are not supported.")
+
+    def _finish(self, update_ops, name_scope):
+        # Update the power accumulators.
+        with ops.control_dependencies([ self.lr ]), tf.device("/cpu:0"):
+            update_beta1 = self.beta1_power.assign(self.beta1_power * self.beta1_t)
+            update_beta2 = self.beta2_power.assign(self.beta2_power * self.beta2_t)
+
+        return tf.group(*update_ops + [update_beta1, update_beta2], name=name_scope)
+
+
+class AdamOptimizer(ClipAdamOptimizer):
+    def __init__(self, learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False, name="Adam"):
+        super().__init__(learning_rate=learning_rate, beta1=beta1, beta2=beta2, epsilon=epsilon, norm_scale=norm_scale, grad_scale=grad_scale, saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans, name=name)
+
+
+############################## ClipAdamOptimizer #####################################
+
+adafactor1d_op = _op_module.adafactor1d
+adafactor2d_op = _op_module.adafactor2d
+
+class AdafactorOptimizer(optimizer.Optimizer):
+    def __init__(self, learning_rate=5e-4, beta2=0.999, epsilon=1e-30, clip_thresh=1.0, norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False, name="Adafactor"):
+        super().__init__(False, name)
+        self.epsilon    = epsilon
+        self.saturate   = saturate
+        self.zero_infs  = zero_infs
+        self.zero_nans  = zero_nans
+        self.name       = name
+        self.norm_scale = [] if norm_scale is None else [norm_scale]
+
+        with tf.device("/cpu:0"), tf.variable_scope("adafactor_decay"):
+
+            if type(learning_rate) in (float, int):
+                learning_rate = tf.constant(float(learning_rate))
+            if type(clip_thresh)   in (float, int):
+                clip_thresh   = tf.constant(float(clip_thresh))
+            if type(grad_scale)    in (float, int):
+                grad_scale    = tf.constant(float(grad_scale))
+            one = tf.constant(1.0)
+
+            self.decay1_power = tf.Variable(initial_value=beta2,       name="decay1_power", trainable=False)
+            self.decay2_power = tf.Variable(initial_value=beta2*beta2, name="decay2_power", trainable=False)
+            self.learn_rate   = learning_rate
+            self.clip_thresh  = clip_thresh
+            self.grad_scale   = grad_scale
+            self.decay_t      = tf.constant(beta2)
+            self.decay        = self.decay_t * (one - self.decay1_power) / (one - self.decay2_power)
+
+    def _get_beta_accumulators(self):
+        return self.decay1_power, self.decay2_power
+
+    def _non_slot_variables(self):
+        return self._get_beta_accumulators()
+
+    def _create_slots(self, params):
+        # Create slots for the first and second moments.
+        for param in params:
+            if param.shape.ndims == 2 and param.shape[0].value > 1:
+                self._get_or_make_slot(param, tf.zeros(param.shape[1].value), "cv", self.name + "CV")
+                self._get_or_make_slot(param, tf.zeros(param.shape[0].value), "rv", self.name + "RV")
+            elif param.shape.ndims == 1 or (param.shape.ndims == 2 and param.shape[0].value == 1):
+                self._get_or_make_slot(param, tf.zeros(param.shape.num_elements()), "cv", self.name + "CV")
+            else:
+                raise ValueError("only 1 or 2d params are supported")
+
+    def _apply_dense(self, grad, param):
+
+        if param.shape.ndims == 2 and param.shape[0].value > 1:
+
+            cv = self.get_slot(param, "cv")
+            rv = self.get_slot(param, "rv")
+
+            return adafactor2d_op(param, cv, rv, grad,
+                self.decay, self.learn_rate, self.grad_scale, self.clip_thresh, self.norm_scale, epsilon=self.epsilon,
+                saturate=self.saturate, zero_infs=self.zero_infs, zero_nans=self.zero_nans).out_param
+
+        elif param.shape.ndims == 1 or (param.shape.ndims == 2 and param.shape[0].value == 1):
+
+            cv = self.get_slot(param, "cv")
+
+            return adafactor1d_op(param, cv, grad,
+                self.decay, self.learn_rate, self.grad_scale, self.clip_thresh, self.norm_scale, epsilon=self.epsilon,
+                saturate=self.saturate, zero_infs=self.zero_infs, zero_nans=self.zero_nans).out_param
+        else:
+            raise ValueError("only 1 or 2d params are supported")
+
+    def _apply_sparse(self, grad, param):
+        raise NotImplementedError("Sparse gradient updates are not supported.")
+
+    def _finish(self, update_ops, name_scope):
+        # Update the power accumulators.
+        with ops.control_dependencies([ self.decay ]), tf.device("/cpu:0"):
+            update_decay1 = self.decay1_power.assign(self.decay1_power * self.decay_t)
+            update_decay2 = self.decay2_power.assign(self.decay2_power * self.decay_t)
+
+        return tf.group(*update_ops + [update_decay1, update_decay2], name=name_scope)
+
+############################## ClipGlobalNorm #####################################
+
+clip_global_norm_op = _op_module.clip_global_norm
+
+def ClipGlobalNorm(grads, clip_norm=1.0, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
+
+    grad_float = list()
+    grad_ehalf = list()
+    grad_bhalf = list()
+
+    for grad in grads:
+        if   grad.dtype is tf.float32:
+            grad_float.append(grad)
+        elif grad.dtype is tf.float16:
+            grad_ehalf.append(grad)
+        elif grad.dtype is tf.bfloat16:
+            grad_bhalf.append(grad)
+        else:
+            raise ValueError("unsupported grad dtype")
+
+    with tf.device("/cpu:0"):
+        if type(clip_norm)  in (float, int):
+            clip_norm  = tf.constant(float(clip_norm))
+        if type(grad_scale) in (float, int):
+            grad_scale = tf.constant(float(grad_scale))
+
+    with tf.device("/gpu:0"):
+        global_norm, norm_scale, _ = clip_global_norm_op(
+            grad_scale, clip_norm, grad_float, grad_ehalf, grad_bhalf,
+            saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
+
+    return global_norm, norm_scale
+
+
 
 ############################## Group LASSO / Blocksparse L2 decay #####################################
 
@@ -193,159 +390,3 @@ class BlocksparseMaxnormPrune(object):
                     updates.append(maxnorm_prune_op(gate, param, self.threshold))
 
         return tf.group(*updates)
-
-############################## ClipAdamOptimizer #####################################
-
-
-class ClipAdamOptimizer(optimizer.Optimizer):
-    def __init__(self, learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, clip_sigmas=0.0, grad_scale=1.0, sat_infs=None, zero_nans=True, name="ClipAdam"):
-        super().__init__(False, name)
-        self.beta1      = beta1
-        self.beta2      = beta2
-        self.epsilon    = epsilon
-        self.sat_infs   = sat_infs
-        self.zero_nans  = zero_nans
-        self.name       = name
-
-        with tf.device("/cpu:0"), tf.variable_scope("adam_beta"):
-
-            if type(learning_rate) in (float, int):
-                learning_rate = tf.constant(float(learning_rate))
-            if type(clip_sigmas)   in (float, int):
-                clip_sigmas   = tf.constant(float(clip_sigmas))
-            if type(grad_scale)    in (float, int):
-                grad_scale    = tf.constant(float(grad_scale))
-
-            self.beta1_t     = tf.constant(beta1)
-            self.beta2_t     = tf.constant(beta2)
-            self.beta1_power = tf.Variable(initial_value=beta1, name="beta1_power", trainable=False)
-            self.beta2_power = tf.Variable(initial_value=beta2, name="beta2_power", trainable=False)
-            self.clip_sigma  = clip_sigmas
-            self.grad_scale  = grad_scale
-            self.lr          = learning_rate * tf.sqrt(1 - self.beta2_power) / (1 - self.beta1_power)
-
-    def _get_beta_accumulators(self):
-        return self.beta1_power, self.beta2_power
-
-    def _non_slot_variables(self):
-        return self._get_beta_accumulators()
-
-    def _create_slots(self, params):
-        # Create slots for the first and second moments.
-        for param in params:
-            self._zeros_slot(param, "m", self.name + "Mean")
-            self._zeros_slot(param, "v", self.name + "Var")
-
-    def _apply_dense(self, grad, param):
-
-        m = self.get_slot(param, "m")
-        v = self.get_slot(param, "v")
-
-        # a float32 grad could still could contain infs from upstream fp16 math
-        sat_infs = grad.dtype is tf.float16 if self.sat_infs is None else self.sat_infs
-
-        return adam_op(grad, param, m, v, self.lr, self.grad_scale, self.clip_sigma,
-            decay_mean=self.beta1, decay_var=self.beta2, epsilon=self.epsilon,
-            sat_infs=sat_infs, zero_nans=self.zero_nans, lazy_update=hasattr(grad, "lazy")).out_param
-
-    def _apply_sparse(self, grad, param):
-        raise NotImplementedError("Sparse gradient updates are not supported.")
-
-    def _finish(self, update_ops, name_scope):
-        # Update the power accumulators.
-        with ops.control_dependencies([ self.lr ]), tf.device("/cpu:0"):
-            update_beta1 = self.beta1_power.assign(self.beta1_power * self.beta1_t)
-            update_beta2 = self.beta2_power.assign(self.beta2_power * self.beta2_t)
-
-        return tf.group(*update_ops + [update_beta1, update_beta2], name=name_scope)
-
-
-class AdamOptimizer(ClipAdamOptimizer):
-    def __init__(self, learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, grad_scale=1.0, sat_infs=None, zero_nans=True, name="Adam"):
-        super().__init__(learning_rate=learning_rate, beta1=beta1, beta2=beta2, epsilon=epsilon, grad_scale=grad_scale, sat_infs=sat_infs, zero_nans=zero_nans, name=name)
-
-
-############################## ClipAdamOptimizer #####################################
-
-adafactor1d_op = _op_module.adafactor1d
-adafactor2d_op = _op_module.adafactor2d
-
-class AdafactorOptimizer(optimizer.Optimizer):
-    def __init__(self, learning_rate=5e-4, beta2=0.999, epsilon=1e-30, clip_thresh=1.0, grad_scale=1.0, sat_infs=None, zero_nans=True, name="Adafactor"):
-        super().__init__(False, name)
-        self.epsilon    = epsilon
-        self.sat_infs   = sat_infs
-        self.zero_nans  = zero_nans
-        self.name       = name
-
-        with tf.device("/cpu:0"), tf.variable_scope("adafactor_decay"):
-
-            if type(learning_rate) in (float, int):
-                learning_rate = tf.constant(float(learning_rate))
-            if type(clip_thresh)   in (float, int):
-                clip_thresh   = tf.constant(float(clip_thresh))
-            if type(grad_scale)    in (float, int):
-                grad_scale    = tf.constant(float(grad_scale))
-            one = tf.constant(1.0)
-
-            self.decay1_power = tf.Variable(initial_value=beta2,       name="decay1_power", trainable=False)
-            self.decay2_power = tf.Variable(initial_value=beta2*beta2, name="decay2_power", trainable=False)
-            self.learn_rate   = learning_rate
-            self.clip_thresh  = clip_thresh
-            self.grad_scale   = grad_scale
-            self.decay_t      = tf.constant(beta2)
-            self.decay        = self.decay_t * (one - self.decay1_power) / (one - self.decay2_power)
-
-    def _get_beta_accumulators(self):
-        return self.decay1_power, self.decay2_power
-
-    def _non_slot_variables(self):
-        return self._get_beta_accumulators()
-
-    def _create_slots(self, params):
-        # Create slots for the first and second moments.
-        for param in params:
-            if param.shape.ndims == 2 and param.shape[0].value > 1:
-                self._get_or_make_slot(param, tf.zeros(param.shape[1].value), "cv", self.name + "CV")
-                self._get_or_make_slot(param, tf.zeros(param.shape[0].value), "rv", self.name + "RV")
-            elif param.shape.ndims == 1 or (param.shape.ndims == 2 and param.shape[0].value == 1):
-                self._get_or_make_slot(param, tf.zeros(param.shape.num_elements()), "cv", self.name + "CV")
-            else:
-                raise ValueError("only 1 or 2d params are supported")
-
-    def _apply_dense(self, grad, param):
-
-        # a float32 grad could still could contain infs from upstream fp16 math
-        sat_infs = grad.dtype is tf.float16 if self.sat_infs is None else self.sat_infs
-
-        if param.shape.ndims == 2 and param.shape[0].value > 1:
-
-            cv = self.get_slot(param, "cv")
-            rv = self.get_slot(param, "rv")
-
-            return adafactor2d_op(param, cv, rv, grad,
-                self.decay, self.learn_rate, self.grad_scale, self.clip_thresh,
-                epsilon=self.epsilon, sat_infs=sat_infs, zero_nans=self.zero_nans).out_param
-
-        elif param.shape.ndims == 1 or (param.shape.ndims == 2 and param.shape[0].value == 1):
-
-            cv = self.get_slot(param, "cv")
-
-            return adafactor1d_op(param, cv, grad,
-                self.decay, self.learn_rate, self.grad_scale, self.clip_thresh,
-                epsilon=self.epsilon, sat_infs=sat_infs, zero_nans=self.zero_nans).out_param
-        else:
-            raise ValueError("only 1 or 2d params are supported")
-
-    def _apply_sparse(self, grad, param):
-        raise NotImplementedError("Sparse gradient updates are not supported.")
-
-    def _finish(self, update_ops, name_scope):
-        # Update the power accumulators.
-        with ops.control_dependencies([ self.decay ]), tf.device("/cpu:0"):
-            update_decay1 = self.decay1_power.assign(self.decay1_power * self.decay_t)
-            update_decay2 = self.decay2_power.assign(self.decay2_power * self.decay_t)
-
-        return tf.group(*update_ops + [update_decay1, update_decay2], name=name_scope)
-
-

@@ -47,15 +47,14 @@ CCFLAGS=-std=c++11 -O3 -fPIC -DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) 
 	-I/usr/local
 
 NVCCFLAGS=-DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) -O3 -Xcompiler -fPIC -std=c++11 --prec-div=false --prec-sqrt=false \
-	-arch=sm_61 \
-	-gencode=arch=compute_60,code=sm_60 \
+ 	-gencode=arch=compute_60,code=sm_60 \
 	-gencode=arch=compute_61,code=sm_61 \
-	-gencode=arch=compute_70,code=sm_70 \
-	-gencode=arch=compute_61,code=compute_61
-
+ 	-gencode=arch=compute_70,code=sm_70 \
+ 	-gencode=arch=compute_70,code=compute_70
 #  	-gencode=arch=compute_35,code=sm_35 \
 # 	-gencode=arch=compute_50,code=sm_50 \
 # 	-gencode=arch=compute_52,code=sm_52 \
+#   --keep --keep-dir tmp
 
 OBJS=\
 	$(TARGET)/batch_norm_op.o \
@@ -81,6 +80,7 @@ CU_OBJS=\
 	$(TARGET)/blocksparse_l2_norm_op_gpu.cu.o \
 	$(TARGET)/blocksparse_matmul_op_gpu.cu.o \
 	$(TARGET)/blocksparse_matmul_gated_op_gpu.cu.o \
+	$(TARGET)/blocksparse_hgemm_cn_op_gpu.cu.o \
 	$(TARGET)/blocksparse_transformer_op_gpu.cu.o \
 	$(TARGET)/cwise_linear_op_gpu.cu.o \
 	$(TARGET)/edge_bias_op_gpu.cu.o \

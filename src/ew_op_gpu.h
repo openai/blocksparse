@@ -56,247 +56,6 @@ __device__ __forceinline__ float2 to_float(float2 v) { return v; }
 __device__ __forceinline__ float4 to_float(float4 v) { return v; }
 __device__ __forceinline__ float8 to_float(float8 v) { return v; }
 
-__device__ __forceinline__ float round8(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3b000000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 8 - 1) << 23)
-        "and.b32 %0, val, 0xffff8000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-    return r;
-}
-__device__ __forceinline__ float round7(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3b800000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 7 - 1) << 23)
-        "and.b32 %0, val, 0xffff0000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-    return r;
-}
-__device__ __forceinline__ float round6(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3c000000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 6 - 1) << 23)
-        "and.b32 %0, val, 0xfffe0000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-    return r;
-}
-__device__ __forceinline__ float round5(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3c800000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 5 - 1) << 23)
-        "and.b32 %0, val, 0xfffc0000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-    return r;
-}
-__device__ __forceinline__ float round4(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3d000000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 4 - 1) << 23)
-        "and.b32 %0, val, 0xfff80000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-
-    r = fmaxf(r, -powf(2.f,  4.f));
-    r = fminf(r,  powf(2.f,  4.f));
-    r = fabs(r) < powf(2.f, -4.f) ? 0.0f : r;
-    return r;
-}
-__device__ __forceinline__ float round4w(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3d000000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 4 - 1) << 23)
-        "and.b32 %0, val, 0xfff80000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-
-    r = fmaxf(r, -powf(2.f,  1.f));
-    r = fminf(r,  powf(2.f,  1.f));
-    r = fabs(r) < powf(2.f, -7.f) ? 0.0f : r;
-    return r;
-}
-__device__ __forceinline__ float round3w(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3d800000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 3 - 1) << 23)
-        "and.b32 %0, val, 0xfff00000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-
-    r = fmaxf(r, -powf(2.f,  1.f));
-    r = fminf(r,  powf(2.f,  1.f));
-    r = fabs(r) < powf(2.f, -15.f) ? 0.0f : r;
-    return r;
-}
-__device__ __forceinline__ float round3f(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3d800000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 3 - 1) << 23)
-        "and.b32 %0, val, 0xfff00000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-
-    r = fmaxf(r, -powf(2.f,  10.f));
-    r = fminf(r,  powf(2.f,  10.f));
-    r = fabs(r) < powf(2.f, -6.f) ? 0.0f : r;
-    return r;
-}
-__device__ __forceinline__ float round3(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3d800000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 3 - 1) << 23)
-        "and.b32 %0, val, 0xfff00000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-    return r;
-}
-__device__ __forceinline__ float round2g(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3e000000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 2 - 1) << 23)
-        "and.b32 %0, val, 0xffe00000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-
-    r = fmaxf(r, -powf(2.f,  1.f));
-    r = fminf(r,  powf(2.f,  1.f));
-    r = fabs(r) < powf(2.f, -31.f) ? 0.0f : r;
-    return r;
-}
-__device__ __forceinline__ float round1(float v)
-{
-    // extract sign/exponent, scale it with an ulp, add to val and truncate (mask)
-    float r;
-    asm("{                                       \n\t"
-        ".reg .f32 exp, val;                     \n\t"
-        "and.b32 exp, %1, 0xff800000;            \n\t"
-        "fma.rz.ftz.f32 val, exp, 0F3e800000, %1;\n\t"  // ulp: "0F%08x" % ((127 - 1 - 1) << 23)
-        "and.b32 %0, val, 0xffc00000;            \n\t"
-        "}" : "=f"(r) : "f"(v));
-
-    r = fmaxf(r, -powf(2.f,  20.f));
-    r = fminf(r,  powf(2.f,  20.f));
-    r = fabs(r) < powf(2.f, -44.f) ? 0.0f : r;
-    return r;
-}
-
-// __device__ __forceinline__ float quant(float x)
-// {
-//     x = fmaxf(x, -16777216.0f);
-//     x = fminf(x,  16777216.0f);
-//     x = fabs(x) < 3.637978807091713e-12f ? 0.0f : x;
-//     return x;
-// }
-
-// bfe exp,     uint8, 1, 6;
-// bfe sign,    uint8, 7, 1;
-// shl float32, exp,     23;           // exponent
-// add float32, float32, 0x29800000;   // exponent bias shift (add 83<<23)
-// bfi float32, float32, uint8, 22, 1; // mantissa
-// bfi float32, float32, sign,  31, 1; // sign
-
-
-// and exp,   float32, 0xff800000;
-// fma float32, exp, 0F3e800000, float32; // round
-// bfe sign,  float32, 31, 1;
-// bfe exp,   float32, 23, 8;
-// bfe uint8, float32, 22, 1;    // mantissa
-// sub exp, exp, 83;             // exponent bias shift
-// bfi uint8, uint8, exp,  1, 6; // exponent
-// bfi uint8, uint8, sign, 7, 1; // sign
-
-// __device__ __forceinline__ float trunc8(float v) { asm("and.b32 %0, %0, 0xffff8000;" : "+f"(v) : ); return v; }
-// __device__ __forceinline__ float trunc7(float v) { asm("and.b32 %0, %0, 0xffff0000;" : "+f"(v) : ); return v; }
-// __device__ __forceinline__ float trunc6(float v) { asm("and.b32 %0, %0, 0xfffe0000;" : "+f"(v) : ); return v; }
-// __device__ __forceinline__ float trunc5(float v) { asm("and.b32 %0, %0, 0xfffc0000;" : "+f"(v) : ); return v; }
-// __device__ __forceinline__ float trunc4(float v) { asm("and.b32 %0, %0, 0xfff80000;" : "+f"(v) : ); return v; }
-// __device__ __forceinline__ float trunc3(float v) { asm("and.b32 %0, %0, 0xfff00000;" : "+f"(v) : ); return v; }
-
-
-// __device__ __forceinline__ float2 round8(float2 v) { UNARY_VEC2(round8, v, v); return v; }
-// __device__ __forceinline__ float2 round7(float2 v) { UNARY_VEC2(round7, v, v); return v; }
-// __device__ __forceinline__ float2 round6(float2 v) { UNARY_VEC2(round6, v, v); return v; }
-// __device__ __forceinline__ float2 round5(float2 v) { UNARY_VEC2(round5, v, v); return v; }
-// __device__ __forceinline__ float2 round4(float2 v) { UNARY_VEC2(round4, v, v); return v; }
-// __device__ __forceinline__ float2 round3(float2 v) { UNARY_VEC2(round3, v, v); return v; }
-// __device__ __forceinline__ float2 round2(float2 v) { UNARY_VEC2(round2, v, v); return v; }
-// __device__ __forceinline__ float2 round1(float2 v) { UNARY_VEC2(round1, v, v); return v; }
-
-__device__ __forceinline__ float2 round4w(float2 v) { UNARY_VEC2(round4w, v, v); return v; }
-__device__ __forceinline__ float4 round4w(float4 v) { UNARY_VEC4(round4w, v, v); return v; }
-
-__device__ __forceinline__ float2 round3w(float2 v) { UNARY_VEC2(round3w, v, v); return v; }
-__device__ __forceinline__ float4 round3w(float4 v) { UNARY_VEC4(round3w, v, v); return v; }
-
-__device__ __forceinline__ float2 round3f(float2 v) { UNARY_VEC2(round3f, v, v); return v; }
-__device__ __forceinline__ float4 round3f(float4 v) { UNARY_VEC4(round3f, v, v); return v; }
-
-__device__ __forceinline__ float2 round2g(float2 v) { UNARY_VEC2(round2g, v, v); return v; }
-__device__ __forceinline__ float4 round2g(float4 v) { UNARY_VEC4(round2g, v, v); return v; }
-
-__device__ __forceinline__ float2 round1(float2 v) { UNARY_VEC2(round1, v, v); return v; }
-__device__ __forceinline__ float4 round1(float4 v) { UNARY_VEC4(round1, v, v); return v; }
-
-__device__ __forceinline__ float2 round3(float2 v) { UNARY_VEC2(round3, v, v); return v; }
-__device__ __forceinline__ float4 round3(float4 v) { UNARY_VEC4(round3, v, v); return v; }
-
-// __device__ __forceinline__ float4 round8(float4 v) { UNARY_VEC4(round8, v, v); return v; }
-// __device__ __forceinline__ float4 round7(float4 v) { UNARY_VEC4(round7, v, v); return v; }
-// __device__ __forceinline__ float4 round6(float4 v) { UNARY_VEC4(round6, v, v); return v; }
-// __device__ __forceinline__ float4 round5(float4 v) { UNARY_VEC4(round5, v, v); return v; }
-// __device__ __forceinline__ float4 round4(float4 v) { UNARY_VEC4(round4, v, v); return v; }
-// __device__ __forceinline__ float4 round3(float4 v) { UNARY_VEC4(round3, v, v); return v; }
-// __device__ __forceinline__ float4 round2(float4 v) { UNARY_VEC4(round2, v, v); return v; }
-// __device__ __forceinline__ float4 round1(float4 v) { UNARY_VEC4(round1, v, v); return v; }
-
-// __device__ __forceinline__ float2 trunc8(float2 v) { UNARY_VEC2(trunc8, v, v); return v; }
-// __device__ __forceinline__ float2 trunc7(float2 v) { UNARY_VEC2(trunc7, v, v); return v; }
-// __device__ __forceinline__ float2 trunc6(float2 v) { UNARY_VEC2(trunc6, v, v); return v; }
-// __device__ __forceinline__ float2 trunc5(float2 v) { UNARY_VEC2(trunc5, v, v); return v; }
-// __device__ __forceinline__ float2 trunc4(float2 v) { UNARY_VEC2(trunc4, v, v); return v; }
-// __device__ __forceinline__ float2 trunc3(float2 v) { UNARY_VEC2(trunc3, v, v); return v; }
-
-// __device__ __forceinline__ float4 trunc8(float4 v) { UNARY_VEC4(trunc8, v, v); return v; }
-// __device__ __forceinline__ float4 trunc7(float4 v) { UNARY_VEC4(trunc7, v, v); return v; }
-// __device__ __forceinline__ float4 trunc6(float4 v) { UNARY_VEC4(trunc6, v, v); return v; }
-// __device__ __forceinline__ float4 trunc5(float4 v) { UNARY_VEC4(trunc5, v, v); return v; }
-// __device__ __forceinline__ float4 trunc4(float4 v) { UNARY_VEC4(trunc4, v, v); return v; }
-// __device__ __forceinline__ float4 trunc3(float4 v) { UNARY_VEC4(trunc3, v, v); return v; }
-
-
 __device__ __forceinline__ float  to_float(ehalf  v)
 {
     float r;
@@ -477,18 +236,8 @@ __device__ __forceinline__ float8 to_float(bhalf8 v)
     return r;
 }
 
-// __device__ __forceinline__ float quant(float x)
-// {
-//     x = fmaxf(x, -16777216.0f);
-//     x = fminf(x,  16777216.0f);
-//     x = fabs(x) < 3.637978807091713e-12f ? 0.0f : x;
-//     return x;
-// }
-
-
 __device__ __forceinline__ bhalf  to_bhalf(float  v)
 {
-    //v = quant(v);
     bhalf r;
     asm("{\n\t"
         ".reg .f32 f32, exp;\n\t"
@@ -503,7 +252,6 @@ __device__ __forceinline__ bhalf  to_bhalf(float  v)
 }
 __device__ __forceinline__ bhalf2 to_bhalf(float2 v)
 {
-    //UNARY_VEC2(quant, v, v);
     bhalf2 r;
     asm("{\n\t"
         ".reg .f32 exp0, exp1, f0, f1;\n\t"
@@ -520,7 +268,6 @@ __device__ __forceinline__ bhalf2 to_bhalf(float2 v)
 }
 __device__ __forceinline__ bhalf4 to_bhalf(float4 v)
 {
-    //UNARY_VEC4(quant, v, v);
     bhalf4 r;
     asm("{\n\t"
         ".reg .f32 exp<4>, f<4>;\n\t"
@@ -544,8 +291,6 @@ __device__ __forceinline__ bhalf4 to_bhalf(float4 v)
 }
 __device__ __forceinline__ bhalf8 to_bhalf(float8 v)
 {
-    //UNARY_VEC4(quant, v.a, v.a);
-    //UNARY_VEC4(quant, v.b, v.b);
     bhalf8 r;
     asm("{\n\t"
         ".reg .f32 exp<8>, f<8>;\n\t"
@@ -965,6 +710,16 @@ __device__ __forceinline__ void ew_set(float2 &a, float val) { a.x = a.y = val; 
 __device__ __forceinline__ void ew_set(float4 &a, float val) { a.x = a.y = a.z = a.w = val; }
 __device__ __forceinline__ void ew_set(float8 &v, float val) { ew_set(v.a, val); ew_set(v.b, val); }
 
+__device__ __forceinline__ void ew_set(ehalf  &a, uint val) { a.x = (ushort)val; }
+__device__ __forceinline__ void ew_set(ehalf2 &a, uint val) { a.x = val; }
+__device__ __forceinline__ void ew_set(ehalf4 &a, uint val) { a.x = a.y = val; }
+__device__ __forceinline__ void ew_set(ehalf8 &a, uint val) { a.x = a.y = a.z = a.w = val; }
+
+__device__ __forceinline__ void ew_set(bhalf  &a, uint val) { a.x = (ushort)val; }
+__device__ __forceinline__ void ew_set(bhalf2 &a, uint val) { a.x = val; }
+__device__ __forceinline__ void ew_set(bhalf4 &a, uint val) { a.x = a.y = val; }
+__device__ __forceinline__ void ew_set(bhalf8 &a, uint val) { a.x = a.y = a.z = a.w = val; }
+
 
 __device__ __forceinline__ float  _add(float x, float y) { return x + y; }
 __device__ __forceinline__ float  _sub(float x, float y) { return x - y; }
@@ -993,13 +748,48 @@ __device__ __forceinline__ float  _exp_grad(float dz, float x) { return dz * exp
 __device__ __forceinline__ float  _log_grad(float dz, float x) { return dz / x; }
 __device__ __forceinline__ float  _elu_grad(float dz, float x, float a) { return x > 0.0f ? dz : dz * (a * (expf(x) - 1.0f) + a); }
 
+__device__ __forceinline__ float _zero_inf(float x)
+{
+    asm("{                         \n\t"
+        ".reg .pred p;             \n\t"
+        "testp.infinite.f32 p, %0; \n\t"
+        "selp.f32 %0, 0.0, %0, p;  \n\t"
+        "}" : "+f"(x) :);
+    return x;
+}
 __device__ __forceinline__ float _zero_nan(float x)
 {
-    asm("{                               \n\t"
-        ".reg .pred is_number;           \n\t"
-        "testp.number.f32 is_number, %0; \n\t"
-        "selp.f32 %0, %0, 0.0, is_number;\n\t"
+    asm("{                           \n\t"
+        ".reg .pred p;               \n\t"
+        "testp.notanumber.f32 p, %0; \n\t"
+        "selp.f32 %0, 0.0, %0, p;    \n\t"
         "}" : "+f"(x) :);
+    return x;
+}
+__device__ __forceinline__ float _zero_nan_inf(float x)
+{
+    asm("{                               \n\t"
+        ".reg .pred is_finite;           \n\t"
+        "testp.finite.f32 is_finite, %0; \n\t"
+        "selp.f32 %0, %0, 0.0, is_finite;\n\t"
+        "}" : "+f"(x) :);
+    return x;
+}
+__device__ __forceinline__ float _exp_approx(float x)
+{
+    x *= 1.4426950408889634f;
+    asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(x) :);
+    return x;
+}
+__device__ __forceinline__ float _log_approx(float x)
+{
+    asm("lg2.approx.ftz.f32 %0, %0;" : "+f"(x) :);
+    x *= 0.6931471824645996f;
+    return x;
+}
+__device__ __forceinline__ float _rcp_approx(float x)
+{
+    asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(x) :);
     return x;
 }
 
@@ -1055,6 +845,7 @@ __device__ __forceinline__ float2 load_c(const bhalf2* __restrict__ in, int i=0,
 __device__ __forceinline__ float4 load_c(const bhalf4* __restrict__ in, int i=0, bool b=true) { bhalf4 v; ew_zero(v); if (b) v = in[i]; return to_float(v); }
 __device__ __forceinline__ float8 load_c(const bhalf8* __restrict__ in, int i=0, bool b=true) { bhalf8 v; ew_zero(v); if (b) v = in[i]; return to_float(v); }
 
+
 __device__ __forceinline__ void store(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
 __device__ __forceinline__ void store(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
 __device__ __forceinline__ void store(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
@@ -1090,47 +881,6 @@ __device__ __forceinline__ void store(bhalf8* out, float* v, int i=0, bool b=tru
 __device__ __forceinline__ void store( int*  out,  int v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
 __device__ __forceinline__ void store(uint*  out, uint v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
 
-// __device__ __forceinline__ void store_f(float*  out, float  v, int i=0, bool b=true) { float  r = round3f(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(float2* out, float2 v, int i=0, bool b=true) { float2 r = round3f(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(float4* out, float4 v, int i=0, bool b=true) { float4 r = round3f(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
-
-// __device__ __forceinline__ void store_g(float*  out, float  v, int i=0, bool b=true) { float  r = round2g(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(float2* out, float2 v, int i=0, bool b=true) { float2 r = round2g(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(float4* out, float4 v, int i=0, bool b=true) { float4 r = round2g(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
-
-
-// __device__ __forceinline__ void store_f(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-// __device__ __forceinline__ void store_f(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-// __device__ __forceinline__ void store_f(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-// __device__ __forceinline__ void store_f(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
-
-// __device__ __forceinline__ void store_f(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
-
-// __device__ __forceinline__ void store_f(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_f(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
-
-// __device__ __forceinline__ void store_g(ehalf*  out, float  v, int i=0, bool b=true) { ehalf  r = to_ehalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(ehalf2* out, float2 v, int i=0, bool b=true) { ehalf2 r = to_ehalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(ehalf4* out, float4 v, int i=0, bool b=true) { ehalf4 r = to_ehalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(ehalf8* out, float8 v, int i=0, bool b=true) { ehalf8 r = to_ehalf(v); if (b) __stg(out + i, r); }
-
-// __device__ __forceinline__ void store_g(bhalf*  out, float  v, int i=0, bool b=true) { bhalf  r = to_bhalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(bhalf2* out, float2 v, int i=0, bool b=true) { bhalf2 r = to_bhalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(bhalf4* out, float4 v, int i=0, bool b=true) { bhalf4 r = to_bhalf(v); if (b) __stg(out + i, r); }
-// __device__ __forceinline__ void store_g(bhalf8* out, float8 v, int i=0, bool b=true) { bhalf8 r = to_bhalf(v); if (b) __stg(out + i, r); }
-
-// __device__ __forceinline__ void store_g(float*  out, float  v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-// __device__ __forceinline__ void store_g(float2* out, float2 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-// __device__ __forceinline__ void store_g(float4* out, float4 v, int i=0, bool b=true) { if (b) __stg(out + i, v); }
-// __device__ __forceinline__ void store_g(float8* out, float8 v, int i=0, bool b=true) { return; } // not used
-
 
 // For unused code paths but the compiler still needs to process.
 __device__ __forceinline__ void store(float* out, float2 v, int i=0, bool b=true) {}
@@ -1149,6 +899,7 @@ __device__ __forceinline__ float ew_sum(float8 v) { return ew_sum(v.a) + ew_sum(
 __device__ __forceinline__ float ew_max(float  a) { return a; }
 __device__ __forceinline__ float ew_max(float2 a) { return fmaxf(a.x, a.y); }
 __device__ __forceinline__ float ew_max(float4 a) { return fmaxf(fmaxf(a.x, a.y), fmaxf(a.z, a.w)); }
+__device__ __forceinline__ float ew_max(float8 v) { return fmaxf(ew_max(v.a), ew_max(v.b)); }
 
 __device__ __forceinline__ float  ew_warp_sum(float  a, int i) { a   += shfl_xor(a, i); return a; }
 __device__ __forceinline__ float2 ew_warp_sum(float2 a, int i) { a.x += shfl_xor(a.x, i); a.y += shfl_xor(a.y, i); return a; }
@@ -1215,8 +966,13 @@ MATH_Z_X(ew_log,     logf)
 MATH_Z_X(ew_sig,     _sig)
 MATH_Z_X(ew_tanh,   tanhf)
 MATH_Z_X(ew_relu,   _relu)
+MATH_Z_X(ew_zero_inf, _zero_inf)
 MATH_Z_X(ew_zero_nan, _zero_nan)
+MATH_Z_X(ew_zero_nan_inf, _zero_nan_inf)
 
+MATH_Z_X(ew_exp_approx, _exp_approx)
+MATH_Z_X(ew_log_approx, _log_approx)
+MATH_Z_X(ew_rcp_approx, _rcp_approx)
 
 MATH_DZ_XY(ew_max_grad, _max_grad)
 MATH_DZ_XY(ew_min_grad, _min_grad)

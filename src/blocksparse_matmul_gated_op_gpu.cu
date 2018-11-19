@@ -236,10 +236,12 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_xprop(
         // Critial Section
         if (tid == 0)
             while (atomicCAS(Lock, 0, 1) != 0);
+        __syncwarp();
 
         int offsetC = locks*gridDim.x;
         int* Count = Lock + offsetC;
         int  count = *Count;
+        __syncwarp();
 
         if (count == 0)
         {
@@ -251,6 +253,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_xprop(
             store(Y, *(float8*)outY[1], N*2, bn);
 
             __threadfence();
+            __syncwarp();
 
             if (tid == 0)
                 atomicExch(Lock, 0);
@@ -269,6 +272,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_xprop(
             store(Y, y2, N*2, bn);
 
             __threadfence();
+            __syncwarp();
 
             if (tid == 0)
                 atomicExch(Lock, 0);
@@ -492,10 +496,12 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
         // Critial Section
         if (tid == 0)
             while (atomicCAS(Lock, 0, 1) != 0);
+        __syncwarp();
 
         int offsetC = locks*gridDim.x;
         int* Count = Lock + offsetC;
         int  count = *Count;
+        __syncwarp();
 
         if (count == 0)
         {
@@ -510,6 +516,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
             }
 
             __threadfence();
+            __syncwarp();
 
             if (tid == 0)
                 atomicExch(Lock, 0);
@@ -537,6 +544,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
             }
 
             __threadfence();
+            __syncwarp();
 
             if (tid == 0)
                 atomicExch(Lock, 0);

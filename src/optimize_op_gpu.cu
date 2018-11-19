@@ -12,69 +12,74 @@
 
 template <typename T, typename V>
 __global__ void adafactor_row_variance(
-    float* RV, float* RV_MEAN, const T* __restrict__ Grad, float grad_scale, float decay, float epsilon, uint K, float rcpC, float rcpK, uint sat_infs, uint zero_nans)
+    float* RV, float* RV_MEAN, const T* __restrict__ Grad, const float* __restrict__ Norm, float grad_scale, float decay, float epsilon, uint K, float rcpC, float rcpK, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint c   = blockIdx.x;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    V var_sum;
-    ew_zero(var_sum);
-
-    #pragma unroll 1
-    for (uint k = tid, offset = c*K + tid; k < K; k += blockDim.x, offset += blockDim.x)
+    // skip all optimization if the global norm is bad.
+    if (norm_scale != 0.0f)
     {
-        V grad  = load(Grad + offset);
+        uint tid = threadIdx.x;
+        uint c   = blockIdx.x;
 
-        grad = ew_mul(grad, grad_scale);
+        V var_sum;
+        ew_zero(var_sum);
 
-        // Nans => zero
-        if (zero_nans)
-            grad = ew_zero_nan(grad);
-
-        // Saturate fp16 infinity values
-        if (std::is_same<T, ehalf4>::value || std::is_same<T, ehalf>::value || sat_infs)
-            grad = ew_maximum(ew_minimum(grad, 65504.0f), -65504.0f);
-
-        var_sum = ew_add(var_sum, ew_add(ew_sqr(grad), epsilon));
-    }
-    float row_var = ew_sum(var_sum);
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        row_var += shfl_xor(row_var, i);
-
-    // if using more than 1 warp, further reduced with shared memory
-    if (blockDim.x > 32)
-    {
-        __shared__ float Share[32];
-
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Share[tid/32] = row_var;
-
-        __syncthreads();
-
-        if (tid < blockDim.x/32)
+        #pragma unroll 1
+        for (uint k = tid, offset = c*K + tid; k < K; k += blockDim.x, offset += blockDim.x)
         {
-            // first warp loads all prior reductions
-            row_var = Share[tid];
+            V grad  = load(Grad + offset);
 
-            // reduce within this first warp
-            #pragma unroll 1
-            for (int i = blockDim.x/64; i > 0; i >>= 1)
-                row_var += shfl_xor(row_var, i);
+            if (zero_infs)
+                grad = ew_zero_inf(grad);
+            if (zero_nans)
+                grad = ew_zero_nan(grad);
+            if (saturate != 0.0f)
+                grad = ew_maximum(ew_minimum(grad, saturate), -saturate);
+
+            grad = ew_mul(grad, grad_scale * norm_scale);
+
+            var_sum = ew_add(var_sum, ew_add(ew_sqr(grad), epsilon));
         }
-    }
-    if (tid == 0)
-    {
-        row_var *= rcpK;
+        float row_var = ew_sum(var_sum);
 
-        RV += c;
-        float old_rv = __ldg((const float*)RV);
+        // reduce within warp
+        for (int i = 16; i > 0; i >>= 1)
+            row_var += shfl_xor(row_var, i);
 
-        row_var = decay * old_rv + (1.0f - decay) * row_var;
-        __stg(RV, row_var);
-        atomicRed(RV_MEAN, row_var * rcpC);
+        // if using more than 1 warp, further reduced with shared memory
+        if (blockDim.x > 32)
+        {
+            __shared__ float Share[32];
+
+            // first thread of each warp store to shared
+            if ((tid & 31) == 0)
+                Share[tid/32] = row_var;
+
+            __syncthreads();
+
+            if (tid < blockDim.x/32)
+            {
+                // first warp loads all prior reductions
+                row_var = Share[tid];
+
+                // reduce within this first warp
+                #pragma unroll 1
+                for (int i = blockDim.x/64; i > 0; i >>= 1)
+                    row_var += shfl_xor(row_var, i);
+            }
+        }
+        if (tid == 0)
+        {
+            row_var *= rcpK;
+
+            RV += c;
+            float old_rv = __ldg((const float*)RV);
+
+            row_var = decay * old_rv + (1.0f - decay) * row_var;
+            __stg(RV, row_var);
+            atomicRed(RV_MEAN, row_var * rcpC);
+        }
     }
 }
 
@@ -84,68 +89,73 @@ __global__ void adafactor_row_variance(
 
 template <typename T, typename V, uint THREADS>
 __global__ void __launch_bounds__(THREADS) adafactor_col_variance(
-    V* CV, const T* __restrict__ Grad, float grad_scale, float decay, float epsilon, uint C, uint K, float rcpC, uint sat_infs, uint zero_nans)
+    V* CV, const T* __restrict__ Grad, const float* __restrict__ Norm, float grad_scale, float decay, float epsilon, uint C, uint K, float rcpC, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint k   = blockIdx.x*32 + (tid & 31);
-    uint c   = tid / 32;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    uint ck = c*K + k;
-
-    V var_sum;
-    ew_zero(var_sum);
-    if (k < K)
+    // skip all optimization if the global norm is bad.
+    if (norm_scale != 0.0f)
     {
-        #pragma unroll 1
-        while (c < C)
+        uint tid = threadIdx.x;
+        uint k   = blockIdx.x*32 + (tid & 31);
+        uint c   = tid / 32;
+
+        uint ck = c*K + k;
+
+        V var_sum;
+        ew_zero(var_sum);
+        if (k < K)
         {
-            V grad = load(Grad + ck);
+            #pragma unroll 1
+            while (c < C)
+            {
+                V grad = load(Grad + ck);
 
-            grad = ew_mul(grad, grad_scale);
+                if (zero_infs)
+                    grad = ew_zero_inf(grad);
+                if (zero_nans)
+                    grad = ew_zero_nan(grad);
+                if (saturate != 0.0f)
+                    grad = ew_maximum(ew_minimum(grad, saturate), -saturate);
 
-            // Nans => zero
-            if (zero_nans)
-                grad = ew_zero_nan(grad);
+                grad = ew_mul(grad, grad_scale * norm_scale);
 
-            // Saturate fp16 infinity values
-            if (std::is_same<T, ehalf>::value || sat_infs)
-                grad = ew_maximum(ew_minimum(grad, 65504.0f), -65504.0f);
+                var_sum = ew_add(var_sum, ew_add(ew_sqr(grad), epsilon));
 
-            var_sum = ew_add(var_sum, ew_add(ew_sqr(grad), epsilon));
-
-            ck += K*THREADS/32;
-            c  +=   THREADS/32;
+                ck += K*THREADS/32;
+                c  +=   THREADS/32;
+            }
         }
-    }
-    if (THREADS > 32)
-    {
-        __shared__ V Share[THREADS];
-        if (tid >= 64)
-            Share[tid] = var_sum;
-
-        __syncthreads();
-
-        if (tid < 64)
+        if (THREADS > 32)
         {
-            for (uint i = 1; i < THREADS/64; i++)
-                var_sum = ew_add(var_sum, Share[tid + i*64]);
+            __shared__ V Share[THREADS];
+            if (tid >= 64)
+                Share[tid] = var_sum;
 
-            Share[tid] = var_sum;
+            __syncthreads();
+
+            if (tid < 64)
+            {
+                for (uint i = 1; i < THREADS/64; i++)
+                    var_sum = ew_add(var_sum, Share[tid + i*64]);
+
+                Share[tid] = var_sum;
+            }
+            __syncthreads();
+
+            if (tid < 32)
+                var_sum = ew_add(var_sum, Share[tid + 32]);
         }
-        __syncthreads();
+        if (tid < 32 && k < K)
+        {
+            CV += k;
+            V col_var = ew_mul(var_sum, rcpC);
+            V old_cv  = __ldg((const V*)CV);
 
-        if (tid < 32)
-            var_sum = ew_add(var_sum, Share[tid + 32]);
-    }
-    if (tid < 32 && k < K)
-    {
-        CV += k;
-        V col_var = ew_mul(var_sum, rcpC);
-        V old_cv  = __ldg((const V*)CV);
+            col_var = ew_add(ew_mul(old_cv, decay), ew_mul(col_var, 1.0f - decay));
 
-        col_var = ew_add(ew_mul(old_cv, decay), ew_mul(col_var, 1.0f - decay));
-
-        __stg(CV, col_var);
+            __stg(CV, col_var);
+        }
     }
 }
 
@@ -155,68 +165,73 @@ __global__ void __launch_bounds__(THREADS) adafactor_col_variance(
 
 template <typename T, typename V>
 __global__ void adafactor_normalize_2d(
-    V* X, float* RMS_X, const T* __restrict__ Grad, const float* __restrict__ RV, const V* __restrict__ CV, const float* __restrict__ RV_MEAN, float grad_scale, uint K, float rcpCK, uint sat_infs, uint zero_nans)
+    V* X, float* RMS_X, const T* __restrict__ Grad, const float* __restrict__ Norm, const float* __restrict__ RV, const V* __restrict__ CV, const float* __restrict__ RV_MEAN, float grad_scale, uint K, float rcpCK, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint c   = blockIdx.x;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    float rv = rsqrtf(RV[c] / *RV_MEAN);
-
-    V rms_sum;
-    ew_zero(rms_sum);
-
-    #pragma unroll 1
-    for (uint k = tid, offset = c*K + tid; k < K; k += blockDim.x, offset += blockDim.x)
+    // skip all optimization if the global norm is bad.
+    if (norm_scale != 0.0f)
     {
-        V grad = load(Grad + offset);
-        V cv   = ew_rsqrt(CV[k]);
+        uint tid = threadIdx.x;
+        uint c   = blockIdx.x;
 
-        grad = ew_mul(grad, grad_scale);
+        float rv = rsqrtf(RV[c] / *RV_MEAN);
 
-        // Nans => zero
-        if (zero_nans)
-            grad = ew_zero_nan(grad);
+        V rms_sum;
+        ew_zero(rms_sum);
 
-        // Saturate fp16 infinity values
-        if (std::is_same<T, ehalf4>::value || std::is_same<T, ehalf>::value || sat_infs)
-            grad = ew_maximum(ew_minimum(grad, 65504.0f), -65504.0f);
-
-        V x = ew_mul(grad, ew_mul(cv, rv));
-
-        rms_sum = ew_add(rms_sum, ew_sqr(x));
-
-        store(X + offset, x);
-    }
-    float rms_x = ew_sum(rms_sum);
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        rms_x += shfl_xor(rms_x, i);
-
-    // if using more than 1 warp, further reduced with shared memory
-    if (blockDim.x > 32)
-    {
-        __shared__ float Share[32];
-
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Share[tid/32] = rms_x;
-
-        __syncthreads();
-
-        if (tid < blockDim.x/32)
+        #pragma unroll 1
+        for (uint k = tid, offset = c*K + tid; k < K; k += blockDim.x, offset += blockDim.x)
         {
-            // first warp loads all prior reductions
-            rms_x = Share[tid];
+            V grad = load(Grad + offset);
+            V cv   = ew_rsqrt(CV[k]);
 
-            // reduce within this first warp
-            #pragma unroll 1
-            for (int i = blockDim.x/64; i > 0; i >>= 1)
-                rms_x += shfl_xor(rms_x, i);
+            if (zero_infs)
+                grad = ew_zero_inf(grad);
+            if (zero_nans)
+                grad = ew_zero_nan(grad);
+            if (saturate != 0.0f)
+                grad = ew_maximum(ew_minimum(grad, saturate), -saturate);
+
+            grad = ew_mul(grad, grad_scale * norm_scale);
+
+            V x = ew_mul(grad, ew_mul(cv, rv));
+
+            rms_sum = ew_add(rms_sum, ew_sqr(x));
+
+            store(X + offset, x);
         }
+        float rms_x = ew_sum(rms_sum);
+
+        // reduce within warp
+        for (int i = 16; i > 0; i >>= 1)
+            rms_x += shfl_xor(rms_x, i);
+
+        // if using more than 1 warp, further reduced with shared memory
+        if (blockDim.x > 32)
+        {
+            __shared__ float Share[32];
+
+            // first thread of each warp store to shared
+            if ((tid & 31) == 0)
+                Share[tid/32] = rms_x;
+
+            __syncthreads();
+
+            if (tid < blockDim.x/32)
+            {
+                // first warp loads all prior reductions
+                rms_x = Share[tid];
+
+                // reduce within this first warp
+                #pragma unroll 1
+                for (int i = blockDim.x/64; i > 0; i >>= 1)
+                    rms_x += shfl_xor(rms_x, i);
+            }
+        }
+        if (tid == 0)
+            atomicRed(RMS_X, rms_x * rcpCK);
     }
-    if (tid == 0)
-        atomicRed(RMS_X, rms_x * rcpCK);
 }
 
 // new_v = decay * v + (1 - decay) * (grad**2 + eps1)
@@ -225,70 +240,81 @@ __global__ void adafactor_normalize_2d(
 // rms_x = np.mean(x**2, keepdims=True)
 template <typename T>
 __global__ void __launch_bounds__(32) adafactor_normalize_1d(
-    float* CV, float* X, float* RMS_X, const T* __restrict__ Grad, float grad_scale, float decay, float epsilon, uint K, float rcpK, uint sat_infs, uint zero_nans)
+    float* CV, float* X, float* RMS_X, const T* __restrict__ Grad, const float* __restrict__ Norm, float grad_scale, float decay, float epsilon, uint K, float rcpK, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint bid = blockIdx.x;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    float rms_x = 0.0f;
-
-    #pragma unroll 1
-    for (uint k = bid*32 + tid; k < K; k += gridDim.x*32)
+    // skip all optimization if the global norm is bad.
+    if (norm_scale != 0.0f)
     {
-        float grad = load(Grad + k);
-        float cv   = CV[k];
+        uint tid = threadIdx.x;
+        uint bid = blockIdx.x;
 
-        grad = ew_mul(grad, grad_scale);
+        float rms_x = 0.0f;
 
-        // Nans => zero
-        if (zero_nans)
-            grad = ew_zero_nan(grad);
+        #pragma unroll 1
+        for (uint k = bid*32 + tid; k < K; k += gridDim.x*32)
+        {
+            float grad = load(Grad + k);
+            float cv   = CV[k];
 
-        // Saturate fp16 infinity values
-        if (std::is_same<T, ehalf>::value || sat_infs)
-            grad = ew_maximum(ew_minimum(grad, 65504.0f), -65504.0f);
+            if (zero_infs)
+                grad = ew_zero_inf(grad);
+            if (zero_nans)
+                grad = ew_zero_nan(grad);
+            if (saturate != 0.0f)
+                grad = ew_maximum(ew_minimum(grad, saturate), -saturate);
 
-        float new_cv = decay * cv + (1.0f - decay) * (grad*grad + epsilon);
-        float x      = grad * rsqrtf(new_cv);
+            grad = ew_mul(grad, grad_scale * norm_scale);
 
-        CV[k] = new_cv;
-        X[k]  = x;
+            float new_cv = decay * cv + (1.0f - decay) * (grad*grad + epsilon);
+            float x      = grad * rsqrtf(new_cv);
 
-        rms_x += x*x;
+            CV[k] = new_cv;
+            X[k]  = x;
+
+            rms_x += x*x;
+        }
+        // reduce within warp
+        for (int i = 16; i > 0; i >>= 1)
+            rms_x += shfl_xor(rms_x, i);
+
+        if (tid == 0)
+            atomicRed(RMS_X, rms_x * rcpK);
     }
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        rms_x += shfl_xor(rms_x, i);
-
-    if (tid == 0)
-        atomicRed(RMS_X, rms_x * rcpK);
 }
 
 // # kernel 4
 // tf.assign_sub(param, learning_rate * x / np.maximum(1.0, np.sqrt(rms_x) / clipping_threshold) )
 template <typename V>
 __global__ void adafactor_apply(
-    V* P, const V* __restrict__ X, const float* __restrict__ RMS_X, float learning_rate, float rcp_clip, uint size)
+    V* P, const V* __restrict__ X, const float* __restrict__ RMS_X, const float* __restrict__ Norm, float learning_rate, float rcp_clip, uint size, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint bid = blockIdx.x;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    float update_rate = learning_rate / fmaxf(sqrtf(*RMS_X) * rcp_clip, 1.0f);
+    // skip all optimization if the global norm is bad.
+    if (norm_scale != 0.0f)
+    {
+        uint tid = threadIdx.x;
+        uint bid = blockIdx.x;
 
-    #pragma unroll 1
-    for (uint i = bid*blockDim.x + tid; i < size; i += gridDim.x*blockDim.x)
-        P[i] = ew_sub(P[i], ew_mul(X[i], update_rate));
+        float update_rate = learning_rate / fmaxf(sqrtf(__ldg(RMS_X)) * rcp_clip, 1.0f);
+
+        #pragma unroll 1
+        for (uint i = bid*blockDim.x + tid; i < size; i += gridDim.x*blockDim.x)
+            P[i] = ew_sub(P[i], ew_mul(X[i], update_rate));
+    }
 }
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
 template <typename T, typename V>
-bool Adafactor(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const T* grad, float scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, bool sat_infs, bool zero_nans)
+bool Adafactor(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const T* grad, const float* norm_scale, float grad_scale, float learning_rate, float decay, float epsilon, float clip_thresh, uint C, uint K, float saturate, bool zero_infs, bool zero_nans)
 {
     cuMemsetD32Async((CUdeviceptr)means, 0, 2, stream); // used for row variance mean and RMS_X
     float rcpK    = 1.0f / (float)K;
-    float rcpClip = 1.0f / clip;
+    float rcpClip = 1.0f / clip_thresh;
 
     float* rv_mean = means;
     float* rms_x   = means + 1;
@@ -298,24 +324,24 @@ bool Adafactor(CUstream stream, uint SMs, float* cv, float* rv, float* x, float*
     {
         uint gridK = MIN(MAX(SMs*2, CEIL_DIV(K, 32*4)), SMs*32*2);
 
-        adafactor_normalize_1d<T><<<gridK,32,0,stream>>>(cv, x, rms_x, grad, scale, decay, epsilon, K, rcpK, sat_infs, zero_nans);
-        adafactor_apply<float><<<gridK,32,0,stream>>>(param, x, (const float*)rms_x, learning_rate, rcpClip, K);
+        adafactor_normalize_1d<T><<<gridK,32,0,stream>>>(cv, x, rms_x, grad, norm_scale, grad_scale, decay, epsilon, K, rcpK, saturate, zero_infs, zero_nans, norm_scale != 0);
+        adafactor_apply<float><<<gridK,32,0,stream>>>(param, x, (const float*)rms_x, norm_scale, learning_rate, rcpClip, K, norm_scale != 0);
     }
     else
     {
         float rcpC = 1.0f / (float)C;
         uint gridK = CEIL_DIV(K, 32);
 
-        adafactor_col_variance<T,float,1024><<<gridK,1024,0,stream>>>(cv, grad, scale, decay, epsilon, C, K, rcpC, sat_infs, zero_nans);
+        adafactor_col_variance<T,float,1024><<<gridK,1024,0,stream>>>(cv, grad, norm_scale, grad_scale, decay, epsilon, C, K, rcpC, saturate, zero_infs, zero_nans, norm_scale != 0);
 
         if (K & 3)
         {
             uint CK = C*K;
             uint gridCK = CK > SMs*1024 ? SMs*2 : SMs;
 
-            adafactor_row_variance<T,float><<<C,1024,0,stream>>>(rv, rv_mean, grad, scale, decay, epsilon, K, rcpC, rcpK, sat_infs, zero_nans);
-            adafactor_normalize_2d<T,float><<<C,1024,0,stream>>>(x, rms_x, grad, (const float*)rv, (const float*)cv, (const float*)rv_mean, scale, K, rcpC*rcpK, sat_infs, zero_nans);
-            adafactor_apply<float><<<gridCK,1024,0,stream>>>(param, (const float*)x, (const float*)rms_x, learning_rate, rcpClip, CK);
+            adafactor_row_variance<T,float><<<C,1024,0,stream>>>(rv, rv_mean, grad, norm_scale, grad_scale, decay, epsilon, K, rcpC, rcpK, saturate, zero_infs, zero_nans, norm_scale != 0);
+            adafactor_normalize_2d<T,float><<<C,1024,0,stream>>>(x, rms_x, grad, norm_scale, (const float*)rv, (const float*)cv, (const float*)rv_mean, grad_scale, K, rcpC*rcpK, saturate, zero_infs, zero_nans, norm_scale != 0);
+            adafactor_apply<float><<<gridCK,1024,0,stream>>>(param, (const float*)x, (const float*)rms_x, norm_scale, learning_rate, rcpClip, CK, norm_scale != 0);
         }
         else
         {
@@ -327,99 +353,100 @@ bool Adafactor(CUstream stream, uint SMs, float* cv, float* rv, float* x, float*
                 CK <= SMs*256*4 ? SMs*4 :
                                   SMs*8 ;
 
-            adafactor_row_variance<V,float4><<<C,256,0,stream>>>(rv, rv_mean, (const V*)grad, scale, decay, epsilon, K, rcpC, rcpK, sat_infs, zero_nans);
-            adafactor_normalize_2d<V,float4><<<C,256,0,stream>>>((float4*)x, rms_x, (const V*)grad, (const float*)rv, (const float4*)cv, (const float*)rv_mean, scale, K, rcpC*rcpK, sat_infs, zero_nans);
-            adafactor_apply<float4><<<gridCK,256,0,stream>>>((float4*)param, (const float4*)x, (const float*)rms_x, learning_rate, rcpClip, CK);
+            adafactor_row_variance<V,float4><<<C,256,0,stream>>>(rv, rv_mean, (const V*)grad, norm_scale, grad_scale, decay, epsilon, K, rcpC, rcpK, saturate, zero_infs, zero_nans, norm_scale != 0);
+            adafactor_normalize_2d<V,float4><<<C,256,0,stream>>>((float4*)x, rms_x, (const V*)grad, norm_scale, (const float*)rv, (const float4*)cv, (const float*)rv_mean, grad_scale, K, rcpC*rcpK, saturate, zero_infs, zero_nans, norm_scale != 0);
+            adafactor_apply<float4><<<gridCK,256,0,stream>>>((float4*)param, (const float4*)x, (const float*)rms_x, norm_scale, learning_rate, rcpClip, CK, norm_scale != 0);
         }
     }
     return true;
 }
-template bool Adafactor<float,float4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const float* grad, float scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, bool sat_infs, bool zero_nans);
-template bool Adafactor<ehalf,ehalf4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const ehalf* grad, float scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, bool sat_infs, bool zero_nans);
-template bool Adafactor<bhalf,bhalf4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const bhalf* grad, float scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, bool sat_infs, bool zero_nans);
+template bool Adafactor<float,float4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const float* grad, const float* norm_scale, float grad_scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, float saturate, bool zero_infs, bool zero_nans);
+template bool Adafactor<ehalf,ehalf4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const ehalf* grad, const float* norm_scale, float grad_scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, float saturate, bool zero_infs, bool zero_nans);
+template bool Adafactor<bhalf,bhalf4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const bhalf* grad, const float* norm_scale, float grad_scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, float saturate, bool zero_infs, bool zero_nans);
 
 
 template <typename TG, typename TR>
-__global__ void apply_lazy_adam(
+__global__ void apply_lazy_emb_adam(
           float*              Param,
              TR*              Mean,
              TR*              Var,
     const    TG* __restrict__ Grad,
-    float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint K, uint sat_infs, uint zero_nans)
+    const float* __restrict__ Norm,
+    float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint K, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint c = blockIdx.x;
-    uint k = blockIdx.y*blockDim.x + tid;
-    uint offset = c*K + k;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    float g = load(add_ptr_u(Grad, offset), 0, k < K);
-
-    // Nans => zero
-    if (zero_nans)
-        asm("{                               \n\t"
-            ".reg .pred is_number;           \n\t"
-            "testp.number.f32 is_number, %0; \n\t"
-            "selp.f32 %0, %0, 0.0, is_number;\n\t"
-            "}" : "+f"(g) :);
-
-    // Saturate fp16 infinity values
-    if (std::is_same<TG, ehalf>::value || sat_infs)
-        g = fmaxf(fminf(g, 65504.0f), -65504.0f);
-
-    // max reduce gradient within this block.
-    // If the whole block is zero that means that this embedding vector was not selected.
-    // If the emb vector is bigger than the block then at least the probability is high of non-selection.
-    // Make Adam a no-op in this case.
-    float gmax = fabsf(g);
-    for (int i = 16; i > 0; i >>= 1)
-        gmax = fmaxf(gmax, shfl_xor(gmax, i));
-
-    if (blockDim.x > 32)
+    if (norm_scale != 0.0f)
     {
-        __shared__ float Share[32];
+        uint tid = threadIdx.x;
+        uint c   = blockIdx.x;
+        uint k   = blockIdx.y*blockDim.x + tid;
+        uint offset = c*K + k;
 
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Share[tid/32] = gmax;
-        __syncthreads();
+        float g = load(add_ptr_u(Grad, offset), 0, k < K);
 
-        if (tid < 32)
+        if (zero_infs)
+            g = ew_zero_inf(g);
+        if (zero_nans)
+            g = ew_zero_nan(g);
+        if (saturate != 0.0f)
+            g = ew_maximum(ew_minimum(g, saturate), -saturate);
+
+        // max reduce gradient within this block.
+        // If the whole block is zero that means that this embedding vector was not selected.
+        // If the emb vector is bigger than the block then at least the probability is high of non-selection.
+        // Make Adam a no-op in this case.
+        float gmax = fabsf(g);
+        for (int i = 16; i > 0; i >>= 1)
+            gmax = fmaxf(gmax, shfl_xor(gmax, i));
+
+        if (blockDim.x > 32)
         {
-            // first warp loads all prior reductions
-            gmax = Share[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (int i = blockDim.x/64; i > 0; i >>= 1)
-                gmax = fmaxf(gmax, shfl_xor(gmax, i));
-            // final reduction to shared
-            Share[tid] = gmax;
+            __shared__ float Share[32];
+
+            // first thread of each warp store to shared
+            if ((tid & 31) == 0)
+                Share[tid/32] = gmax;
+            __syncthreads();
+
+            if (tid < 32)
+            {
+                // first warp loads all prior reductions
+                gmax = Share[tid];
+                // reduce within this last warp
+                #pragma unroll 1
+                for (int i = blockDim.x/64; i > 0; i >>= 1)
+                    gmax = fmaxf(gmax, shfl_xor(gmax, i));
+                // final reduction to shared
+                Share[tid] = gmax;
+            }
+            __syncthreads();
+            gmax = Share[0];
         }
-        __syncthreads();
-        gmax = Share[0];
-    }
 
-    if (k < K && gmax > 0.0f)
-    {
-        float v = load(add_ptr_u((const    TR*)Var,   offset));
-        float m = load(add_ptr_u((const    TR*)Mean,  offset));
-        float p = load(add_ptr_u((const float*)Param, offset));
-
-        g *= grad_scale;
-        v  = decay_var * v + (1.0f - decay_var) * g*g;
-
-        float sigma = sqrtf(v);
-        if (clip_sigma != 0.0f)
+        if (k < K && gmax > 0.0f)
         {
-            float clip = clip_sigma * sigma;
-            g = fmaxf(g, -clip);
-            g = fminf(g,  clip);
-        }
-        m  = decay_mean * m + (1.0f - decay_mean) * g;
-        p -= lr * m / (sigma + epsilon);
+            float v = load(add_ptr_u((const    TR*)Var,   offset));
+            float m = load(add_ptr_u((const    TR*)Mean,  offset));
+            float p = load(add_ptr_u((const float*)Param, offset));
 
-        store(add_ptr_u(Mean,  offset), m);
-        store(add_ptr_u(Var,   offset), v);
-        store(add_ptr_u(Param, offset), p);
+            g *= grad_scale * norm_scale;
+            v  = decay_var * v + (1.0f - decay_var) * g*g;
+
+            float sigma = sqrtf(v);
+            if (clip_sigma != 0.0f)
+            {
+                float clip = clip_sigma * sigma;
+                g = fmaxf(g, -clip);
+                g = fminf(g,  clip);
+            }
+            m  = decay_mean * m + (1.0f - decay_mean) * g;
+            p -= lr * m / (sigma + epsilon);
+
+            store(add_ptr_u(Mean,  offset), m);
+            store(add_ptr_u(Var,   offset), v);
+            store(add_ptr_u(Param, offset), p);
+        }
     }
 }
 
@@ -429,69 +456,57 @@ __global__ void apply_adam(
              TR*              Mean,
              TR*              Var,
     const    TG* __restrict__ Grad,
-    float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint sat_infs, uint zero_nans)
+    const float* __restrict__ Norm,
+    float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
-    uint tid = threadIdx.x;
-    uint bid = blockIdx.x;
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
 
-    for (uint offset = bid*blockDim.x + tid; offset < size; offset += gridDim.x*blockDim.x)
+    // skip all optimization if the global norm is bad.
+    if (norm_scale != 0.0f)
     {
-        float g = load(add_ptr_u(              Grad,  offset));
-        float v = load(add_ptr_u((const    TR*)Var,   offset));
-        float m = load(add_ptr_u((const    TR*)Mean,  offset));
-        float p = load(add_ptr_u((const float*)Param, offset));
+        uint tid = threadIdx.x;
+        uint bid = blockIdx.x;
 
-        // Nans => zero
-        if (zero_nans)
-            asm("{                               \n\t"
-                ".reg .pred is_number;           \n\t"
-                "testp.number.f32 is_number, %0; \n\t"
-                "selp.f32 %0, %0, 0.0, is_number;\n\t"
-                "}" : "+f"(g) :);
-
-        // Saturate fp16 infinity values
-        if (std::is_same<TG, ehalf>::value || sat_infs)
-            g = fmaxf(fminf(g, 65504.0f), -65504.0f);
-
-        g *= grad_scale;
-        v  = decay_var * v + (1.0f - decay_var) * g*g;
-
-        float sigma = sqrtf(v);
-        if (clip_sigma != 0.0f)
+        for (uint offset = bid*blockDim.x + tid; offset < size; offset += gridDim.x*blockDim.x)
         {
-            float clip = clip_sigma * sigma;
-            g = fmaxf(g, -clip);
-            g = fminf(g,  clip);
-        }
-        m  = decay_mean * m + (1.0f - decay_mean) * g;
-        p -= lr * m / (sigma + epsilon);
+            float g = load(add_ptr_u(              Grad,  offset));
+            float v = load(add_ptr_u((const    TR*)Var,   offset));
+            float m = load(add_ptr_u((const    TR*)Mean,  offset));
+            float p = load(add_ptr_u((const float*)Param, offset));
 
-        store(add_ptr_u(Mean,  offset), m);
-        store(add_ptr_u(Var,   offset), v);
-        store(add_ptr_u(Param, offset), p);
+            if (zero_infs)
+                g = ew_zero_inf(g);
+            if (zero_nans)
+                g = ew_zero_nan(g);
+            if (saturate != 0.0f)
+                g = ew_maximum(ew_minimum(g, saturate), -saturate);
+
+            g *= grad_scale * norm_scale;
+            v  = decay_var * v + (1.0f - decay_var) * g*g;
+
+            float sigma = sqrtf(v);
+            if (clip_sigma != 0.0f)
+            {
+                float clip = clip_sigma * sigma;
+                g = fmaxf(g, -clip);
+                g = fminf(g,  clip);
+            }
+            m  = decay_mean * m + (1.0f - decay_mean) * g;
+            p -= lr * m / (sigma + epsilon);
+
+            store(add_ptr_u(Mean,  offset), m);
+            store(add_ptr_u(Var,   offset), v);
+            store(add_ptr_u(Param, offset), p);
+        }
     }
 }
+
 template <typename TG, typename TR>
-bool ApplyAdam(
-  CUstream stream, uint SMs,
-  const TG* grad,
-  float* param,
-  TR* mean,
-  TR* var,
-  float lr,
-  float decay_mean,
-  float decay_var,
-  float epsilon,
-  float grad_scale,
-  float clip_sigma,
-  uint  size,
-  uint  lazy_update,
-  bool  sat_infs,
-  bool  zero_nans)
+bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, const float* norm_scale, float* param, TR* mean, TR* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint  size, uint  lazy_emb, float saturate, bool zero_infs, bool zero_nans)
 {
-    if (lazy_update)
+    if (lazy_emb)
     {
-        uint K = lazy_update;
+        uint K = lazy_emb;
         uint C = size;
         uint threads, gridK;
         if (K <= 1024) {
@@ -502,7 +517,7 @@ bool ApplyAdam(
             threads = 256;
             gridK   = CEIL_DIV(K, 256);
         }
-        apply_lazy_adam<TG,TR><<<dim3(C,gridK,1),threads,0,stream>>>(param, mean, var, grad, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, K, sat_infs, zero_nans);
+        apply_lazy_emb_adam<TG,TR><<<dim3(C,gridK,1),threads,0,stream>>>(param, mean, var, grad, norm_scale, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, K, saturate, zero_infs, zero_nans, norm_scale != 0);
     }
     else
     {
@@ -513,13 +528,13 @@ bool ApplyAdam(
         else if (size > SMs* 128) { threads =  256; }
         else if (size > SMs*  64) { threads =  128; }
 
-        apply_adam<TG,TR><<<grid,threads,0,stream>>>(param, mean, var, grad, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, size, sat_infs, zero_nans);
+        apply_adam<TG,TR><<<grid,threads,0,stream>>>(param, mean, var, grad, norm_scale, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, size, saturate, zero_infs, zero_nans, norm_scale != 0);
     }
     return true;
 }
-template bool ApplyAdam<float,float>(CUstream stream, uint SMs, const float* grad, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, bool sat_infs, bool zero_nans);
-template bool ApplyAdam<ehalf,float>(CUstream stream, uint SMs, const ehalf* grad, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, bool sat_infs, bool zero_nans);
-template bool ApplyAdam<bhalf,float>(CUstream stream, uint SMs, const bhalf* grad, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, bool sat_infs, bool zero_nans);
+template bool ApplyAdam<float,float>(CUstream stream, uint SMs, const float* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<ehalf,float>(CUstream stream, uint SMs, const ehalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<bhalf,float>(CUstream stream, uint SMs, const bhalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
 
 
 template <typename TG, typename TR, uint BSIZE, uint THREADS>
@@ -528,8 +543,9 @@ __global__ void __launch_bounds__(THREADS) apply_adam_gated(
              TR*              Mean,
              TR*              Var,
     const    TG* __restrict__ Grad,
+    const float* __restrict__ Norm,
     const float* __restrict__ Gate,
-    float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma)
+    float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
 {
     const uint U = BSIZE*BSIZE/THREADS;
 
@@ -553,6 +569,13 @@ __global__ void __launch_bounds__(THREADS) apply_adam_gated(
 
         for (uint j = 0; j < U; j++)
         {
+            if (zero_infs)
+                g[j] = ew_zero_inf(g[j]);
+            if (zero_nans)
+                g[j] = ew_zero_nan(g[j]);
+            if (saturate != 0.0f)
+                g[j] = ew_maximum(ew_minimum(g[j], saturate), -saturate);
+
             g[j] *= grad_scale;
             v[j]  = decay_var  * v[j] + (1.0f - decay_var ) * g[j] * g[j];
 
@@ -574,34 +597,20 @@ __global__ void __launch_bounds__(THREADS) apply_adam_gated(
 }
 
 template <typename TG, typename TR>
-bool ApplyAdamGated(
-  CUstream stream,
-  const float* gate,
-  const TG* grad,
-  float* param,
-  TR* mean,
-  TR* var,
-  float lr,
-  float decay_mean,
-  float decay_var,
-  float epsilon,
-  float grad_scale,
-  float clip_sigma,
-  uint  blocks,
-  uint  bsize)
+bool ApplyAdamGated(CUstream stream, const float* gate, const TG* grad, const float* norm_scale, float* param, TR* mean, TR* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint  blocks, uint  bsize, float saturate, bool zero_infs, bool zero_nans)
 {
     if (bsize == 8)
-        apply_adam_gated<TG,TR, 8, 32><<<blocks, 32,0,stream>>>(param, mean, var, grad, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma);
+        apply_adam_gated<TG,TR, 8, 32><<<blocks, 32,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
     else if (bsize == 16)
-        apply_adam_gated<TG,TR,16, 64><<<blocks, 64,0,stream>>>(param, mean, var, grad, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma);
+        apply_adam_gated<TG,TR,16, 64><<<blocks, 64,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
     else
-        apply_adam_gated<TG,TR,32,256><<<blocks,256,0,stream>>>(param, mean, var, grad, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma);
+        apply_adam_gated<TG,TR,32,256><<<blocks,256,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
     return true;
 }
 
-template bool ApplyAdamGated<float,float>(CUstream stream, const float* gate, const float* grad, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize);
-template bool ApplyAdamGated<ehalf,float>(CUstream stream, const float* gate, const ehalf* grad, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize);
-template bool ApplyAdamGated<bhalf,float>(CUstream stream, const float* gate, const bhalf* grad, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize);
+template bool ApplyAdamGated<float,float>(CUstream stream, const float* gate, const float* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdamGated<ehalf,float>(CUstream stream, const float* gate, const ehalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdamGated<bhalf,float>(CUstream stream, const float* gate, const bhalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
 
 
 
@@ -846,5 +855,146 @@ bool BlocksparseMaxnormPrune(CUstream stream, const T* param, float* gate, float
     return true;
 }
 template bool BlocksparseMaxnormPrune<float>(CUstream stream, const float* param, float* gate, float threshold, uint blocks, uint bsize);
+
+
+
+template <typename T, typename V>
+__global__ void __launch_bounds__(1024) reduce_sum_squared(float* SumSquared, const T* X, uint size, float grad_scale, float saturate, uint zero_infs, uint zero_nans)
+{
+    __shared__ float Share[32];
+
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    // check if this block has any work to do
+    if (bid * 1024 < size)
+    {
+        float sum_squared = 0.0f;
+        #pragma unroll 1
+        for (uint offset = bid * 1024 + tid; offset < size; offset += gridDim.x*1024)
+        {
+            V x = load(X + offset);
+
+            if (zero_infs)
+                x = ew_zero_inf(x);
+            if (zero_nans)
+                x = ew_zero_nan(x);
+            if (saturate != 0.0f)
+                x = ew_maximum(ew_minimum(x, saturate), -saturate);
+
+            x = ew_mul(x, grad_scale);
+            sum_squared += ew_sum(ew_sqr(x));
+        }
+
+        // reduce within warp
+        #pragma unroll
+        for (int i = 16; i > 0; i >>= 1)
+            sum_squared += shfl_xor(sum_squared, i);
+
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = sum_squared;
+
+        __syncthreads();
+
+        if (tid < 32)
+        {
+            // first warp loads all prior reductions
+            sum_squared = Share[tid];
+
+            // reduce within this last warp
+            for (int i = 16; i > 0; i >>= 1)
+                sum_squared += shfl_xor(sum_squared, i);
+
+            if (tid == 0)
+                atomicRed(SumSquared, sum_squared);
+        }
+    }
+}
+
+
+template <typename T, typename V>
+bool ReduceSumSquared(CUstream stream, uint SMs, float* sum_squared, const T* x, uint size, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint tensor_idx, uint tensor_cnt)
+{
+    if (tensor_idx == 0)
+       cuMemsetD32Async((CUdeviceptr)sum_squared, 0, tensor_cnt, stream);
+
+    sum_squared += tensor_idx;
+
+    if ((size & 3) == 0 && size > SMs*1024)
+    {
+        size >>= 2;
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        reduce_sum_squared<V,float4><<<grid,1024,0,stream>>>(sum_squared, (const V*)x, size, grad_scale, saturate, zero_infs, zero_nans);
+    }
+    else
+    {
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        reduce_sum_squared<T,float><<<grid,1024,0,stream>>>(sum_squared, x, size, grad_scale, saturate, zero_infs, zero_nans);
+    }
+    return true;
+}
+template bool ReduceSumSquared<float,float4>(CUstream stream, uint SMs, float* sum_squared, const float* x, uint size, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint tensor_idx, uint tensor_cnt);
+template bool ReduceSumSquared<bhalf,bhalf4>(CUstream stream, uint SMs, float* sum_squared, const bhalf* x, uint size, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint tensor_idx, uint tensor_cnt);
+template bool ReduceSumSquared<ehalf,ehalf4>(CUstream stream, uint SMs, float* sum_squared, const ehalf* x, uint size, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint tensor_idx, uint tensor_cnt);
+
+__global__ void compute_clip_norm(float* Norm, float* Scale, const float* SumSquared, float clip_norm, uint tensor_cnt)
+{
+    __shared__ float Share[32];
+
+    uint tid = threadIdx.x;
+
+    float sum_squared = 0.0f;
+    #pragma unroll 1
+    for (uint offset = tid; offset < tensor_cnt; offset += 1024)
+        sum_squared += __ldg(SumSquared + offset);
+
+    // reduce within warp
+    #pragma unroll
+    for (int i = 16; i > 0; i >>= 1)
+        sum_squared += shfl_xor(sum_squared, i);
+
+    // first thread of each warp store to shared
+    if ((tid & 31) == 0)
+        Share[tid/32] = sum_squared;
+
+    __syncthreads();
+
+    if (tid < 32)
+    {
+        // first warp loads all prior reductions
+        sum_squared = Share[tid];
+
+        // reduce within this last warp
+        for (int i = 16; i > 0; i >>= 1)
+            sum_squared += shfl_xor(sum_squared, i);
+
+        if (tid == 0)
+        {
+            float global_norm = sqrtf(sum_squared);
+
+            uint is_finite;
+            asm("{                               \n\t"
+                ".reg .pred is_finite;           \n\t"
+                "testp.finite.f32 is_finite, %1; \n\t"
+                "selp.u32 %0, 1, 0, is_finite;   \n\t"
+                "}" : "=r"(is_finite) : "f"(global_norm));
+
+            if (is_finite == 1)
+                *Scale = clip_norm / fmaxf(global_norm, clip_norm);
+            else
+                *Scale = 0.0f; // use zero for sentinal value to skip updates
+
+            *Norm = global_norm;
+        }
+    }
+}
+
+bool ComputeClipNorm(CUstream stream, float* l2norm, float* scale, float* sum_squared, float clip_norm, uint tensor_cnt)
+{
+    compute_clip_norm<<<1,1024,0,stream>>>(l2norm, scale, (const float*)sum_squared, clip_norm, tensor_cnt);
+    return true;
+}
+
 
 #endif
