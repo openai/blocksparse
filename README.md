@@ -1,3 +1,5 @@
+**Status:** Maintenance (expect bug fixes and minor updates)
+
 # Blocksparse
 
 The `blocksparse` package contains TensorFlow Ops and corresponding GPU kernels for block-sparse matrix multiplication.  Also included are related ops like edge bias, sparse weight norm and layer norm.
