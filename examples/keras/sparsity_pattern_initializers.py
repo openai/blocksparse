@@ -1,5 +1,8 @@
+from tensorflow.python.keras.utils.generic_utils import deserialize_keras_object
+from tensorflow.python.keras.utils.generic_utils import serialize_keras_object
 import networkx as nx
 import numpy as np
+import six
 
 
 class SparsityMaskInitializer(object):
@@ -49,3 +52,36 @@ class BarabasiAlbert(SparsityMaskInitializer):
         a = nx.adjacency_matrix(g).toarray().astype(np.int32) + np.eye(n, dtype=np.int32)
         a[0:self.m,0:self.m] = 1        
         return a[:shape[0], :shape[1]]
+    
+    def get_config(self):
+        return {'m': self.m}
+
+# Compatibility aliases
+barabasi_albert = BarabasiAlbert
+
+# Utility functions
+def serialize(initializer):
+    return serialize_keras_object(initializer)
+
+
+def deserialize(config, custom_objects=None):
+    return deserialize_keras_object(
+        config,
+        module_objects=globals(),
+        custom_objects=custom_objects,
+        printable_module_name='initializer')
+
+
+def get(identifier):
+    if identifier is None:
+        return None
+    if isinstance(identifier, dict):
+        return deserialize(identifier)
+    elif isinstance(identifier, six.string_types):
+        config = {'class_name': str(identifier), 'config': {}}
+        return deserialize(config)
+    elif callable(identifier):
+        return identifier
+    else:
+        raise ValueError('Could not interpret initializer identifier: ' +
+                         str(identifier))

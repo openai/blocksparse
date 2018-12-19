@@ -11,6 +11,8 @@ from tensorflow.python.keras.layers import InputSpec
 from tensorflow.python.keras.layers import Layer
 from tensorflow.python.ops import nn
 from blocksparse.matmul import BlocksparseMatMul
+import sparsity_pattern_initializers as sp_initializers
+import numpy as np
 
 class BlockSparse(Layer):
     """ A blocksparse variant of a regular densely-connected NN layer.
@@ -37,11 +39,14 @@ class BlockSparse(Layer):
     
     Arguments:
         units: Positive integer, dimensionality of the output space.
-        sparsity_mask_initializer: Initializer for the sparsity mask
-          of the `kernel` weights matrix.
         blocksize: values 32, 16, 8 supported
-        feature_axis Boolean, when block_size is less than 32 memory access becomes far more efficient
-          with a (C,N) activation layout
+        feature_axis Boolean, when block_size is less than 32 memory
+          access becomes far more efficient with a (C,N) activation layout
+        sparsity_mask_initializer: Initializer for the sparsity mask for
+          the blocksparse weight matrix of the `kernel` weights matrix.
+        sparsity_mask: Boolean numpy array, defines the sparsity mask for
+          the blocksparse weight matrix. If a mask is given the 
+          sparsity_mask_initializer will not be used.
         activation: Activation function to use.
           If you don't specify anything, no activation is applied
           (ie. "linear" activation: `a(x) = x`).
@@ -66,9 +71,10 @@ class BlockSparse(Layer):
     
     def __init__(self,
                  units,
-                 sparsity_mask_initializer,
                  blocksize=32,
                  feature_axis=1,
+                 sparsity_mask_initializer='barabasi_albert',
+                 sparsity_mask=None,
                  activation=None,
                  use_bias=True,
                  kernel_initializer='glorot_uniform',
@@ -83,7 +89,7 @@ class BlockSparse(Layer):
         super(BlockSparse, self).__init__(
             activity_regularizer=regularizers.get(activity_regularizer), **kwargs)
         self.units = units
-        self.sparsity_mask_initializer = sparsity_mask_initializer
+        self.sparsity_mask_initializer = sp_initializers.get(sparsity_mask_initializer)
         self.blocksize = blocksize
         self.feature_axis = feature_axis
         self.activation = activations.get(activation)
@@ -95,7 +101,10 @@ class BlockSparse(Layer):
         self.kernel_constraint = constraints.get(kernel_constraint)
         self.bias_constraint = constraints.get(bias_constraint)
 
-        self.sparsity_mask = None
+        if sparsity_mask is not None:
+            self._initial_sparsity_mask = sparsity_mask
+        else:
+            self._initial_sparsity_mask = None
 
     def build(self, input_shape):
         input_shape = tensor_shape.TensorShape(input_shape)
@@ -112,9 +121,15 @@ class BlockSparse(Layer):
         
         mask_shape=(input_shape[-1].value//self.blocksize, self.units//self.blocksize)
         
-        self.sparsity_mask = self.sparsity_mask_initializer(mask_shape)
+        if self._initial_sparsity_mask is not None:
+            if self._initial_sparsity_mask.shape != mask_shape:
+                raise ValueError('Incorrect shape for initial sparsity expected {} got {}'.format(mask_shape,
+                self._initial_sparsity_mask.shape))
+            sparsity_mask = self._initial_sparsity_mask
+        else:
+            sparsity_mask = self.sparsity_mask_initializer(mask_shape)
 
-        self.bsmm = BlocksparseMatMul(self.sparsity_mask,
+        self.bsmm = BlocksparseMatMul(sparsity_mask,
                                       block_size=self.blocksize,
                                       feature_axis=self.feature_axis,
                                       name=self.name + '_bsmm')
@@ -151,3 +166,24 @@ class BlockSparse(Layer):
 
     def compute_output_shape(self, input_shape):
         return (input_shape[0], self.units)
+
+    def get_config(self):
+        config = {
+            'units': self.units,
+            'blocksize': self.blocksize,
+            'feature_axis': self.feature_axis,
+            'sparsity_mask_initializer': sp_initializers.serialize(self.sparsity_mask_initializer),
+            'sparsity_mask': self._initial_sparsity_mask,
+            'activation': activations.serialize(self.activation),
+            'use_bias': self.use_bias,
+            'kernel_initializer': initializers.serialize(self.kernel_initializer),
+            'bias_initializer': initializers.serialize(self.bias_initializer),
+            'kernel_regularizer': regularizers.serialize(self.kernel_regularizer),
+            'bias_regularizer': regularizers.serialize(self.bias_regularizer),
+            'activity_regularizer':
+                regularizers.serialize(self.activity_regularizer),
+            'kernel_constraint': constraints.serialize(self.kernel_constraint),
+            'bias_constraint': constraints.serialize(self.bias_constraint)
+        }
+        base_config = super(BlockSparse, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
