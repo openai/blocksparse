@@ -102,6 +102,9 @@ class BlockSparse(Layer):
         self.bias_constraint = constraints.get(bias_constraint)
 
         if sparsity_mask is not None:
+            if isinstance(sparsity_mask, dict):
+                if sparsity_mask.get('type') == 'ndarray':
+                    sparsity_mask = np.array(sparsity_mask['value'])
             self._initial_sparsity_mask = sparsity_mask
         else:
             self._initial_sparsity_mask = None
@@ -173,7 +176,7 @@ class BlockSparse(Layer):
             'blocksize': self.blocksize,
             'feature_axis': self.feature_axis,
             'sparsity_mask_initializer': sp_initializers.serialize(self.sparsity_mask_initializer),
-            'sparsity_mask': self._initial_sparsity_mask,
+            'sparsity_mask': self.bsmm.layout,
             'activation': activations.serialize(self.activation),
             'use_bias': self.use_bias,
             'kernel_initializer': initializers.serialize(self.kernel_initializer),
