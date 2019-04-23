@@ -1,4 +1,4 @@
-__version__ = '1.13.0_master'
+__version__ = '1.13.1_master'
 
 from blocksparse.utils import (
     _op_module,
@@ -109,8 +109,10 @@ from blocksparse.optimize import (
     blocksparse_prune,
     clip_by_global_norm,
     global_norm,
-    blocksparse_adam_op,
+    adafactor2d_op,
+    adafactor1d_op,
     adam_op,
+    blocksparse_adam_op,
 )
 
 from blocksparse.quantize import (
