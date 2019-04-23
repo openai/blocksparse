@@ -278,7 +278,7 @@ __global__ void __launch_bounds__(128) layer_norm_dg_db_CN(
     int k     = idx_K + tid16;
 
     __syncthreads();
-
+    float dg = 0.0f, db = 0.0f;
     if (k < K)
     {
         int N4 = N >> 2;
@@ -309,20 +309,19 @@ __global__ void __launch_bounds__(128) layer_norm_dg_db_CN(
             dg4 = ew_add(ew_mul(dy, xhat), dg4);
             db4 = ew_add(dy, db4);
         }
-        float dg = ew_sum(dg4);
-        float db = ew_sum(db4);
-
-        // reduce each half warp
-        for (int i = 8; i > 0; i >>= 1)
-        {
-            dg += shfl_xor(dg, i);
-            db += shfl_xor(db, i);
-        }
-        if (tid15 == 0)
-        {
-            DG[k] = dg;
-            DB[k] = db;
-        }
+        dg = ew_sum(dg4);
+        db = ew_sum(db4);
+    }
+    // reduce each half warp
+    for (int i = 8; i > 0; i >>= 1)
+    {
+        dg += shfl_xor(dg, i);
+        db += shfl_xor(db, i);
+    }
+    if (k < K && tid15 == 0)
+    {
+        DG[k] = dg;
+        DB[k] = db;
     }
 }
 

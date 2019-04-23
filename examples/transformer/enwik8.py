@@ -10,17 +10,10 @@ unzip enwik8.zip -d /tmp
 '''
 
 import argparse
-import numpy as np
-import tensorflow as tf
+import numpy       as np
+import tensorflow  as tf
+import blocksparse as bs
 from mpi4py import MPI
-from blocksparse.transformer import BlocksparseTransformer, softmax_cross_entropy
-from blocksparse.optimize    import AdamOptimizer, AdafactorOptimizer, ClipGlobalNorm
-from blocksparse.norms       import layer_norm
-from blocksparse.embed       import embedding_lookup
-from blocksparse.ewops       import bias_relu, float_cast, scale_tensor
-from blocksparse.nccl        import allreduce, group_allreduce, sync_variables_op
-from blocksparse.quantize    import log_stats
-
 
 def layernorm(x, scope, epsilon=1e-5, relu=False):
     """
@@ -30,7 +23,7 @@ def layernorm(x, scope, epsilon=1e-5, relu=False):
     with tf.variable_scope(scope):
         gain = tf.get_variable('gain', [n_state], initializer=tf.constant_initializer(1.0))
         bias = tf.get_variable('bias', [n_state], initializer=tf.constant_initializer(0.0))
-        return layer_norm(x, gain, bias, axis=-1, epsilon=epsilon, relu=relu)
+        return bs.layer_norm(x, gain, bias, axis=-1, epsilon=epsilon, relu=relu)
 
 
 def conv1d(x, scope, nf, relu=False):
@@ -47,7 +40,7 @@ def conv1d(x, scope, nf, relu=False):
             x = tf.reshape(x, [-1, nx])
 
         # avoid atomics in bias grad, but be careful as tf handles temp memory badly in the presense of async ops like all-reduce
-        y = bias_relu(tf.matmul(x, fp16(w)), b, relu=relu, atomics=False)
+        y = bs.bias_relu(tf.matmul(x, fp16(w)), b, relu=relu, atomics=False)
 
         if ndims > 2:
             y = tf.reshape(y, y_shape)
@@ -82,17 +75,17 @@ def get_blocksparse_attention_ops(n_timesteps, n_heads):
     for q_idx, k_idx in np.ndindex(n_time_blocks, n_time_blocks):
         if k_idx > q_idx:
             layout[q_idx, k_idx] = 0
-    bst = BlocksparseTransformer(layout, block_size=blocksize, mask_callback=causal_subblock_mask, heads=n_heads)
+    bst = bs.BlocksparseTransformer(layout, block_size=blocksize, mask_callback=causal_subblock_mask, heads=n_heads)
     return bst
 
 
 def fp16(x):
     # no need to cast the gradients back to fp32 as the all-reduce and optimizers handle fp16/fp32 mixed precision
-    return float_cast(x, dtype=tf.float16, dx_dtype=tf.float16)
+    return bs.float_cast(x, dtype=tf.float16, dx_dtype=tf.float16)
 
 
 def fp32(x):
-    return float_cast(x, dtype=tf.float32)
+    return bs.float_cast(x, dtype=tf.float32)
 
 
 def attention(x, scope, n_head, n_timesteps):
@@ -150,7 +143,7 @@ def model(xs, ys, cost_scale, grad_scale):
         with tf.device("/gpu:0"):
 
             # Contains scope/var_name substrings we use to group gradients for all reduce
-            # You'll want to find groupings that are scheduled uniquely by tensorflow, otherwise allreduce could hang.
+            # You'll want to find groupings that are scheduled uniquely by tensorflow, otherwise bs.allreduce could hang.
             # The groups should be ordered in which the all-reduce is called.
             # Any gradients not matching the substrings will get appended to the last group.
             grad_groups = []
@@ -159,7 +152,7 @@ def model(xs, ys, cost_scale, grad_scale):
             with tf.variable_scope('embed'):
                 x_embed   = fp16(tf.get_variable("x",   [   hps.n_vocab,     hps.n_state], initializer=tf.random_normal_initializer(stddev=0.02)))
                 pos_embed = fp16(tf.get_variable('pos', [1, hps.n_timesteps, hps.n_state], initializer=tf.random_normal_initializer(stddev=0.01)))
-                h = embedding_lookup(x_embed, xs) + pos_embed
+                h = bs.embedding_lookup(x_embed, xs) + pos_embed
                 grad_groups.insert(0, 'embed')
 
             for l in range(hps.n_layer):
@@ -175,25 +168,25 @@ def model(xs, ys, cost_scale, grad_scale):
 
             # labels = tf.reshape(ys, [-1])
             # loss   = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=fp32(logits), labels=tf.cast(labels, tf.int32))
-            loss   = softmax_cross_entropy(logits=logits, labels=ys)
+            loss   = bs.softmax_cross_entropy(logits=logits, labels=ys)
             loss   = tf.reduce_mean(loss)
 
             params = tf.trainable_variables()
-            # use scale_tensor so we can keep the cost_scale a host side placeholder
-            grads  = tf.gradients(scale_tensor(loss, cost_scale), params)
+            # use bs.scale_tensor so we can keep the cost_scale a host side placeholder
+            grads  = tf.gradients(bs.scale_tensor(loss, cost_scale), params)
 
             if mpi_size > 1:
-                loss = allreduce(loss) * tf.constant(1.0 / mpi_size)
+                loss = bs.allreduce(loss) * tf.constant(1.0 / mpi_size)
 
-                group_allreduce(grads, params, search_strings=grad_groups)
+                bs.group_allreduce(grads, params, search_strings=grad_groups)
 
-            global_norm, norm_scale = ClipGlobalNorm(grads, grad_scale=grad_scale, clip_norm=hps.clip_norm)
+            global_norm, norm_scale = bs.clip_by_global_norm(grads, grad_scale=grad_scale, clip_norm=hps.clip_norm)
 
             # for tuning fp16 cost scaling
             if hps.log_stats and mpi_rank == 0:
                 for i, (grad, param) in enumerate(zip(grads, params)):
                     name = param.op.name + "_" + "_".join(str(x) for x in param.shape.as_list())
-                    grads[i] = log_stats(grad, tf.cast(global_step, tf.int32), logfile="scale_stats.txt", name=name)
+                    grads[i] = bs.log_stats(grad, tf.cast(global_step, tf.int32), logfile="scale_stats.txt", name=name)
 
 
             # use adafactor for most params and adam for embeddings
@@ -210,8 +203,8 @@ def model(xs, ys, cost_scale, grad_scale):
                 else:
                     fact_grads.append( (grad, param) )
 
-            fact = AdafactorOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale)
-            adam = AdamOptimizer(     learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale)
+            fact = bs.AdafactorOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale)
+            adam = bs.AdamOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale, fp16=True)
             train_op = tf.group(fact.apply_gradients(fact_grads), adam.apply_gradients(adam_grads))
 
         # update global step after we're done using it for this update
@@ -249,7 +242,7 @@ def iter_data(X, n_timesteps, n_batch, mpi_rank, mpi_size):
 
 def print_rank0(*args):
     if mpi_rank == 0:
-        print(*args)
+        print(*args, flush=True)
 
 
 if __name__ == '__main__':
@@ -309,26 +302,31 @@ if __name__ == '__main__':
 
         sess.run(tf.global_variables_initializer())
         if mpi_size > 1:
-            sess.run(sync_variables_op(mpi_rank))
+            sess.run(bs.sync_variables_op(mpi_rank))
 
         for i in range(hps.n_epochs):
             print_rank0(f'Starting epoch {i}')
             for x, y in iter_data(trainX, hps.n_timesteps, hps.n_batch, mpi_rank, mpi_size):
 
-                cost, global_norm, norm_scale, _ = sess.run([loss, gn, ns, train_op], {X: x, Y: y, cost_scale: cur_cost_scale})
+                retry = True
+                while retry:
 
-                # slowly increase cost scale but quickly drop it when inf or nan is detected in the gradients
-                # norm_scale will be zero when this happens
-                if norm_scale == 0.0:
-                    cur_cost_scale *= 0.5
-                    cost_count      = 0
-                    print_rank0("fp16 saturation detected (%f), changing cost_scale to: 2^%.0f" % (global_norm, np.log2(cur_cost_scale)))
-                elif cost_count >= hps.cost_count:
-                    cur_cost_scale *= 2.0
-                    cost_count      = 0
-                    print_rank0("No fp16 saturation detected after %d iterations, changing cost_scale to: 2^%.0f" % (hps.cost_count, np.log2(cur_cost_scale)))
-                else:
-                    cost_count += 1
+                    cost, global_norm, norm_scale, _ = sess.run([loss, gn, ns, train_op], {X: x, Y: y, cost_scale: cur_cost_scale})
+
+                    # slowly increase cost scale but quickly drop it when inf or nan is detected in the gradients
+                    # norm_scale will be zero when this happens
+                    if norm_scale == 0.0:
+                        cur_cost_scale *= 0.5
+                        cost_count      = 0
+                        print_rank0("fp16 saturation detected (%f), changing cost_scale to: 2^%.0f" % (global_norm, np.log2(cur_cost_scale)))
+                    else:
+                        retry = False
+                        if cost_count >= hps.cost_count:
+                            cur_cost_scale *= 2.0
+                            cost_count      = 0
+                            print_rank0("No fp16 saturation detected after %d iterations, changing cost_scale to: 2^%.0f" % (hps.cost_count, np.log2(cur_cost_scale)))
+                        else:
+                            cost_count += 1
 
                 if iteration % hps.log_every_n_iters == 0:
                     print_rank0('train iteration: %7d, loss: %.5f, bits per byte: %.5f ns:%.5f gn:%.5f' % (iteration, cost, cost/np.log(2), norm_scale, global_norm))

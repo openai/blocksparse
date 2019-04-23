@@ -4,6 +4,9 @@
 #include <stdio.h>
 #include <type_traits>
 
+#define MIN(a,b) (((a)<(b))?(a):(b))
+#define MAX(a,b) (((a)>(b))?(a):(b))
+
 // Forward Kernels
 #define OP_Z_XY(func, op)                   \
 template <typename T, typename V, int U>    \
@@ -271,7 +274,11 @@ OP_Z_X(Sig,      ew_sig)
 OP_Z_X(Tanh,    ew_tanh)
 OP_Z_X(Relu,    ew_relu)
 
-OP_Z_XA(Elu,     ew_elu)
+OP_Z_XA(Elu,   ew_elu  )
+OP_Z_XA(Gelu,  ew_gelu )
+OP_Z_XA(Swish, ew_swish)
+
+
 OP_Z_XB(BiasAdd, ew_add)
 OP_Z_XB(GainMul, ew_mul)
 
@@ -292,7 +299,9 @@ OP_DX_DZX( ExpGrad,  ew_exp_grad)
 OP_DX_DZX( LogGrad,  ew_log_grad)
 OP_DX_DZX(SqrtGrad, ew_sqrt_grad)
 
-OP_DX_DZXA(EluGrad,  ew_elu_grad)
+OP_DX_DZXA(EluGrad,     ew_elu_grad)
+OP_DX_DZXA(GeluGrad,   ew_gelu_grad)
+OP_DX_DZXA(SwishGrad, ew_swish_grad)
 
 template <typename T, typename V>
 bool EW_Forward(CUstream stream,
@@ -328,8 +337,10 @@ bool EW_Forward(CUstream stream,
             case 13 :    Tanh<V,float4,2><<<grid,32,0,stream>>>(Z, X,    size); break;
             case 14 :    Relu<V,float4,2><<<grid,32,0,stream>>>(Z, X,    size); break;
             case 15 :     Elu<V,float4,2><<<grid,32,0,stream>>>(Z, X,    size, alpha);  break;
-            case 16 : BiasAdd<V,float4,2><<<dim3(grid,N),32,0,stream>>>(Z, X, B, size); break;
-            case 17 : GainMul<V,float4,2><<<dim3(grid,N),32,0,stream>>>(Z, X, B, size); break;
+            case 16 :    Gelu<V,float4,2><<<grid,32,0,stream>>>(Z, X,    size, alpha);  break;
+            case 17 :   Swish<V,float4,2><<<grid,32,0,stream>>>(Z, X,    size, alpha);  break;
+            case 18 : BiasAdd<V,float4,2><<<dim3(grid,N),32,0,stream>>>(Z, X, B, size); break;
+            case 19 : GainMul<V,float4,2><<<dim3(grid,N),32,0,stream>>>(Z, X, B, size); break;
         }
     }
     else
@@ -353,8 +364,10 @@ bool EW_Forward(CUstream stream,
             case 13 :    Tanh<T,float,4><<<grid,32,0,stream>>>(z, x,    size); break;
             case 14 :    Relu<T,float,4><<<grid,32,0,stream>>>(z, x,    size); break;
             case 15 :     Elu<T,float,4><<<grid,32,0,stream>>>(z, x,    size, alpha); break;
-            case 16 : BiasAdd<T,float,4><<<dim3(grid,N),32,0,stream>>>(z, x, b, size); break;
-            case 17 : GainMul<T,float,4><<<dim3(grid,N),32,0,stream>>>(z, x, b, size); break;
+            case 16 :    Gelu<T,float,4><<<grid,32,0,stream>>>(z, x,    size, alpha); break;
+            case 17 :   Swish<T,float,4><<<grid,32,0,stream>>>(z, x,    size, alpha); break;
+            case 18 : BiasAdd<T,float,4><<<dim3(grid,N),32,0,stream>>>(z, x, b, size); break;
+            case 19 : GainMul<T,float,4><<<dim3(grid,N),32,0,stream>>>(z, x, b, size); break;
         }
     }
     return true;
@@ -425,8 +438,10 @@ bool EW_Backward(CUstream stream,
             case 13 :    TanhGrad<VB,VF,float4,2><<<grid64,32,0,stream>>>(DX, DZ, Z, size); break;
             case 14 :    ReluGrad<VB,VF,float4,2><<<grid64,32,0,stream>>>(DX, DZ, Z, size); break;
             case 15 :     EluGrad<VB,VF,float4,2><<<grid64,32,0,stream>>>(DX, DZ, X, size, alpha);    break;
-            case 16 : BiasAddGrad<VB,   float4  ><<<grid32,32,0,stream>>>(DB, DZ,           N, size); break;
-            case 17 : GainMulGrad<VB,VF,float4  ><<<grid32,32,0,stream>>>(DX, DB, DZ, X, G, N, size); break;
+            case 16 :    GeluGrad<VB,VF,float4,2><<<grid64,32,0,stream>>>(DX, DZ, X, size, alpha);    break;
+            case 17 :   SwishGrad<VB,VF,float4,2><<<grid64,32,0,stream>>>(DX, DZ, X, size, alpha);    break;
+            case 18 : BiasAddGrad<VB,   float4  ><<<grid32,32,0,stream>>>(DB, DZ,           N, size); break;
+            case 19 : GainMulGrad<VB,VF,float4  ><<<grid32,32,0,stream>>>(DX, DB, DZ, X, G, N, size); break;
         }
     }
     else
@@ -449,8 +464,10 @@ bool EW_Backward(CUstream stream,
             case 13 :    TanhGrad<B,F,float,4><<<grid128,32,0,stream>>>(dx, dz, z, size); break;
             case 14 :    ReluGrad<B,F,float,4><<<grid128,32,0,stream>>>(dx, dz, z, size); break;
             case 15 :     EluGrad<B,F,float,4><<<grid128,32,0,stream>>>(dx, dz, x, size, alpha);    break;
-            case 16 : BiasAddGrad<B,  float  ><<<grid32 ,32,0,stream>>>(db, dz,           N, size); break;
-            case 17 : GainMulGrad<B,F,float  ><<<grid32 ,32,0,stream>>>(dx, db, dz, x, g, N, size); break;
+            case 16 :    GeluGrad<B,F,float,4><<<grid128,32,0,stream>>>(dx, dz, x, size, alpha);    break;
+            case 17 :   SwishGrad<B,F,float,4><<<grid128,32,0,stream>>>(dx, dz, x, size, alpha);    break;
+            case 18 : BiasAddGrad<B,  float  ><<<grid32 ,32,0,stream>>>(db, dz,           N, size); break;
+            case 19 : GainMulGrad<B,F,float  ><<<grid32 ,32,0,stream>>>(dx, db, dz, x, g, N, size); break;
         }
     }
     return true;
@@ -558,162 +575,245 @@ template bool FloatCast<ehalf,float,ehalf4,float4>(CUstream stream, ehalf* y, co
 template bool FloatCast<float,bhalf,float4,bhalf4>(CUstream stream, float* y, const bhalf* x, int size);
 template bool FloatCast<bhalf,float,bhalf4,float4>(CUstream stream, bhalf* y, const float* x, int size);
 
+// 2**-32
+#define URAND_SCALE 2.3283064365386962891e-10f
 
-__device__ __forceinline__ uint float4_to_uint(float4 v)
+__global__ void concrete_gate(uint* Entropy, float* Gate, float* Concrete, const float* LogA, float limit_a, float limit_b, float rcp_temp, float epsilon, uint size)
 {
-    uint ret;
-    asm("{\n\t"
-        ".reg .u32 u0, u1, u2, u3;\n\t"
-        "cvt.rni.u32.f32 u0, %1;\n\t"
-        "cvt.rni.u32.f32 u1, %2;\n\t"
-        "cvt.rni.u32.f32 u2, %3;\n\t"
-        "cvt.rni.u32.f32 u3, %4;\n\t"
-        "bfi.b32 u0, u1, u0, 8, 8;\n\t"
-        "bfi.b32 u2, u3, u2, 8, 8;\n\t"
-        "shl.b32 u2, u2, 16;\n\t"
-        "add.u32 %0, u0, u2;\n\t" // encourage faster XMAD.PSL over BFI for 3rd bit merge
-        "}" : "=r"(ret) : "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
-    return ret;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+    uint idx = bid*blockDim.x + tid;
+
+    if (idx < size)
+    {
+        uint lfsr0 = __ldg((const uint*)Entropy + (gridDim.x*blockDim.x*0 + idx));
+        uint lfsr1 = __ldg((const uint*)Entropy + (gridDim.x*blockDim.x*1 + idx));
+        uint lfsr2 = __ldg((const uint*)Entropy + (gridDim.x*blockDim.x*2 + idx));
+
+        #pragma unroll 1
+        for (uint offset = idx; offset < size; offset += gridDim.x * blockDim.x)
+        {
+            float loga = __ldg(LogA + offset);
+
+            lfsr0 = ((lfsr0 & 0xfffffffe) << 12) ^ (((lfsr0 << 13) ^ lfsr0) >> 19);
+            lfsr1 = ((lfsr1 & 0xfffffff8) <<  4) ^ (((lfsr1 << 2)  ^ lfsr1) >> 25);
+            lfsr2 = ((lfsr2 & 0xfffffff0) << 11) ^ (((lfsr2 << 3)  ^ lfsr2) >> 11);
+            uint  urand    = lfsr0 ^ lfsr1 ^ lfsr2;
+            float frand    = (float)urand * URAND_SCALE * (1.0f - epsilon*2) + epsilon;
+            float concrete = ew_sig((ew_log(frand) - ew_log(1.0f - frand) + loga) * rcp_temp);
+            float stretch  = concrete * (limit_b - limit_a) + limit_a;
+            float gate     = fminf(fmaxf(stretch, 0.0f), 1.0f);
+
+            __stg(Gate     + offset,     gate);
+            __stg(Concrete + offset, concrete);
+
+        }
+        __stg(Entropy + (gridDim.x*blockDim.x*0 + idx), lfsr0);
+        __stg(Entropy + (gridDim.x*blockDim.x*1 + idx), lfsr1);
+        __stg(Entropy + (gridDim.x*blockDim.x*2 + idx), lfsr2);
+    }
 }
-__device__ __forceinline__ float4 uint_to_float4(uint val)
+__global__ void concrete_gate_grad(float* DLogA, const float* DGate, const float* Concrete, float limit_a, float limit_b, float rcp_temp, uint size)
 {
-    float4 v;
-    asm("{\n\t"
-        ".reg .u8 u0, u1, u2, u3;\n\t"
-        "mov.b32 {u0, u1, u2, u3}, %4;\n\t"
-        "cvt.rn.f32.u8 %0, u0;\n\t"
-        "cvt.rn.f32.u8 %1, u1;\n\t"
-        "cvt.rn.f32.u8 %2, u2;\n\t"
-        "cvt.rn.f32.u8 %3, u3;\n\t"
-        "}" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "r"(val) );
-    return v;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+    uint idx = bid*blockDim.x + tid;
+
+    #pragma unroll 1
+    for (uint offset = idx; offset < size; offset += gridDim.x * blockDim.x)
+    {
+        float dgate    = __ldg(DGate    + offset);
+        float concrete = __ldg(Concrete + offset);
+
+        float stretch   = concrete * (limit_b - limit_a) + limit_a;
+        float d_tanh    = stretch >= 0.0 && stretch <= 1.0 ? dgate : 0.0f;
+        float d_stretch = d_tanh * (limit_b - limit_a);
+        float d_loga    = ew_sig_grad(d_stretch, concrete) * rcp_temp;
+
+        __stg(DLogA + offset, d_loga);
+    }
 }
-__device__ __forceinline__ float rand_mask(float keep_prob, uint& lfsr0, uint& lfsr1, uint& lfsr2)
+__global__ void concrete_gate_infer(float* Gate, const float* LogA, float limit_a, float limit_b, uint size)
 {
-    lfsr0 = ((lfsr0 & 0xfffffffe) << 12) ^ (((lfsr0 << 13) ^ lfsr0) >> 19);
-    lfsr1 = ((lfsr1 & 0xfffffff8) <<  4) ^ (((lfsr1 << 2)  ^ lfsr1) >> 25);
-    lfsr2 = ((lfsr2 & 0xfffffff0) << 11) ^ (((lfsr2 << 3)  ^ lfsr2) >> 11);
-    uint urand = lfsr0 ^ lfsr1 ^ lfsr2;
-    // (float)urand * 2**-32 > keep_prob ? 0.0f : 1.0f;
-    float val;
-    asm("cvt.rn.f32.u32 %0, %1;\n\t"
-        "mul.f32 %0, %0, 0F2f800000;"
-        : "=f"(val) : "r"(urand));
-    return val > keep_prob ? 0.0f : 1.0f;
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+    uint idx = bid*blockDim.x + tid;
+
+    #pragma unroll 1
+    for (uint offset = idx; offset < size; offset += gridDim.x * blockDim.x)
+    {
+        float loga = __ldg(LogA + offset);
+
+        float stretch  = ew_sig(loga) * (limit_b - limit_a) + limit_a;
+        float gate     = fminf(fmaxf(stretch, 0.0f), 1.0f);
+
+        __stg(Gate + offset, gate);
+    }
+}
+bool ConcreteGate(CUstream stream, uint SMs,
+    uint* Entropy, float* Gate, float* Concrete, const float* LogA, float limit_a, float limit_b, float rcp_temp, float epsilon, uint size)
+{
+   uint threads =
+        size >= SMs*1024*4 ? 1024 :
+        size >= SMs* 512*4 ?  512 :
+        size >= SMs* 256*4 ?  256 :
+                              128 ;
+    concrete_gate<<<SMs,threads,0,stream>>>(Entropy, Gate, Concrete, LogA, limit_a, limit_b, rcp_temp, epsilon, size);
+    return true;
+}
+bool ConcreteGateGrad(CUstream stream, uint SMs,
+    float* DLogA, const float* DGate, const float* Concrete, float limit_a, float limit_b, float rcp_temp, uint size)
+{
+   uint threads =
+        size >= SMs*1024*2 ? 1024 :
+        size >= SMs* 512*2 ?  512 :
+        size >= SMs* 256*2 ?  256 :
+                              128 ;
+    concrete_gate_grad<<<SMs,threads,0,stream>>>(DLogA, DGate, Concrete, limit_a, limit_b, rcp_temp, size);
+    return true;
+}
+bool ConcreteGateInfer(CUstream stream, uint SMs,
+    float* Gate, const float* LogA, float limit_a, float limit_b, uint size)
+{
+   uint threads =
+        size >= SMs*1024*2 ? 1024 :
+        size >= SMs* 512*2 ?  512 :
+        size >= SMs* 256*2 ?  256 :
+                              128 ;
+    concrete_gate_infer<<<SMs,threads,0,stream>>>(Gate, LogA, limit_a, limit_b, size);
+    return true;
 }
 
+__global__ void __launch_bounds__(1024) gen_dropout_mask(uint* Entropy, uint* Mask, float keep_prob, uint size32)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+    uint idx = bid*blockDim.x + tid;
 
-template <typename T, uint THREADS>
-__global__ void __launch_bounds__(THREADS) dropout_forward(
-    T* Y, uint* Mask, const T* __restrict__ X, uint size, float keep_prob, float scale)
+    uint offsetM = idx/32;
+
+    if (offsetM < size32)
+    {
+        uint lfsr0 = __ldg((const uint*)Entropy + (gridDim.x*blockDim.x*0 + idx));
+        uint lfsr1 = __ldg((const uint*)Entropy + (gridDim.x*blockDim.x*1 + idx));
+        uint lfsr2 = __ldg((const uint*)Entropy + (gridDim.x*blockDim.x*2 + idx));
+
+        #pragma unroll 1
+        for (uint offset = offsetM; offset < size32; offset += gridDim.x * blockDim.x/32)
+        {
+            lfsr0 = ((lfsr0 & 0xfffffffe) << 12) ^ (((lfsr0 << 13) ^ lfsr0) >> 19);
+            lfsr1 = ((lfsr1 & 0xfffffff8) <<  4) ^ (((lfsr1 << 2)  ^ lfsr1) >> 25);
+            lfsr2 = ((lfsr2 & 0xfffffff0) << 11) ^ (((lfsr2 << 3)  ^ lfsr2) >> 11);
+            uint urand = lfsr0 ^ lfsr1 ^ lfsr2;
+            bool keep  = (float)urand * URAND_SCALE < keep_prob;
+
+# if CUDA_VERSION >= 9020
+            uint mask  = __ballot_sync(0xffffffff, keep);
+# else
+            uint mask  = __ballot(keep);
+# endif
+            if ((tid & 31) == 0)
+                __stg(Mask + offset, mask);
+        }
+        __stg(Entropy + (gridDim.x*blockDim.x*0 + idx), lfsr0);
+        __stg(Entropy + (gridDim.x*blockDim.x*1 + idx), lfsr1);
+        __stg(Entropy + (gridDim.x*blockDim.x*2 + idx), lfsr2);
+    }
+}
+bool GenDropoutMask(CUstream stream, uint SMs, uint* Entropy, uint* Mask, float keep_prob, uint size)
+{
+    // try and get good entropy reuse (8x) and make this kernel mostly compute bound
+    uint threads = 256;
+         if (size >= SMs*1024*8) { threads = 1024; }
+    else if (size >= SMs* 512*8) { threads =  512; }
+
+    gen_dropout_mask<<<SMs,threads,0,stream>>>(Entropy, Mask, keep_prob, CEIL_DIV(size, 32));
+    return true;
+}
+
+template <typename T, typename V, uint THREADS, uint DIMS>
+__global__ void __launch_bounds__(THREADS) apply_dropout_mask(
+    T* Y, const T* __restrict__ X, const uint* __restrict__ M,
+    float scale,  uint x_size, Strides<5> x, Strides<5> m)
 {
     uint tid = threadIdx.x;
     uint bid = blockIdx.x;
 
-    uint lfsr0, lfsr1, lfsr2;
-    uint idx = bid * THREADS + tid;
-    asm("mov.b32 %0, %%clock_hi;"       : "=r"(lfsr0) :);
-    asm("mov.b32 %0, %%clock;"          : "=r"(lfsr1) :);
-    asm("mov.b32 %0, %%globaltimer_lo;" : "=r"(lfsr2) :);
-    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr0) : "r"((lfsr0 ^ tid) & 31));
-    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr1) : "r"((lfsr1 ^ tid) & 31));
-    asm("shf.r.clamp.b32 %0,%0,%0,%1;"  : "=r"(lfsr2) : "r"((lfsr2 ^ tid) & 31));
-    lfsr0 ^= idx ^ (idx << 5)  ^ (idx << 11) ^ (idx << 17) ^ (idx << 23);
+    const uint VSIZE = sizeof(V)/4;
 
-    for (uint offset = idx; offset < size; offset += gridDim.x*THREADS)
+    #pragma unroll 1
+    for (uint offsetX = bid*THREADS + tid; offsetX < x_size; offsetX += gridDim.x*THREADS)
     {
-        float4 x = load(add_ptr_u(X, offset));
+        uint x_idx[DIMS];
+        x_idx[0] = offsetX  * VSIZE;
+        for (int i = 1; i < DIMS; i++)
+        {
+            x_idx[i  ] = x_idx[i-1] % x.stride[i-1];
+            x_idx[i-1] = x_idx[i-1] / x.stride[i-1];
+        }
 
-        float4 mask;
-        mask.x = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
-        mask.y = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
-        mask.z = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
-        mask.w = rand_mask(keep_prob, lfsr0, lfsr1, lfsr2);
-        float4 y = ew_mul(ew_mul(x, mask), scale);
-        store(add_ptr_u(Y, offset), y);
+        uint offsetM = 0;
+        for (int i = 0; i < DIMS; i++)
+            offsetM += x_idx[i] * m.stride[i];
 
-        Mask[offset] = float4_to_uint(mask);
+        V    xval =  load(X + offsetX);
+        uint mask = __ldg(M + offsetM/32);
+
+        uint shift = offsetM & 31;
+        for (uint i = 0; i < VSIZE; i++)
+            if (((1 << (shift + i)) & mask) == 0) ((float*)&xval)[i] = 0.0f;
+
+        store(Y + offsetX, ew_mul(xval, scale));
     }
 }
 
-// Forward pass with existing mask (when forward pass needs to be recomputed)
-template <typename T, uint THREADS>
-__global__ void __launch_bounds__(THREADS) dropout_mask_forward(
-    T* Y, const uint* __restrict__ Mask, const T* __restrict__ X, uint size, float scale)
+template <typename V1, typename V4, typename V8>
+bool ApplyDropoutMask(CUstream stream, uint SMs,
+            V1* y,
+    const   V1* x,
+    const uint* m,
+    float scale, uint size, int rank, Strides<5> &xs, Strides<5> &ms)
 {
-    uint tid = threadIdx.x;
-    uint bid = blockIdx.x;
+    // printf("xs: %d %d\n", xs.stride[0], xs.stride[1]);
+    // printf("ms: %d %d\n", ms.stride[0], ms.stride[1]);
 
-    for (uint offset = bid*THREADS + tid; offset < size; offset += gridDim.x*THREADS)
+    // use vec8 loads
+    if (rank == 1 && (size & 7) == 0 && sizeof(V1) == 2)
     {
-        float4 x = load(add_ptr_u(X, offset));
-        float4 y = ew_mul(ew_mul(x, uint_to_float4(Mask[offset])), scale);
-        store(add_ptr_u(Y, offset), y);
+        size >>= 3;
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        apply_dropout_mask<V8,float8,1024,1><<<grid,1024,0,stream>>>((V8*)y, (const V8*)x, m, scale, size, xs, ms);
     }
-}
-
-template <typename T, uint THREADS>
-__global__ void __launch_bounds__(THREADS) dropout_backward(
-    T* DX, const uint* __restrict__ Mask, const T* __restrict__ DY, uint size, float scale)
-{
-    uint tid = threadIdx.x;
-    uint bid = blockIdx.x;
-
-    for (uint offset = bid*THREADS + tid; offset < size; offset += gridDim.x*THREADS)
+    // use vec4 loads
+    else if (rank == 1 && (size & 3) == 0)
     {
-        float4 dy = load(add_ptr_u(DY, offset));
-        float4 dx = ew_mul(ew_mul(dy, uint_to_float4(Mask[offset])), scale);
-        store(add_ptr_u(DX, offset), dx);
+        size >>= 2;
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        apply_dropout_mask<V4,float4,1024,1><<<grid,1024,0,stream>>>((V4*)y, (const V4*)x, m, scale, size, xs, ms);
     }
-}
+    // In broadcast mode we can't use vec loads
+    else
+    {
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+             if (rank == 1)
+            apply_dropout_mask<V1, float,1024,1><<<grid,1024,0,stream>>>(y, x, m, scale, size, xs, ms);
+        else if (rank == 2)
+            apply_dropout_mask<V1, float,1024,2><<<grid,1024,0,stream>>>(y, x, m, scale, size, xs, ms);
+        else if (rank == 3)
+            apply_dropout_mask<V1, float,1024,3><<<grid,1024,0,stream>>>(y, x, m, scale, size, xs, ms);
+        else if (rank == 4)
+            apply_dropout_mask<V1, float,1024,4><<<grid,1024,0,stream>>>(y, x, m, scale, size, xs, ms);
+        else if (rank == 5)
+            apply_dropout_mask<V1, float,1024,5><<<grid,1024,0,stream>>>(y, x, m, scale, size, xs, ms);
 
-template <typename T, typename V>
-bool DropoutForward(CUstream stream, uint SMs,
-          T* y,
-       char* m,
-    const T* x,
-    uint size, float keep_prob, float scale)
-{
-    size >>= 2; // use vector loads
-    dropout_forward<V,512><<<SMs,512,0,stream>>>((V*)y, (uint*)m, (const V*)x, size, keep_prob, scale);
+    }
     return true;
 }
-template bool DropoutForward<float,float4>(CUstream stream, uint SMs, float* y, char* m, const float* x, uint size, float keep_prob, float scale);
-template bool DropoutForward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, char* m, const ehalf* x, uint size, float keep_prob, float scale);
-template bool DropoutForward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, char* m, const bhalf* x, uint size, float keep_prob, float scale);
-
-template <typename T, typename V>
-bool DropoutMaskForward(CUstream stream, uint SMs,
-             T* y,
-    const char* m,
-    const    T* x,
-    uint size, float scale)
-{
-    size >>= 2; // use vector loads
-    uint grid = size > SMs*1024 ? SMs*2 : SMs;
-    dropout_mask_forward<V,1024><<<grid,1024,0,stream>>>((V*)y, (const uint*)m, (const V*)x, size, scale);
-    return true;
-}
-template bool DropoutMaskForward<float,float4>(CUstream stream, uint SMs, float* y, const char* m, const float* x, uint size, float scale);
-template bool DropoutMaskForward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, const char* m, const ehalf* x, uint size, float scale);
-template bool DropoutMaskForward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, const char* m, const bhalf* x, uint size, float scale);
+template bool ApplyDropoutMask<float,float4,float8>(CUstream stream, uint SMs, float* y, const float* x, const uint* m, float scale, uint size, int rank, Strides<5> &xs, Strides<5> &ms);
+template bool ApplyDropoutMask<ehalf,ehalf4,ehalf8>(CUstream stream, uint SMs, ehalf* y, const ehalf* x, const uint* m, float scale, uint size, int rank, Strides<5> &xs, Strides<5> &ms);
+template bool ApplyDropoutMask<bhalf,bhalf4,bhalf8>(CUstream stream, uint SMs, bhalf* y, const bhalf* x, const uint* m, float scale, uint size, int rank, Strides<5> &xs, Strides<5> &ms);
 
 
-template <typename T, typename V>
-bool DropoutBackward(CUstream stream, uint SMs,
-             T* dx,
-    const char* m,
-    const    T* dy,
-    uint size, float scale)
-{
-    size >>= 2; // use vector loads
-    uint grid = size > SMs*1024 ? SMs*2 : SMs;
-    dropout_backward<V,1024><<<grid,1024,0,stream>>>((V*)dx, (const uint*)m, (const V*)dy, size, scale);
-    return true;
-}
-template bool DropoutBackward<float,float4>(CUstream stream, uint SMs, float* dx, const char* m, const float* dy, uint size, float scale);
-template bool DropoutBackward<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* dx, const char* m, const ehalf* dy, uint size, float scale);
-template bool DropoutBackward<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* dx, const char* m, const bhalf* dy, uint size, float scale);
 
 
 template <typename T, typename V>
@@ -730,10 +830,11 @@ __global__ void filter_tensor(T* Y, const T* __restrict__ X, uint size, float sc
             x = ew_zero_inf(x);
         if (zero_nans)
             x = ew_zero_nan(x);
-        if (saturate != 0.0f)
-            x = ew_maximum(ew_minimum(x, saturate), -saturate);
 
         x = ew_mul(x, scale);
+
+        if (saturate != 0.0f)
+            x = ew_maximum(ew_minimum(x, saturate), -saturate);
 
         store(Y + offset, x);
     }
@@ -759,59 +860,90 @@ template bool FilterTensor<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, co
 template bool FilterTensor<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, const bhalf* x, uint size, float scale, float saturate, bool zero_infs, bool zero_nans);
 
 
-
-template <typename T, typename V>
-__global__ void __launch_bounds__(32) add_n(
-    struct plist8<T> X, T* Z,
-    int size, int params)
+template <typename T, typename V, uint THREADS, uint UNROLL>
+__global__ void __launch_bounds__(THREADS,2) add_n(struct Plist<T,9> X, T* Y, uint size, uint params)
 {
-    int tid = threadIdx.x;
-    int bid = blockIdx.x;
-    int i   = bid*32 + tid;
-    if (i < size)
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    for (uint offset = bid*THREADS + tid; offset < size; offset += gridDim.x*THREADS)
     {
-        V z; ew_zero(z);
+        V y; ew_zero(y);
         #pragma unroll
-        for (int j = 0; j < 8; j++)
+        for (uint j = 0; j < UNROLL; j++)
         {
-            V x = load(X.a[j], i, j < params);
-            z = ew_add(x, z);
+            V x = load(X.a[j] + offset, 0, j < params);
+            y   = ew_add(x, y);
         }
-        store(Z, z, i);
+        store(Y + offset, y);
     }
 }
 
 template <typename T, typename V>
-bool AddN(CUstream stream, struct plist8<T>* x, T* z, int size, int params)
+bool AddN(CUstream stream, uint SMs, struct Plist<T,9>* x, T* y, uint size, uint params)
 {
-    if ((size & 3) == 0 && size >= 256)
+    if (size & 3)
     {
-        size >>= 2; // use vector loads
-        int grid = (size >> 5) + ((size & 31) != 0);
-
-        struct plist8<V>* X = (struct plist8<V>*)x;
-
-        add_n<V,float4><<<grid,32,0,stream>>>(*X, (V*)z, size, params);
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        if (params > 5)
+            add_n<T,float,1024,9><<<grid,1024,0,stream>>>(*x, y, size, params);
+        else if (params > 3)
+            add_n<T,float,1024,5><<<grid,1024,0,stream>>>(*x, y, size, params);
+        else
+            add_n<T,float,1024,3><<<grid,1024,0,stream>>>(*x, y, size, params);
     }
+    // use vector loads
     else
     {
-        int grid = (size >> 5) + ((size & 31) != 0);
-        add_n<T,float><<<grid,32,0,stream>>>(*x, z, size, params);
+        size >>= 2;
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+
+        struct Plist<V,9>* X = (struct Plist<V,9>*)x;
+
+        if (params > 5)
+            add_n<V,float4, 512,9><<<grid, 512,0,stream>>>(*X, (V*)y, size, params);
+        else if (params > 3)
+            add_n<V,float4,1024,5><<<grid,1024,0,stream>>>(*X, (V*)y, size, params);
+        else
+            add_n<V,float4,1024,3><<<grid,1024,0,stream>>>(*X, (V*)y, size, params);
     }
     return true;
 }
 
-template bool AddN<float,float4>(CUstream stream, struct plist8<float>* x, float* z, int size, int params);
-template bool AddN<ehalf,ehalf4>(CUstream stream, struct plist8<ehalf>* x, ehalf* z, int size, int params);
-template bool AddN<bhalf,bhalf4>(CUstream stream, struct plist8<bhalf>* x, bhalf* z, int size, int params);
+template bool AddN<float,float4>(CUstream stream, uint SMs, struct Plist<float,9>* x, float* y, uint size, uint params);
+template bool AddN<ehalf,ehalf4>(CUstream stream, uint SMs, struct Plist<ehalf,9>* x, ehalf* y, uint size, uint params);
+template bool AddN<bhalf,bhalf4>(CUstream stream, uint SMs, struct Plist<bhalf,9>* x, bhalf* y, uint size, uint params);
 
 
-template <typename T, typename V>
-__global__ void __launch_bounds__(256) bias_relu(
+template <typename T, typename V, uint RELU>
+__global__ void __launch_bounds__(256) bias_relu_axis_0(
+              T*              Y,
+    const     T* __restrict__ X,
+    const float* __restrict__ B,
+    uint N, uint K)
+{
+    uint kn = blockIdx.x*256 + threadIdx.x;
+    uint k  = kn / N;
+
+    if (k < K)
+    {
+        float b = load(add_ptr_u(B, k));
+        V x = load(add_ptr_u(X, kn));
+        V y = ew_add(x, b);
+        if (RELU == 2) // fast_gelu
+            y = ew_swish(y, 1.702f);
+        else if (RELU == 1) // relu
+            y = ew_relu(y);
+
+        store(add_ptr_u(Y, kn), y);
+    }
+}
+template <typename T, typename V, uint RELU>
+__global__ void __launch_bounds__(256) bias_relu_axis_1(
           T*              Y,
     const T* __restrict__ X,
     const V* __restrict__ B,
-    uint N, uint K, uint relu)
+    uint N, uint K)
 {
     uint nk = blockIdx.x*256 + threadIdx.x;
 
@@ -823,7 +955,9 @@ __global__ void __launch_bounds__(256) bias_relu(
         V b = load(add_ptr_u(B,  k));
         V x = load(add_ptr_u(X, nk));
         V y = ew_add(x, b);
-        if (relu)
+        if (RELU == 2) // fast_gelu
+            y = ew_swish(y, 1.702f);
+        else if (RELU == 1) // relu
             y = ew_relu(y);
 
         store(add_ptr_u(Y, nk), y);
@@ -835,39 +969,149 @@ bool EW_Bias_Relu(CUstream stream,
               T* y,
     const     T* x,
     const float* b,
-    uint N, uint K, bool relu)
+    uint axis, uint N, uint K, uint relu)
 {
-    if ((K & 3) == 0)
+    if (axis == 0)
     {
-                   V* Y = (           V*)y;
-        const      V* X = (const      V*)x;
-        const float4* B = (const float4*)b;
+        if ((N & 3) == 0)
+        {
+                  V* Y = (      V*)y;
+            const V* X = (const V*)x;
 
-        K >>= 2;
-        uint grid = (N*K >> 8) + ((N*K & 255) != 0);
-        bias_relu<V,float4><<<grid,256,0,stream>>>(Y, X, B, N, K, relu);
+            N >>= 2;
+            uint grid = CEIL_DIV(N*K, 256);
+            if (relu == 2)
+                bias_relu_axis_0<V,float4,2><<<grid,256,0,stream>>>(Y, X, b, N, K);
+            else if (relu == 1)
+                bias_relu_axis_0<V,float4,1><<<grid,256,0,stream>>>(Y, X, b, N, K);
+            else
+                bias_relu_axis_0<V,float4,0><<<grid,256,0,stream>>>(Y, X, b, N, K);
+        }
+        else
+        {
+            uint grid = CEIL_DIV(N*K, 256);
+            if (relu == 2)
+                bias_relu_axis_0<T,float ,2><<<grid,256,0,stream>>>(y, x, b, N, K);
+            else if (relu == 1)
+                bias_relu_axis_0<T,float ,1><<<grid,256,0,stream>>>(y, x, b, N, K);
+            else
+                bias_relu_axis_0<T,float ,0><<<grid,256,0,stream>>>(y, x, b, N, K);
+        }
     }
     else
     {
-        uint grid = (N*K >> 8) + ((N*K & 255) != 0);
-        bias_relu<T,float ><<<grid,256,0,stream>>>(y, x, b, N, K, relu);
+        if ((K & 3) == 0)
+        {
+                       V* Y = (           V*)y;
+            const      V* X = (const      V*)x;
+            const float4* B = (const float4*)b;
+
+            K >>= 2;
+            uint grid = CEIL_DIV(N*K, 256);
+            if (relu == 2)
+                bias_relu_axis_1<V,float4,2><<<grid,256,0,stream>>>(Y, X, B, N, K);
+            else if (relu == 1)
+                bias_relu_axis_1<V,float4,1><<<grid,256,0,stream>>>(Y, X, B, N, K);
+            else
+                bias_relu_axis_1<V,float4,0><<<grid,256,0,stream>>>(Y, X, B, N, K);
+        }
+        else
+        {
+            uint grid = CEIL_DIV(N*K, 256);
+            if (relu == 2)
+                bias_relu_axis_1<T,float ,2><<<grid,256,0,stream>>>(y, x, b, N, K);
+            else if (relu == 1)
+                bias_relu_axis_1<T,float ,1><<<grid,256,0,stream>>>(y, x, b, N, K);
+            else
+                bias_relu_axis_1<T,float ,0><<<grid,256,0,stream>>>(y, x, b, N, K);
+        }
     }
     return true;
 }
 
-template bool EW_Bias_Relu<float,float4>(CUstream stream, float* y, const float* x, const float* b, uint N, uint K, bool relu);
-template bool EW_Bias_Relu<ehalf,ehalf4>(CUstream stream, ehalf* y, const ehalf* x, const float* b, uint N, uint K, bool relu);
-template bool EW_Bias_Relu<bhalf,bhalf4>(CUstream stream, bhalf* y, const bhalf* x, const float* b, uint N, uint K, bool relu);
+template bool EW_Bias_Relu<float,float4>(CUstream stream, float* y, const float* x, const float* b, uint axis, uint N, uint K, uint relu);
+template bool EW_Bias_Relu<ehalf,ehalf4>(CUstream stream, ehalf* y, const ehalf* x, const float* b, uint axis, uint N, uint K, uint relu);
+template bool EW_Bias_Relu<bhalf,bhalf4>(CUstream stream, bhalf* y, const bhalf* x, const float* b, uint axis, uint N, uint K, uint relu);
 
+// db = sum(dy, axis=0)
+// dx = dy * (y > 0)
+template <typename T, typename V, uint RELU>
+__global__ void bias_relu_axis_0_grad(
+          float*              DB,
+              T*              DX,
+    const     T* __restrict__ DY,
+    const     T* __restrict__ Y, // acutally X for fast_gelu
+    const float* __restrict__ B,
+    uint N, uint K)
+{
+    __shared__ float Share[32];
+
+    uint tid = threadIdx.x;
+    uint   k = blockIdx.x;
+    float  b = RELU ? __ldg(B + k) : 0.0f;
+
+    if (tid < 32)
+        Share[tid] = 0.0f;
+
+    V db_v;
+    ew_zero(db_v);
+    for (uint n = tid, kn = k*N + tid; n < N; n += blockDim.x, kn += blockDim.x)
+    {
+        V dy = load(DY + kn);
+
+        if (RELU == 2) // fast_gelu
+        {
+            V x = load(Y + kn);
+
+            dy = ew_swish_grad(dy, ew_add(x, b), 1.702f);
+
+            store(DX + kn, dy);
+        }
+        else if (RELU == 1) // relu
+        {
+            V  y = load(Y + kn);
+            dy = ew_relu_grad(dy, y);
+            store(DX + kn, dy);
+        }
+        db_v = ew_add(db_v, dy);
+    }
+    // reduce within thread
+    float db = ew_sum(db_v);
+
+    // reduce within warp
+    for (int i = 16; i > 0; i >>= 1)
+        db += shfl_xor(db, i);
+
+    // reduce across warps
+    if (blockDim.x > 32)
+    {
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid/32] = db;
+        __syncthreads();
+
+        if (tid < 32)
+        {
+            // first warp loads all prior reductions
+            db = Share[tid];
+            // reduce within this last warp
+            for (int i = 16; i > 0; i >>= 1)
+                db += shfl_xor(db, i);
+        }
+    }
+    if (tid == 0)
+        __stg(DB + k, db);
+}
 
 // db = sum(dy, axis=0)
 // dx = dy * (y > 0)
 template <typename T, typename V, uint THREADS, uint WIDTH, uint RELU>
-__global__ void __launch_bounds__(THREADS) bias_relu_grad(
+__global__ void __launch_bounds__(THREADS) bias_relu_axis_1_grad(
           V*              DB,
           T*              DX,
     const T* __restrict__ DY,
-    const T* __restrict__ Y,
+    const T* __restrict__ Y, // acutally X for fast_gelu
+    const V* __restrict__ B,
     uint N, uint K, uint partials)
 {
     // Stripe the reduction lines with tid and block_n
@@ -894,7 +1138,16 @@ __global__ void __launch_bounds__(THREADS) bias_relu_grad(
     {
         V dy = load(add_ptr_u(DY, nk), 0, bk);
 
-        if (RELU)
+        if (RELU == 2) // fast_gelu
+        {
+            V x = load(add_ptr_u(Y, nk), 0, bk);
+            V b = load(add_ptr_u(B,  k), 0, bk);
+
+            dy = ew_swish_grad(dy, ew_add(x, b), 1.702f);
+
+            store(add_ptr_u(DX, nk), dy, 0, bk);
+        }
+        else if (RELU == 1)
         {
             V  y = load(add_ptr_u(Y, nk), 0, bk);
             dy = ew_relu_grad(dy, y);
@@ -1042,82 +1295,138 @@ bool EW_Bias_Relu_Grad(CUstream stream,
           float* db_partial,
               T* dx,
     const     T* dy,
-    const     T* y,
-    uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials)
+    const     T* y, // x for gelu
+    const float* b,
+    uint axis, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, uint relu, bool partials)
 {
-    if (gridN > 1 && !partials)
-        cuMemsetD32Async((CUdeviceptr)db, 0, K, stream);
-
-    //printf("%d %d %d %d %d %d %d\n", gridN, gridK, vec, width, N, K, relu);
-    if (vec == 4)
+    if (axis == 0)
     {
-        const V* DY = (const V*)dy;
-        const V* Y  = (const V*)y;
-              V* DX = (      V*)dx;
-        float4* DB = gridN > 1 && partials ? (float4*)db_partial : (float4*)db;
-
-        if (relu)
+        if ((N & 3) == 0)
         {
-            if      (width == 32)
-                bias_relu_grad<V,float4,256,32,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
-            else if (width == 16)
-                bias_relu_grad<V,float4,256,16,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
-            else if (width == 8)
-                bias_relu_grad<V,float4,256, 8,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
-            else if (width == 4)
-                bias_relu_grad<V,float4,256, 4,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            N >>= 2;
+            const V* DY = (const V*)dy;
+            const V*  Y = (const V*)y;
+                  V* DX = (      V*)dx;
+
+            uint threads = MIN(CEIL_DIV(N, 128), 32) * 32;
+            if (relu == 2)
+                bias_relu_axis_0_grad<V,float4,2><<<K,threads,0,stream>>>(db, DX, DY, Y, b, N, K);
+            else if (relu == 1)
+                bias_relu_axis_0_grad<V,float4,1><<<K,threads,0,stream>>>(db, DX, DY, Y, b, N, K);
+            else
+                bias_relu_axis_0_grad<V,float4,0><<<K,threads,0,stream>>>(db, DX, DY, Y, b, N, K);
         }
         else
         {
-            if      (width == 32)
-                bias_relu_grad<V,float4,256,32,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
-            else if (width == 16)
-                bias_relu_grad<V,float4,256,16,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
-            else if (width == 8)
-                bias_relu_grad<V,float4,256, 8,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
-            else if (width == 4)
-                bias_relu_grad<V,float4,256, 4,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, N, K >> 2, partials);
+            uint threads = MIN(CEIL_DIV(N, 128), 32) * 32;
+            if (relu == 2)
+                bias_relu_axis_0_grad<T, float,2><<<K,threads,0,stream>>>(db, dx, dy, y, b, N, K);
+            else if (relu == 1)
+                bias_relu_axis_0_grad<T, float,1><<<K,threads,0,stream>>>(db, dx, dy, y, b, N, K);
+            else
+                bias_relu_axis_0_grad<T, float,0><<<K,threads,0,stream>>>(db, dx, dy, y, b, N, K);
         }
     }
     else
     {
-        float* DB = gridN > 1 && partials ? db_partial : db;
+        if (gridN > 1 && !partials)
+            cuMemsetD32Async((CUdeviceptr)db, 0, K, stream);
 
-        if (relu)
+        //printf("%d %d %d %d %d %d %d\n", gridN, gridK, vec, width, N, K, relu);
+        if (vec == 4)
         {
-            if      (width == 32)
-                bias_relu_grad<T,float,1024,32,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-            else if (width == 16)
-                bias_relu_grad<T,float,1024,16,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-            else if (width == 8)
-                bias_relu_grad<T,float,1024, 8,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-            else if (width == 4)
-                bias_relu_grad<T,float,1024, 4,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
+            const      V* DY = (const V*)dy;
+            const      V* Y  = (const V*)y;
+            const float4* B  = (const float4*)b;
+
+                  V* DX = (      V*)dx;
+            float4* DB = gridN > 1 && partials ? (float4*)db_partial : (float4*)db;
+
+            if (relu == 2) // fast_gelu
+            {
+                if      (width == 32)
+                    bias_relu_axis_1_grad<V,float4,256,32,2><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 16)
+                    bias_relu_axis_1_grad<V,float4,256,16,2><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 8)
+                    bias_relu_axis_1_grad<V,float4,256, 8,2><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 4)
+                    bias_relu_axis_1_grad<V,float4,256, 4,2><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+            }
+            else if (relu == 1) // relu
+            {
+                if      (width == 32)
+                    bias_relu_axis_1_grad<V,float4,256,32,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 16)
+                    bias_relu_axis_1_grad<V,float4,256,16,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 8)
+                    bias_relu_axis_1_grad<V,float4,256, 8,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 4)
+                    bias_relu_axis_1_grad<V,float4,256, 4,1><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+            }
+            else // no act
+            {
+                if      (width == 32)
+                    bias_relu_axis_1_grad<V,float4,256,32,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 16)
+                    bias_relu_axis_1_grad<V,float4,256,16,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 8)
+                    bias_relu_axis_1_grad<V,float4,256, 8,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+                else if (width == 4)
+                    bias_relu_axis_1_grad<V,float4,256, 4,0><<<dim3(gridK,gridN),256,0,stream>>>(DB, DX, DY, Y, B, N, K >> 2, partials);
+            }
         }
         else
         {
-            if      (width == 32)
-                bias_relu_grad<T,float,1024,32,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-            else if (width == 16)
-                bias_relu_grad<T,float,1024,16,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-            else if (width == 8)
-                bias_relu_grad<T,float,1024, 8,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-            else if (width == 4)
-                bias_relu_grad<T,float,1024, 4,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, N, K, partials);
-        }
-    }
-    if (gridN > 1 && partials)
-    {
-        gridK = (K >> 3) + ((K & 7) != 0);
+            float* DB = gridN > 1 && partials ? db_partial : db;
 
-        bias_grad2<<<gridK,256,0,stream>>>(db, (const float*)db_partial, gridN, K);
+            if (relu == 2) // fast_gelu
+            {
+                if      (width == 32)
+                    bias_relu_axis_1_grad<T,float,1024,32,2><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 16)
+                    bias_relu_axis_1_grad<T,float,1024,16,2><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 8)
+                    bias_relu_axis_1_grad<T,float,1024, 8,2><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 4)
+                    bias_relu_axis_1_grad<T,float,1024, 4,2><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+            }
+            else if (relu == 1) // relu
+            {
+                if      (width == 32)
+                    bias_relu_axis_1_grad<T,float,1024,32,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 16)
+                    bias_relu_axis_1_grad<T,float,1024,16,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 8)
+                    bias_relu_axis_1_grad<T,float,1024, 8,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 4)
+                    bias_relu_axis_1_grad<T,float,1024, 4,1><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+            }
+            else // no act
+            {
+                if      (width == 32)
+                    bias_relu_axis_1_grad<T,float,1024,32,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 16)
+                    bias_relu_axis_1_grad<T,float,1024,16,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 8)
+                    bias_relu_axis_1_grad<T,float,1024, 8,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+                else if (width == 4)
+                    bias_relu_axis_1_grad<T,float,1024, 4,0><<<dim3(gridK,gridN),1024,0,stream>>>(DB, dx, dy, y, b, N, K, partials);
+            }
+        }
+        if (gridN > 1 && partials)
+        {
+            gridK = (K >> 3) + ((K & 7) != 0);
+
+            bias_grad2<<<gridK,256,0,stream>>>(db, (const float*)db_partial, gridN, K);
+        }
     }
     return true;
 }
 
-template bool EW_Bias_Relu_Grad<float,float4>(CUstream stream, float* db, float* db_partial, float* dx, const float* dy, const float* y, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials);
-template bool EW_Bias_Relu_Grad<ehalf,ehalf4>(CUstream stream, float* db, float* db_partial, ehalf* dx, const ehalf* dy, const ehalf* y, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials);
-template bool EW_Bias_Relu_Grad<bhalf,bhalf4>(CUstream stream, float* db, float* db_partial, bhalf* dx, const bhalf* dy, const bhalf* y, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, bool relu, bool partials);
+template bool EW_Bias_Relu_Grad<float,float4>(CUstream stream, float* db, float* db_partial, float* dx, const float* dy, const float* y, const float* b, uint axis, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, uint relu, bool partials);
+template bool EW_Bias_Relu_Grad<ehalf,ehalf4>(CUstream stream, float* db, float* db_partial, ehalf* dx, const ehalf* dy, const ehalf* y, const float* b, uint axis, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, uint relu, bool partials);
+template bool EW_Bias_Relu_Grad<bhalf,bhalf4>(CUstream stream, float* db, float* db_partial, bhalf* dx, const bhalf* dy, const bhalf* y, const float* b, uint axis, uint gridN, uint gridK, uint vec, uint width, uint N, uint K, uint relu, bool partials);
 
 
 // x = [128*16*18]
@@ -1325,6 +1634,42 @@ template bool EW_Reduce_Max_Grad<bhalf,unsigned char>(CUstream stream, bhalf* dx
 template bool EW_Reduce_Max_Grad<float,       ushort>(CUstream stream, float* dx, const        ushort* a, const float* dy, uint dim0, uint dim1, uint dim2);
 template bool EW_Reduce_Max_Grad<ehalf,       ushort>(CUstream stream, ehalf* dx, const        ushort* a, const ehalf* dy, uint dim0, uint dim1, uint dim2);
 template bool EW_Reduce_Max_Grad<bhalf,       ushort>(CUstream stream, bhalf* dx, const        ushort* a, const bhalf* dy, uint dim0, uint dim1, uint dim2);
+
+
+
+template <typename T, typename V>
+__global__ void assign_add(T* Y, const T* __restrict__ X, uint size)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    for (uint offset = bid*1024 + tid; offset < size; offset += gridDim.x*1024)
+    {
+        V x = load(X + offset);
+        V y = load((const T*)(Y + offset));
+
+        store(Y + offset, ew_add(x, y));
+    }
+}
+template <typename T, typename V>
+bool AssignAdd(CUstream stream, uint SMs, T* y, const T* x, uint size)
+{
+    if (size & 3)
+    {
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        assign_add<T,float><<<grid,1024,0,stream>>>(y, x, size);
+    }
+    else
+    {
+        size >>= 2; // use vector loads
+        uint grid = size > SMs*1024 ? SMs*2 : SMs;
+        assign_add<V,float4><<<grid,1024,0,stream>>>((V*)y, (const V*)x, size);
+    }
+    return true;
+}
+template bool AssignAdd<float,float4>(CUstream stream, uint SMs, float* y, const float* x, uint size);
+template bool AssignAdd<ehalf,ehalf4>(CUstream stream, uint SMs, ehalf* y, const ehalf* x, uint size);
+template bool AssignAdd<bhalf,bhalf4>(CUstream stream, uint SMs, bhalf* y, const bhalf* x, uint size);
 
 
 

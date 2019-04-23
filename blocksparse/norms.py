@@ -8,13 +8,9 @@ import os.path
 import sys
 import numpy as np
 import tensorflow as tf
-from operator import mul
 from tensorflow.python.framework import ops
-if sys.version_info >= (3, 0):
-    from functools import reduce
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
+from blocksparse.utils import _op_module, reduce_mul
 
 layer_norm_op            = _op_module.layer_norm
 layer_norm_grad_op       = _op_module.layer_norm_grad
@@ -220,7 +216,7 @@ def batch_norm_grad_test(dy, x, g, m, v, epsilon=1e-6):
     xshape = x.shape
     N = xshape[0]
     C = xshape[1]
-    rNDHW  = 1.0 / reduce(mul, xshape[2:], N)
+    rNDHW  = 1.0 / reduce_mul(xshape[2:], N)
 
     dy = dy.reshape(N, C,-1)
     x  =  x.reshape(N, C,-1)

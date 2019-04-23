@@ -4,14 +4,11 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os.path
-import sys
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.framework import ops, function
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
+from blocksparse.utils import _op_module, scalar_constant
 
 embedding_lookup_op      = _op_module.embedding_lookup
 embedding_lookup_grad_op = _op_module.embedding_lookup_grad
@@ -25,7 +22,7 @@ def embedding_lookup(emb, idx, sort_grad=True, bench=0, use_tf=False):
         #print("######################### Using TF embeding:", dev)
         y = tf.nn.embedding_lookup(convert_gradient_to_tensor(emb), idx)
     else:
-        y = embedding_lookup_op(emb, idx, tf.shape(emb)[0], sorted=sort_grad, bench=bench)
+        y = embedding_lookup_op(emb, idx, scalar_constant(emb.shape[0].value, dtype=tf.int32), sorted=sort_grad, bench=bench)
     return y
 
 @ops.RegisterGradient("EmbeddingLookup")

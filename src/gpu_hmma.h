@@ -56,6 +56,12 @@ __device__ __forceinline__ uint2 to_half4(float4 v)
     return r;
 }
 
+__device__ __forceinline__ ushort load_half(const ehalf* a)
+{
+    ushort r;
+    asm volatile ("ld.global.nc.u16 %0, [%1];" : "=h"(r) : "l"(a));
+    return r;
+}
 __device__ __forceinline__ uint  load_half2(const ehalf* a)
 {
     uint r;
@@ -112,6 +118,24 @@ __device__ __forceinline__ void reduce_half2(const ehalf* a, uint v)
 # endif
 }
 
+__device__ __forceinline__ float  ld_shared_float1(uint a)
+{
+    float v;
+    asm volatile ("ld.shared.f32 %0, [%1];"  : "=f"(v) : "r"(a*4));
+    return v;
+}
+__device__ __forceinline__ float2 ld_shared_float2(uint a)
+{
+    float2 v;
+    asm volatile ("ld.shared.v2.f32 {%0, %1}, [%2];"  : "=f"(v.x),"=f"(v.y) : "r"(a*4));
+    return v;
+}
+__device__ __forceinline__ float4 ld_shared_float4(uint a)
+{
+    float4 v;
+    asm volatile ("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];"  : "=f"(v.x),"=f"(v.y),"=f"(v.z),"=f"(v.w) : "r"(a*4));
+    return v;
+}
 
 #define OP_N 0
 #define OP_T 1
@@ -260,8 +284,14 @@ struct fragmentC
         }
     }
 
+
+#if CUDA_VERSION > 9020
+#define MMA_ALIGNED ".aligned"
+#else
+#define MMA_ALIGNED ""
+#endif
 #define MMA_SYNC(tile, opA, opB) \
-    asm("wmma.mma.sync." tile "." opA "." opB ".f32.f32     \n\t"   \
+    asm("wmma.mma.sync" MMA_ALIGNED "." tile "." opA "." opB ".f32.f32     \n\t"   \
         "        {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 },\n\t"   \
         "        {  %8,  %9, %10, %11, %12, %13, %14, %15 },\n\t"   \
         "        { %16, %17, %18, %19, %20, %21, %22, %23 },\n\t"   \
@@ -280,8 +310,9 @@ struct fragmentC
         }
         else if (TILE == M8N32K16)
         {
-            if (OP_A == OP_N && OP_B == OP_N) MMA_SYNC("m8n32k16", "row", "row");
-            if (OP_A == OP_T && OP_B == OP_N) MMA_SYNC("m8n32k16", "col", "row");
+            // m8n32k16 flag doesn't change mma behavior and isn't backwards compatable with cuda 9.0
+            if (OP_A == OP_N && OP_B == OP_N) MMA_SYNC("m16n16k16", "row", "row"); // m8n32k16
+            if (OP_A == OP_T && OP_B == OP_N) MMA_SYNC("m16n16k16", "col", "row"); // m8n32k16
         }
     }
 };

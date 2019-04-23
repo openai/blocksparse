@@ -142,6 +142,8 @@ REGISTER_OP("EdgeBiasGrad")
     .Attr("bench: int = 0")
     .SetShapeFn([](InferenceContext* ctx) {
       ctx->set_output(0, ctx->input(1));
+      ctx->set_output(1, ctx->input(2));
+      ctx->set_output(2, ctx->input(2));
       return Status::OK();
     })
     .Doc(R"doc(

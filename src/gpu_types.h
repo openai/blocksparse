@@ -70,6 +70,20 @@ typedef struct __align__(16) bhalf8 {
     unsigned int w;
 } bhalf8;
 
+// 16 bit storage format for Adam running gradient variance (unsigned)
+// 6 bits expoenent, 10 bits mantissa, 0 bit sign
+typedef struct __align__(2) vhalf {
+    __device__ __forceinline__ vhalf() {}
+    __device__ __forceinline__ vhalf(const unsigned short val) : x(val) {}
+    unsigned short x;
+} vhalf;
+// 16 bit storage format for Adam running gradient mean (signed)
+// 6 bits expoenent, 9 bits mantissa, 1 bit sign
+typedef struct __align__(2) mhalf {
+    __device__ __forceinline__ mhalf() {}
+    __device__ __forceinline__ mhalf(const unsigned short val) : x(val) {}
+    unsigned short x;
+} mhalf;
 
 typedef struct __align__(16) float8 {
     __device__ __forceinline__ float8() { }
@@ -79,47 +93,41 @@ typedef struct __align__(16) float8 {
 } float8;
 
 
+#define NT_OP 0
+#define NN_OP 1
+#define TN_OP 2
+
 // simple aliases to help keep nice and aligned
 #define FLOAT float
 #define EHALF Eigen::half
+#define MHALF Eigen::half
+#define VHALF Eigen::half
 #define BHALF bfloat16
 
 // Map TF types to GPU single and vector types
-#define FLOAT2 float,float,float2,float4,float8
-#define EHALF2 Eigen::half,ehalf,ehalf2,ehalf4,ehalf8
-#define BHALF2 bfloat16,bhalf,bhalf2,bhalf4,bhalf8
+#define FLOAT_V float,      float,float2,float4,float8
+#define EHALF_V Eigen::half,ehalf,ehalf2,ehalf4,ehalf8
+#define BHALF_V bfloat16,   bhalf,bhalf2,bhalf4,bhalf8
 
 
-
-// Mixed Types - for TF op template declaratoins
-#define MTYPE1(ta) typename ta, typename ta##1, typename ta##2, typename ta##4, typename ta##8
-#define MTYPE2(ta,tb)    MTYPE1(ta), MTYPE1(tb)
-#define MTYPE3(ta,tb,tc) MTYPE1(ta), MTYPE1(tb), MTYPE1(tc)
-
-#define NTYPE1(a) a, a##1, a##2, a##4, a##8
-#define NTYPE2(a, b)    NTYPE1(a), NTYPE1(b)
-#define NTYPE3(a, b, c) NTYPE1(a), NTYPE1(b), NTYPE1(c)
-
-#define OTYPE1(a) a##1, a##2, a##4, a##8
-#define OTYPE2(a, b)    OTYPE1(a), OTYPE1(b)
-#define OTYPE3(a, b, c) OTYPE1(a), OTYPE1(b), OTYPE1(c)
-
-
+// Mixed Types - for mapping TF types to our vector types in template declarations
+#define MTYPE(a) typename a, typename a##1, typename a##2, typename a##4, typename a##8
 
 // Cuda Types - for cuda template declaratoins
-#define CTYPE1(ta) typename ta, typename ta##2, typename ta##4, typename ta##8
-#define CTYPE2(ta,tb)    CTYPE1(ta), CTYPE1(tb)
-#define CTYPE3(ta,tb,tc) CTYPE1(ta), CTYPE1(tb), CTYPE1(tc)
+#define CTYPE(a) typename a, typename a##2, typename a##4, typename a##8
 
 // Vector Types - for cuda implementation calling/instantiation
-#define VTYPE1(a) a, a##2, a##4, a##8
-#define VTYPE2(a, b)    VTYPE1(a), VTYPE1(b)
-#define VTYPE3(a, b, c) VTYPE1(a), VTYPE1(b), VTYPE1(c)
+#define NTYPE(a) a##1, a##2, a##4, a##8
+#define VTYPE(a) a, a##2, a##4, a##8
 
+template<uint DIMS>
+struct Strides {
+    uint stride[DIMS];
+};
 
-template<typename T>
-struct plist8 {
-    const T* a[8];
+template<typename T, uint SIZE>
+struct Plist {
+    const T* a[SIZE];
 };
 
 typedef struct bsmm_params
@@ -129,7 +137,7 @@ typedef struct bsmm_params
     int* Lock;
     //float4* Scratch;
     int blocks;
-    int bshift;
+    int bsize;
     int segments;
     int locks;
     int C;
@@ -137,6 +145,10 @@ typedef struct bsmm_params
     int N;
     int shared;
     int pcount;
+    uint blk_a;
+    uint blk_A;
+    uint blk_b;
+    uint blk_B;
     float alpha;
     float beta;
     CUstream stream;

@@ -4,8 +4,8 @@ import setuptools
 
 setuptools.setup(
     name='blocksparse',
-    version='1.0.0',
-    description='Tensorflow ops for blocksparse matmul, convolution and related operations.',
+    version='1.13.0',
+    description='Tensorflow ops for blocksparse matmul, transformer, convolution and related operations.',
     author='OpenAI',
     maintainer='Scott Gray',
     maintainer_email='scott@openai.com',

@@ -28,10 +28,14 @@ REGISTER_OP("DwMatmulLargeN")
       ShapeHandle x = ctx->input(0);
       ShapeHandle e = ctx->input(1);
 
-      ctx->set_output(0, ctx->MakeShape( {
-        ctx->Dim(x, ctx->Rank(x)-1), // C
-        ctx->Dim(e, ctx->Rank(e)-1)  // K
-      } ));
+      if (ctx->RankKnown(x) && ctx->RankKnown(e))
+        ctx->set_output(0, ctx->MakeShape( {
+          ctx->Dim(x, ctx->Rank(x)-1), // C
+          ctx->Dim(e, ctx->Rank(e)-1)  // K
+        } ));
+      else
+        ctx->set_output(0, ctx->UnknownShape());
+
       return Status::OK();
     })
     .Doc(R"doc(

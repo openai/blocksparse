@@ -588,7 +588,7 @@ __global__ void __launch_bounds__(THREADS) sparse_relu_forward(
     // if using more than 1 warp, further reduced with shared memory
     if (THREADS > 32)
     {
-        __shared__ float2 Share[THREADS/32];
+        __shared__ float2 Share[32];
 
         // first thread of each warp store to shared
         if ((tid & 31) == 0)
@@ -596,7 +596,7 @@ __global__ void __launch_bounds__(THREADS) sparse_relu_forward(
 
         __syncthreads();
 
-        if (tid < THREADS/32)
+        if (tid < 32)
         {
             // first warp loads all prior reductions
             mean = Share[tid];
@@ -608,8 +608,7 @@ __global__ void __launch_bounds__(THREADS) sparse_relu_forward(
                 mean.y += shfl_xor(mean.y, i);
             }
             // outputs final reduction to shared
-            if (tid == 0)
-                Share[0] = mean;
+            Share[tid] = mean;
         }
         __syncthreads();
 

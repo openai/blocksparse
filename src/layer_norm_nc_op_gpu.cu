@@ -50,7 +50,7 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
     // if using more than 1 warp, further reduced with shared memory
     if (THREADS > 32)
     {
-        __shared__ float2 Share[THREADS/32];
+        __shared__ float2 Share[32];
 
         // first thread of each warp store to shared
         if ((tid & 31) == 0)
@@ -58,7 +58,7 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
 
         __syncthreads();
 
-        if (tid < THREADS/32)
+        if (tid < 32)
         {
             // first warp loads all prior reductions
             mean = Share[tid];
@@ -70,8 +70,7 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
                 mean.y += shfl_xor(mean.y, i);
             }
             // outputs final reduction to shared
-            if (tid == 0)
-                Share[0] = mean;
+            Share[tid] = mean;
         }
         __syncthreads();
 
@@ -265,8 +264,8 @@ __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
     const float* __restrict__ Rstd,
     float epsilon, int K, float rcpK, int relu)
 {
-    __shared__ float Share1[THREADS>>5];
-    __shared__ float Share2[THREADS>>5];
+    __shared__ float Share1[32];
+    __shared__ float Share2[32];
 
     int tid = threadIdx.x;
     int n   = blockIdx.x;
@@ -316,14 +315,14 @@ __global__ void __launch_bounds__(THREADS) layer_norm_dx_NC(
         Share2[tid >> 5] = sum2;
     }
     __syncthreads();
-    if (tid < (THREADS>>5))
+    if (tid < 32)
     {
         // first warp loads all prior reductions
         sum1 = Share1[tid];
         sum2 = Share2[tid];
         // reduce within this last warp
         #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
+        for (int i = THREADS/64; i > 0; i >>= 1)
         {
             sum1 += shfl_xor(sum1, i);
             sum2 += shfl_xor(sum2, i);

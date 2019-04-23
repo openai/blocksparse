@@ -98,15 +98,24 @@ REGISTER_OP("CWiseLinearGrad")
     .Attr("n_xy: int >= 0")
     .Attr("n_a: int >= 0")
     .Attr("n_b: int >= 0")
-    .SetShapeFn([](InferenceContext* ctx) {
+    .SetShapeFn([](InferenceContext* ctx)
+    {
       ctx->set_output(0, ctx->input(0));
+
       std::vector<ShapeHandle> a, b;
       ctx->input("a", &a);
       ctx->input("b", &b);
+
       if (a.size())
         ctx->set_output(1, a[0]);
+      else
+        ctx->set_output(1, ctx->UnknownShape());
+
       if (b.size())
         ctx->set_output(2, b[0]);
+      else
+        ctx->set_output(2, ctx->UnknownShape());
+
       return Status::OK();
     })
     .Doc(R"doc(

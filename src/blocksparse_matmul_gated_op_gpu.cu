@@ -344,6 +344,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
     int lut_size   = lut_head.y;
     int idx_K      = lut_head.z;
     int idx_Lock   = lut_head.w;
+    //printf("%d %2d %d\n", idx_K, tid, lut_size);
 
     uint dep_thd_mask = 0xffffffff; dep_thd_mask >>= 32 - tid;
     int  new_lut_size = 0;
@@ -353,45 +354,37 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
     #pragma unroll 1
     for (int i = tid; i < lut_size; i += 32)
     {
+        //printf("%d %2d %d %d %d\n", idx_K, tid, i, lut_size, new_lut_size);
+
         LutEntry entry;
         *(int2*)&entry = Lut[i];
 
         entry.gate = Gate[entry.offsetW];
 
         // only add the entry to the lut if the gate is non-zero
-        // compiler is stupid about reusing predicate here so use asm
-        uint ballot, warp_non_zero;
-        asm volatile ("{\n\t"
-            ".reg .pred p;                      \n\t"
-            ".reg .u32 ballot;                  \n\t"
-            "setp.ne.ftz.f32 p, %2, 0f00000000; \n\t"
-# if CUDA_VERSION >= 9020
-            "vote.sync.ballot.b32 ballot, p, 0xffffffff;\n\t"
-# else
-            "vote.ballot.b32 ballot, p;         \n\t"
-# endif
-            "mov.b32  %0, ballot;               \n\t"
-            "popc.b32 %1, ballot;               \n\t"
-            "@!p bra GATE_ZERO;                 \n\t"
-            "}" : "=r"(ballot), "=r"(warp_non_zero) : "f"(entry.gate));
+        bool gate_non_zero = entry.gate != 0.0f;
+        //uint gate_ballot   = __ballot_sync(0xffffffff, gate_non_zero);
+        uint gate_ballot   = __ballot(gate_non_zero);
+        uint warp_non_zero = __popc(gate_ballot);
+        if (gate_non_zero)
         {
-            uint dep_thd_cnt = __popc(dep_thd_mask & ballot);
+            uint dep_thd_cnt = __popc(dep_thd_mask & gate_ballot);
 
             entry.unused   = 0;
             entry.offsetX *= N8;
             entry.offsetW *= 32;
             Lut4s[new_lut_size + dep_thd_cnt] = entry;
         }
-        asm volatile ("\nGATE_ZERO:\n" ::);
-
         new_lut_size += warp_non_zero;
     }
-    //lut_size = new_lut_size;
-# if CUDA_VERSION >= 9020
-    asm volatile ("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;" : "=r"(lut_size) : "r"(new_lut_size));
-# else
-    asm volatile ("shfl.idx.b32 %0, %1, 0, 0x1f;" : "=r"(lut_size) : "r"(new_lut_size));
-# endif
+    // lut_size = new_lut_size;
+// # if CUDA_VERSION >= 9020
+//     lut_size = __shfl_sync(0xffffffff, new_lut_size, 0, 32);
+// # else
+    lut_size = __shfl(new_lut_size, 0, 32);
+// # endif
+
+    //printf("%d %2d %d\n", idx_K, tid, lut_size);
 
     // zero accumulation registers
     float regY[4][4];
@@ -557,7 +550,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_xprop(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     const float* __restrict__ Gate,
     TU* U,
@@ -780,7 +773,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_updat(
 
     float2 u2 = *(float2*)u;
     float2 b2 = to_float(t2);
-    alpha *= gate;
+    //alpha *= gate;
     u2.x = alpha*u2.x + beta*b2.x;
     u2.y = alpha*u2.y + beta*b2.y;
     store(U, u2, offset);
@@ -788,7 +781,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x8_updat(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     const float* __restrict__ Gate,
     TU* U,
@@ -1003,84 +996,79 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_gated_08x64x08x4_updat(
 
     float2 u2 = *(float2*)u;
     float2 b2 = to_float(t2);
-    alpha *= gate;
+    //alpha *= gate;
     u2.x = alpha*u2.x + beta*b2.x;
     u2.y = alpha*u2.y + beta*b2.y;
     store(U, u2, offset);
 }
 
 
-#define GridDim(size, shift) ((size >> shift) + ((size & ((1<<shift)-1)) != 0))
 
-template <bool Fprop, CTYPE3(TX, TW, TY)>
-cudaError_t BsmmGatedXprop_CN(const TX* X, const TW* W, TY* Y, bsmm_params* params)
+template <bool Fprop, CTYPE(T)>
+cudaError_t BsmmGatedXprop_CN(const T* X, const T* W, T* Y, bsmm_params* params)
 {
-    dim3 grid(GridDim(params->N, 6), params->segments, 1);
+    dim3 grid(CEIL_DIV(params->N, 64), params->segments, 1);
 
     // printf("grid: %d %d\n", grid.x, grid.y);
 
     const int2* L2 = (const int2*)params->Lut;
-    const  TW2* W2 = (const  TW2*)W;
-    const  TX4* X4 = (const  TX4*)X;
-    const  TX8* X8 = (const  TX8*)X;
-           TY2* Y2 = (       TY2*)Y;
-           TY8* Y8 = (       TY8*)Y;
+    const   T2* W2 = (const   T2*)W;
+    const   T4* X4 = (const   T4*)X;
+    const   T8* X8 = (const   T8*)X;
+            T2* Y2 = (        T2*)Y;
+            T8* Y8 = (        T8*)Y;
 
     if (params->locks > 0)
         cuMemsetD32Async((CUdeviceptr)params->Lock, 0, grid.x * params->locks * 2, params->stream);
 
-    if (params->bshift == 3)
+    if (params->bsize == 8)
     {
-        if (sizeof(TW) == 2 && sizeof(TX) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_gated_08x64x08x8_xprop<Fprop,TW2,TX8,TY8><<<grid,32,params->shared*2,params->stream>>>(L2, params->Gate, W2, X8, Y8, params->Lock, params->locks, params->N>>3);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_gated_08x64x08x8_xprop<Fprop,T2,T8,T8><<<grid,32,params->shared*2,params->stream>>>(L2, params->Gate, W2, X8, Y8, params->Lock, params->locks, params->N>>3);
         else
-            gemm_blocksparse_gated_08x64x08x4_xprop<Fprop,TW2,TX4,TY2><<<grid,32,params->shared*2,params->stream>>>(L2, params->Gate, W2, X4, Y2, params->Lock, params->locks, params->N);
+            gemm_blocksparse_gated_08x64x08x4_xprop<Fprop,T2,T4,T2><<<grid,32,params->shared*2,params->stream>>>(L2, params->Gate, W2, X4, Y2, params->Lock, params->locks, params->N);
     }
     return cudaPeekAtLastError();
 }
+template cudaError_t BsmmGatedXprop_CN<true,  VTYPE(float)>(const float* X, const float* W, float* Y, bsmm_params* params);
+template cudaError_t BsmmGatedXprop_CN<true,  VTYPE(ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
+template cudaError_t BsmmGatedXprop_CN<true,  VTYPE(bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
 
-template cudaError_t BsmmGatedXprop_CN<true,  VTYPE3(float,float,float)>(const float* X, const float* W, float* Y, bsmm_params* params);
-template cudaError_t BsmmGatedXprop_CN<true,  VTYPE3(ehalf,ehalf,ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
-template cudaError_t BsmmGatedXprop_CN<true,  VTYPE3(bhalf,bhalf,bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
-
-template cudaError_t BsmmGatedXprop_CN<false, VTYPE3(float,float,float)>(const float* X, const float* W, float* Y, bsmm_params* params);
-template cudaError_t BsmmGatedXprop_CN<false, VTYPE3(ehalf,ehalf,ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
-template cudaError_t BsmmGatedXprop_CN<false, VTYPE3(bhalf,bhalf,bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
+template cudaError_t BsmmGatedXprop_CN<false, VTYPE(float)>(const float* X, const float* W, float* Y, bsmm_params* params);
+template cudaError_t BsmmGatedXprop_CN<false, VTYPE(ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
+template cudaError_t BsmmGatedXprop_CN<false, VTYPE(bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
 
 
-template <CTYPE3(TX, TE, TU)>
-cudaError_t BsmmGatedUpdat_CN(const TX* X, const TE* E, TU* U, bsmm_params* params)
+template <CTYPE(T)>
+cudaError_t BsmmGatedUpdat_CN(const T* X, const T* E, T* U, bsmm_params* params)
 {
     dim3 grid(params->blocks, 1, 1);
-    int loops = GridDim(params->N, 6);
+    int loops = CEIL_DIV(params->N, 64);
 
-    struct plist8<TX4>* X4 = (struct plist8<TX4>*)X;
-    struct plist8<TE4>* E4 = (struct plist8<TE4>*)E;
-    struct plist8<TX8>* X8 = (struct plist8<TX8>*)X;
-    struct plist8<TE8>* E8 = (struct plist8<TE8>*)E;
+    struct Plist<T4,8>* X4 = (struct Plist<T4,8>*)X;
+    struct Plist<T4,8>* E4 = (struct Plist<T4,8>*)E;
+    struct Plist<T8,8>* X8 = (struct Plist<T8,8>*)X;
+    struct Plist<T8,8>* E8 = (struct Plist<T8,8>*)E;
 
     const int2* L2 = (const int2*)params->Lut;
-           TU2* U2 = (       TU2*)U;
+            T2* U2 = (        T2*)U;
 
-    if (params->bshift == 3)
+    if (params->bsize == 8)
     {
         // If not accumulating zero out the buffer
         if (params->beta == 0.0f)
-            cuMemsetD8Async((CUdeviceptr)U, 0, params->blocks * 64 * sizeof(TU), params->stream);
+            cuMemsetD8Async((CUdeviceptr)U, 0, params->blocks * 64 * sizeof(T), params->stream);
 
-        if (sizeof(TX) == 2 && sizeof(TE) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_gated_08x64x08x8_updat<TX8,TE8,TU2><<<grid,32,0,params->stream>>>(*X8, *E8, L2, params->Gate, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_gated_08x64x08x8_updat<T8,T8,T2><<<grid,32,0,params->stream>>>(*X8, *E8, L2, params->Gate, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
         else
-            gemm_blocksparse_gated_08x64x08x4_updat<TX4,TE4,TU2><<<grid,32,0,params->stream>>>(*X4, *E4, L2, params->Gate, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
+            gemm_blocksparse_gated_08x64x08x4_updat<T4,T4,T2><<<grid,32,0,params->stream>>>(*X4, *E4, L2, params->Gate, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
     }
     return cudaPeekAtLastError();
 }
-
-
-
-template cudaError_t BsmmGatedUpdat_CN<VTYPE3(float,float,float)>(const float* X, const float* E, float* U, bsmm_params* params);
-template cudaError_t BsmmGatedUpdat_CN<VTYPE3(ehalf,ehalf,ehalf)>(const ehalf* X, const ehalf* E, ehalf* U, bsmm_params* params);
-template cudaError_t BsmmGatedUpdat_CN<VTYPE3(bhalf,bhalf,bhalf)>(const bhalf* X, const bhalf* E, bhalf* U, bsmm_params* params);
+template cudaError_t BsmmGatedUpdat_CN<VTYPE(float)>(const float* X, const float* E, float* U, bsmm_params* params);
+template cudaError_t BsmmGatedUpdat_CN<VTYPE(ehalf)>(const ehalf* X, const ehalf* E, ehalf* U, bsmm_params* params);
+template cudaError_t BsmmGatedUpdat_CN<VTYPE(bhalf)>(const bhalf* X, const bhalf* E, bhalf* U, bsmm_params* params);
 
 
 #endif // GOOGLE_CUDA

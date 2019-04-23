@@ -4,13 +4,10 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os.path
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.framework import ops
-
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
+from blocksparse.utils import _op_module, scalar_constant
 
 
 ############################## Blocksparse Transformer #####################################
@@ -22,11 +19,11 @@ blocksparse_transformer_nt = _op_module.blocksparse_transformer_nt
 blocksparse_transformer_nn = _op_module.blocksparse_transformer_nn
 blocksparse_transformer_tn = _op_module.blocksparse_transformer_tn
 
-blocksparse_masked_softmax      = _op_module.blocksparse_masked_softmax
-blocksparse_masked_softmax_grad = _op_module.blocksparse_masked_softmax_grad
+blocksparse_masked_softmax = _op_module.blocksparse_masked_softmax
+blocksparse_softmax        = _op_module.blocksparse_softmax
+blocksparse_softmax_grad   = _op_module.blocksparse_softmax_grad
 
-blocksparse_softmax      = _op_module.blocksparse_softmax
-blocksparse_softmax_grad = _op_module.blocksparse_softmax_grad
+bst_partial_autoregressive_mask = _op_module.bst_partial_autoregressive_mask
 
 # save a bit of gpu memory by only creating one copy of identical constant lookup tables
 g_lookup_cache = dict(nt=list(), nn=list(), tn=list(), sm=list())
@@ -41,9 +38,14 @@ def get_constant(lut, name):
                 # found an exact match
                 return tf_entry
 
-    tf_entry = tf.constant(lut, name=name+"_lut")
+    with tf.control_dependencies(None):
+        tf_entry = tf.constant(lut, name=name+"_lut")
     g_lookup_cache[name].append( (lut, tf_entry) )
     return tf_entry
+
+def clear_bst_constants():
+    global g_lookup_cache
+    g_lookup_cache = dict(nt=list(), nn=list(), tn=list(), sm=list())
 
 
 class BlocksparseTransformer(object):
@@ -79,6 +81,7 @@ class BlocksparseTransformer(object):
         self.blk_shape    = (block_size, block_size)
         self.nn_max       = 0
         self.tn_max       = 0
+        self.softmax_dtype = None
 
         if layout.dtype != np.int32:
             layout = layout.astype(np.int32)
@@ -240,11 +243,12 @@ class BlocksparseTransformer(object):
         return C.reshape([batch_size, self.ctx_blks_k * self.blk_size, state_size])
 
 
-    def masked_softmax_test(self, x, scale=1.0):
+    def masked_softmax_test(self, x, scale=1.0, autoregress_at_key=None):
 
         y = np.empty_like(x)
         m = self.softmax_mask_np # heads, blocks, blk_size
         bsize = self.blk_size
+        ones = (1 << bsize) - 1
         for n in range(x.shape[0]):
             for h in range(x.shape[1]):
                 hl = h if self.lut_heads > 1 else 0
@@ -256,8 +260,21 @@ class BlocksparseTransformer(object):
                             # apply scale
                             xm[i,:] = xb * scale
                         else:
+                            mask = m[hl,b,:]
+                            if autoregress_at_key is not None:
+                                Q = self.nt_list[hl][b][0] * bsize
+                                K = k * bsize
+                                new_mask = np.empty(bsize, dtype=mask.dtype)
+                                for q in range(bsize):
+                                    shift_a = bsize - min(max(autoregress_at_key - K, 0), bsize)
+                                    shift_b = min(max(bsize-1 + K - (Q + q), 0), bsize)
+                                    shift_c = int(min(shift_a, shift_b))
+                                    #print(ones, shift_c, type(shift_c))
+                                    new_mask[q] = int(mask[q]) & (ones >> shift_c)
+                                mask = new_mask
+
                             # apply mask and scale to x block
-                            mask  = np.unpackbits(m[hl,b,:].view(np.uint8)).reshape(-1,8)[:,::-1].reshape(-1)
+                            mask  = np.unpackbits(mask.view(np.uint8)).reshape(-1,8)[:,::-1].reshape(-1)
                             nzIdx = np.nonzero(mask)
                             xm[i,nzIdx] = xb[nzIdx] * scale
                     # compute softmax for collection of k blocks
@@ -294,7 +311,7 @@ class BlocksparseTransformer(object):
         nt_lut, nn_lut, tn_lut = self.get_lut_constants()
 
         return blocksparse_transformer_nt(
-            a, b, nt_lut, nn_lut, tn_lut, CT=tf.float16,
+            a, b, nt_lut, nn_lut, tn_lut, CT=tf.bfloat16,
             heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_a=self.ctx_blks_q, ctx_blks_b=self.ctx_blks_k,
             nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
         )
@@ -320,6 +337,8 @@ class BlocksparseTransformer(object):
     def query_key_op(self, q, k, name=None, bench=0):
         nt_lut, nn_lut, tn_lut = self.get_lut_constants()
 
+        self.softmax_dtype = tf.bfloat16 if q.dtype.base_dtype == tf.float32 else tf.float16
+
         return blocksparse_transformer_nt(
             q, k, nt_lut, nn_lut, tn_lut, CT=tf.bfloat16,
             heads=self.heads, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_a=self.ctx_blks_q, ctx_blks_b=self.ctx_blks_k,
@@ -335,19 +354,33 @@ class BlocksparseTransformer(object):
             nn_max=self.nn_max, tn_max=self.tn_max, bench=bench, name=name
         )
 
-    def masked_softmax(self, x, scale=1.0):
+    def masked_softmax(self, x, scale=1.0, autoregress_at_key=None, dtype=None):
         if self.softmax_mask is None:
+            if autoregress_at_key is not None:
+                raise ValueError("autoregress_at_key only applies to ops with mask_callback defined.")
             return self.softmax(x, scale)
 
         nn_lut  = get_constant(self.nn_lut,       name="nn")
         sm_mask = get_constant(self.softmax_mask, name="sm")
 
-        return blocksparse_masked_softmax(x, scale, nn_lut, sm_mask, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks_q, lut_max=self.nn_max)
+        if autoregress_at_key is not None:
+            lut = get_constant(self.nt_lut, name="nt")
+            key = scalar_constant(autoregress_at_key, dtype=tf.int32)
+            with tf.control_dependencies([x.op]):
+                sm_mask = bst_partial_autoregressive_mask(sm_mask, lut, key, blocks=self.blocks, blk_size=self.blk_size, ctx_blks_k=self.ctx_blks_k)
 
-    def softmax(self, x, scale=1.0):
+        if dtype is None:
+            dtype = self.softmax_dtype
+
+        return blocksparse_masked_softmax(x, scalar_constant(scale, dtype=tf.float32), nn_lut, sm_mask, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks_q, lut_max=self.nn_max, T=dtype)
+
+    def softmax(self, x, scale=1.0, dtype=None):
         nn_lut = get_constant(self.nn_lut, name="nn")
 
-        return blocksparse_softmax(x, scale, nn_lut, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks_q, lut_max=self.nn_max)
+        if dtype is None:
+            dtype = self.softmax_dtype
+
+        return blocksparse_softmax(x, scalar_constant(scale, dtype=tf.float32), nn_lut, blocks=self.blocks, blk_size=self.blk_size, ctx_blks=self.ctx_blks_q, lut_max=self.nn_max, T=dtype)
 
 
 #  w  = q    . k.T
@@ -368,15 +401,17 @@ def blocksparse_transformer_nt_grad(op, dw):
     bench      = op.get_attr("bench")
     q, k, nt_lut, nn_lut, tn_lut = op.inputs
 
-    dq = blocksparse_transformer_nn(
-        dw, k, nt_lut, nn_lut, tn_lut,
-        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_k, ctx_blks_c=ctx_blks_q,
-        nn_max=nn_max, tn_max=tn_max, bench=bench)
-
     dk = blocksparse_transformer_tn(
         dw, q, nt_lut, nn_lut, tn_lut,
         heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_q, ctx_blks_c=ctx_blks_k,
         nn_max=nn_max, tn_max=tn_max, bench=bench)
+
+    with tf.control_dependencies([dk.op]):
+
+        dq = blocksparse_transformer_nn(
+            dw, k, nt_lut, nn_lut, tn_lut,
+            heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_k, ctx_blks_c=ctx_blks_q,
+            nn_max=nn_max, tn_max=tn_max, bench=bench)
 
     return (dq, dk, None, None, None)
 
@@ -398,15 +433,18 @@ def blocksparse_transformer_nn_grad(op, dy):
     bench      = op.get_attr("bench")
     w, v, nt_lut, nn_lut, tn_lut = op.inputs
 
-    dw = blocksparse_transformer_nt(
-        dy, v, nt_lut, nn_lut, tn_lut, CT=tf.float16,
-        heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_a=ctx_blks_q, ctx_blks_b=ctx_blks_k,
-        nn_max=nn_max, tn_max=tn_max, bench=bench)
-
     dv = blocksparse_transformer_tn(
         w, dy, nt_lut, nn_lut, tn_lut,
         heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_b=ctx_blks_q, ctx_blks_c=ctx_blks_k,
         nn_max=nn_max, tn_max=tn_max, bench=bench)
+
+    with tf.control_dependencies([dv.op]):
+        c_dtype = tf.bfloat16 if dy.dtype.base_dtype == tf.float32 else tf.float16
+
+        dw = blocksparse_transformer_nt(
+            dy, v, nt_lut, nn_lut, tn_lut, CT=c_dtype,
+            heads=heads, blocks=blocks, blk_size=blk_size, ctx_blks_a=ctx_blks_q, ctx_blks_b=ctx_blks_k,
+            nn_max=nn_max, tn_max=tn_max, bench=bench)
 
     return (dw, dv, None, None, None)
 
@@ -421,9 +459,8 @@ def blocksparse_masked_softmax_op_grad(op, dy):
     y        = op.outputs[0]
     scale    = op.inputs[1]
     lut      = op.inputs[2]
-    mask     = op.inputs[3]
 
-    dx = blocksparse_masked_softmax_grad(dy, y, scale, lut, mask, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks, lut_max=lut_max)
+    dx = blocksparse_softmax_grad(dy, y, scale, lut, blocks=blocks, blk_size=blk_size, ctx_blks=ctx_blks, lut_max=lut_max)
 
     return (dx, None, None, None)
 
@@ -527,11 +564,11 @@ def masked_top_k_softmax(x, k, mask=None, scale=1.0):
     else:
         mask = []
 
-    return masked_top_k_softmax_op(x, k, scale, mask)
+    return masked_top_k_softmax_op(x, k, scalar_constant(scale, dtype=tf.float32), mask)
 
 
 def softmax(x, scale=1.0, bench=0):
-    return masked_softmax_op(x, scale, [], bench=bench)
+    return masked_softmax_op(x, scalar_constant(scale, dtype=tf.float32), [], bench=bench)
 
 def masked_softmax(x, mask=None, scale=1.0, bench=0):
     if mask is not None:
@@ -545,7 +582,7 @@ def masked_softmax(x, mask=None, scale=1.0, bench=0):
     else:
         mask = []
 
-    return masked_softmax_op(x, scale, mask, bench=bench)
+    return masked_softmax_op(x, scalar_constant(scale, dtype=tf.float32), mask, bench=bench)
 
 
 @ops.RegisterGradient("MaskedTopKSoftmax")
@@ -624,9 +661,19 @@ def masked_softmax_grad_test(dy, y, mask=None, scale=1.0):
 # x = np.arange(1,101, dtype=np.float32).reshape(1,10,10)
 # y = masked_top_k_softmax_test(x, 5, mask=m)
 
-############################## Transpose 0213 #####################################
+############################## Transpose #####################################
 
 transpose_0213_op = _op_module.transpose0213
+transpose_2d_op   = _op_module.transpose2d
+
+
+def transpose_2d(x):
+    return transpose_2d_op(x)
+
+@ops.RegisterGradient("Transpose2D")
+def transpose_2d_grad(op, dy):
+    return transpose_2d_op(dy)
+
 
 def transpose_0213(x):
     return transpose_0213_op(x)

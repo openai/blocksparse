@@ -4,20 +4,21 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os.path
 import numpy as np
 import tensorflow as tf
 import scipy.sparse as sparse
 from tensorflow.python.framework import ops
 from tensorflow.python.ops.init_ops import Initializer
+from blocksparse.utils import _op_module, z_order_2d, ceil_div, scalar_constant
 import blocksparse.ewops as ew
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
+
 blocksparse_matmul        = _op_module.blocksparse_matmul
 blocksparse_matmul_dx     = _op_module.blocksparse_matmul_dx
 blocksparse_matmul_dw     = _op_module.blocksparse_matmul_dw
 blocksparse_matmul_dwa    = _op_module.blocksparse_matmul_dwa
+blocksparse_matmul_dg     = _op_module.blocksparse_matmul_dg
+blocksparse_reduced_dw    = _op_module.blocksparse_reduced_dw
 l2_normalize_ck           = _op_module.l2_normalize_ck
 l2_normalize_grad_ck      = _op_module.l2_normalize_grad_ck
 l2_normalize_gain_ck      = _op_module.l2_normalize_gain_ck
@@ -25,59 +26,85 @@ l2_normalize_gain_grad_ck = _op_module.l2_normalize_gain_grad_ck
 
 identity_init = _op_module.blocksparse_matmul_identity_init
 
+# save a bit of gpu memory by only creating one copy of identical constant lookup tables
+g_lookup_cache = dict()
+g_lut_idx = 0
+
+def get_constant(lut, name):
+    global g_lookup_cache
+    global g_lut_idx
+
+    default_graph = tf.get_default_graph()
+    if name not in g_lookup_cache:
+        g_lookup_cache[name] = list()
+    for np_entry, tf_entry in g_lookup_cache[name]:
+        if np_entry.dtype == lut.dtype and np_entry.shape == lut.shape and tf_entry.graph is default_graph:
+            if np.abs(np_entry.astype(np.int64) - lut.astype(np.int64)).sum() == 0:
+                # found an exact match
+                return tf_entry
+
+    #print(name, lut.size)
+    #tf_entry = tf.constant(lut, name=name+"_lut")
+    with tf.control_dependencies(None):
+        tf_entry = tf.get_variable(f"{name}_lut_{g_lut_idx}", initializer=lut.view(np.int64), trainable=False)
+    g_lut_idx += 1
+
+    g_lookup_cache[name].append( (lut, tf_entry) )
+    return tf_entry
+
 class IdentityInit(Initializer):
 
-  def __init__(self, lut, CB, KB, blocks, bshift):
+  def __init__(self, lut, CB, KB, blocks, bsize, scale=1.0):
     self.lut = lut
     self.CB = CB
     self.KB = KB
     self.blocks = blocks
-    self.bshift = bshift
+    self.bsize  = bsize
+    self.scale  = scale
 
   def __call__(self, shape, dtype=None, partition_info=None):
     assert shape[0] == self.blocks
-    return identity_init(self.lut, CB=self.CB, KB=self.KB, blocks=self.blocks, bshift=self.bshift)
+    #lut = get_constant(self.lut, name="updat")
+    with tf.control_dependencies(None):
+        lut = tf.constant(self.lut, name="identity_lut")
+        return identity_init(lut, CB=self.CB, KB=self.KB, blocks=self.blocks, bsize=self.bsize, scale=self.scale)
 
 SEG_MAX = (1<<63)-1
 
 class BlocksparseMatMul(object):
 
     def __getstate__(self):
-        return (self.layout, self.bsize, self.axis, self.name)
+        return (self.layout, self.bsize, self.axis, self.z_order, self.name)
 
     def __setstate__(self, state):
         self.__init__(*state)
 
-    def __init__(self, layout, block_size=32, feature_axis=1, name=None):
+    def __init__(self, layout, block_size=32, feature_axis=0, z_order=True, name=None):
 
         if (feature_axis == 0 and block_size in (8,16,32)) or \
-           (feature_axis == 1 and block_size in (32,)):
+           (feature_axis == 1 and block_size in (32,64)):
            self.axis   = feature_axis
            self.bsize  = block_size
-           self.bshift = len(bin(block_size)) - 3 # cheap log2(block_size)
         else:
             raise ValueError("Unsupported block size with this feature axis")
 
         assert len(layout.shape) == 2
         CB, KB = layout.shape
 
-        if self.axis == 1:
-            segment_size = SEG_MAX # not yet supported
+        group_sizes = layout.sum(axis=0) # assume symetrical transpose
+        max_group = group_sizes.max()
+        min_group = group_sizes[np.nonzero(group_sizes)].min()
+        if max_group / min_group > 2.0:
+            segment_size = max(ceil_div(max_group,4), min_group*2)
         else:
-            group_sizes = layout.sum(axis=0) # assume symetrical transpose
-            max_group = group_sizes.max()
-            min_group = group_sizes[np.nonzero(group_sizes)].min()
-            if max_group / min_group > 2.0:
-                segment_size = max(ceil_div(max_group,4), min_group*2)
-            else:
-                segment_size = SEG_MAX # not worth segmenting
-            #print(max_group, min_group, segment_size, KB)
+            segment_size = SEG_MAX # not worth segmenting
+        #print(max_group, min_group, segment_size, KB)
         #segment_size = SEG_MAX
 
         # don't creat any segments smaller than this
         seg_min = max(ceil_div(segment_size, 4), 4)
 
-        #segment_size = seg_min = 2
+        # segment_size = seg_min = 2
 
         if layout.dtype != np.int32:
             layout = layout.astype(np.int32)
@@ -91,24 +118,32 @@ class BlocksparseMatMul(object):
 
         # morton order (z-order) the blocks for efficient L2 cache utilization across all 3 ops
         updat_list = list()
-        blk = 0
-        for _, i in sorted( [ (BlocksparseMatMul.morton(cs[i], ks[i]), i) for i in range(blocks) ] ):
-            vs[i] = blk
-            updat_list.append((cs[i], ks[i]))
-            blk += 1
-        self.updat_list = updat_list
+        if z_order:
+            blk = 0
+            for _, i in sorted( [ (z_order_2d(cs[i], ks[i]), i) for i in range(blocks) ] ):
+                vs[i] = blk
+                updat_list.append((cs[i], ks[i]))
+                blk += 1
+        else:
+            # row contiguous
+            updat_list = list( zip(cs, ks) )
+            vs = list(range(blocks))
+            # cs = [b[0] for b in updat_list]
+            # ks = [b[1] for b in updat_list]
 
-        updat_lut_np = np.array(updat_list, dtype=np.int32)
+        self.updat_list = updat_list
+        self.updat_lut  = np.array(updat_list, dtype=np.int32)
 
         fsetup = self.xprop_lut(KB, cs, ks, vs, idx,  segment_size, seg_min)
         bsetup = self.xprop_lut(CB, ks, cs, vs, idxT, segment_size, seg_min)
 
-        self.fprop_list, fprop_lut_np, l2_lut_np, self.fprop_shared, self.l2_shared, self.fprop_segments, self.fprop_locks = fsetup
-        self.bprop_list, bprop_lut_np,         _, self.bprop_shared,              _, self.bprop_segments, self.bprop_locks = bsetup
+        self.fprop_list, self.fprop_lut, self.l2_lut, self.fprop_shared, self.l2_shared, self.fprop_segments, self.fprop_locks = fsetup
+        self.bprop_list, self.bprop_lut,           _, self.bprop_shared,              _, self.bprop_segments, self.bprop_locks = bsetup
 
         if name is None:
             name = "BlocksparseMatMul"
 
+        self.z_order = z_order
         self.name    = name
         self.flops   = blocks * block_size * block_size * 2
         self.blocks  = blocks
@@ -121,17 +156,10 @@ class BlocksparseMatMul(object):
         self.C  = CB * block_size
         self.K  = KB * block_size
 
-        self.sparsity = float(blocks) / float(CB * KB)
+        self.sparsity = round(float(blocks) / float(CB * KB), 3)
 
         # save boolean version for serialization purposes, TODO save csr version
         self.layout = layout > 0
-
-        with tf.name_scope(name):
-            self.fprop_lut = tf.constant(fprop_lut_np, name="fprop_lut")
-            self.bprop_lut = tf.constant(bprop_lut_np, name="bprop_lut")
-            self.updat_lut = tf.constant(updat_lut_np, name="updat_lut")
-
-            self.l2_lut = tf.constant(l2_lut_np, name="l2_lut")
 
 
     def i_shape(self, N): return (N, self.C) if self.axis else (self.C, N)
@@ -225,7 +253,11 @@ class BlocksparseMatMul(object):
 
         # l2 norm lut (columns not broken up into segments)
         offset = len(cols) * 4
-        l2_lut = np.empty(offset + len(vs), dtype=np.int32)
+        l2_siz = offset + len(vs)
+        # we use int64 views into the lut for tf compatibility reasons..
+        if l2_siz & 1:
+            l2_siz += 1
+        l2_lut = np.zeros(l2_siz, dtype=np.int32)
         l2_max = 0
         for i, (k, lut) in enumerate(cols):
             # build the lut header: int offset, lut_size, K
@@ -237,22 +269,10 @@ class BlocksparseMatMul(object):
 
         return cols, xp_lut, l2_lut, xp_max*8, l2_max*4, len(segs), locks
 
-    # morton order (z-order)
-    @staticmethod
-    def morton(x, y):
-        answer = 0
-        bits = max(len(bin(x)), len(bin(y))) - 2
-        for i in range(bits):
-            mshifted = 1 << i;
-            shift = i
-            answer |= ((x & mshifted) << shift) | ((y & mshifted) << (shift + 1))
-            #print mshifted, shift, answer, bin(answer)
-        return answer
-
     def prune(self, param, gate):
         new_blocks = np.sum(gate != 0.0)
         if new_blocks != self.blocks:
-            new_param  = np.empty((new_blocks, self.bsize, self.bsize), dtype=np.float32)
+            new_param  = np.empty((new_blocks, self.bsize, self.bsize), dtype=param.dtype)
             new_w      = 0
             layout     = self.layout
             for w, (c, k) in enumerate(self.updat_list):
@@ -267,7 +287,7 @@ class BlocksparseMatMul(object):
         sparsity = round(100 * float(new_blocks) / float(self.CB * self.KB), 1)
 
         print("prune: ", self.blocks, new_blocks, sparsity)
-        return new_param
+        return new_param, np.ones((new_blocks,), dtype=gate.dtype)
 
     def ortho_init(self):
         def _initializer(shape, dtype=np.float32, partition_info=None):
@@ -298,19 +318,19 @@ class BlocksparseMatMul(object):
             return W
         return _initializer
 
-    def identity_init(self, gpu=False):
-        if gpu:
-            return IdentityInit(self.updat_lut, self.CB, self.KB, self.blocks, self.bshift)
+    def identity_init(self, scale=1.0):
 
-        def _initializer(shape, dtype=np.float32, partition_info=None):
-            print("%s identity_init sparsity(%.2f)" % (self.name, self.sparsity))
-            W = np.zeros(self.w_shape, dtype=dtype)
-            for w in range(self.blocks):
-                cb, kb = self.updat_list[w]
-                if (cb % self.KB) == (kb % self.CB):
-                    W[w] = np.eye(self.bsize, dtype=dtype)
-            return W
-        return _initializer
+        return IdentityInit(self.updat_lut, self.CB, self.KB, self.blocks, self.bsize, scale=scale)
+
+        # def _initializer(shape, dtype=np.float32, partition_info=None):
+        #     print("%s identity_init sparsity(%.2f)" % (self.name, self.sparsity))
+        #     W = np.zeros(self.w_shape, dtype=dtype)
+        #     for w in range(self.blocks):
+        #         cb, kb = self.updat_list[w]
+        #         if (cb % self.KB) == (kb % self.CB):
+        #             W[w] = np.eye(self.bsize, dtype=dtype)
+        #     return W
+        # return _initializer
 
     def checker_init(self):
         def _initializer(shape, dtype=np.float32, partition_info=None):
@@ -422,21 +442,24 @@ class BlocksparseMatMul(object):
                 U[w,:,:] = norm_grad[i]
         return U
 
-    def l2_normalize(self, W, gain=None, epsilon=1e-12, dtype=np.float32):
+    def l2_normalize(self, W, gain=None, epsilon=1e-12, dtype=tf.float32):
+
+        l2_lut = get_constant(self.l2_lut, name="l2")
+
         if gain is None:
-            W, _ = l2_normalize_ck(W, self.l2_lut, TY=dtype, epsilon=epsilon, K=self.K, shared=self.l2_shared, bsize=self.bsize )
+            W, _ = l2_normalize_ck(W, l2_lut, TY=dtype, epsilon=epsilon, K=self.K, shared=self.l2_shared, bsize=self.bsize )
         else:
-            W, _ = l2_normalize_gain_ck(W, gain, self.l2_lut, TY=dtype, epsilon=epsilon, K=self.K, shared=self.l2_shared, bsize=self.bsize )
+            W, _ = l2_normalize_gain_ck(W, gain, l2_lut, TY=dtype, epsilon=epsilon, K=self.K, shared=self.l2_shared, bsize=self.bsize )
         return W
 
-    def __call__(self, I, W, gate=None, dw_gated=False, dw_dtype=None, name=None, bench=0):
+    def matmul(self, I, W, gate=None, gate_grad=False, dw_gated=False, name=None, bench=0):
+        return self.__call__(I, W, gate=gate, gate_grad=gate_grad, dw_gated=dw_gated, name=name, bench=bench)
+
+    def __call__(self, I, W, gate=None, gate_grad=False, dw_gated=False, name=None, bench=0):
 
         if name is None:
             name = self.name + ("_%06d" % self.count)
         self.count += 1
-
-        if dw_dtype is None:
-            dw_dtype = W.dtype
 
         if gate is None:
             gate = []
@@ -444,10 +467,14 @@ class BlocksparseMatMul(object):
             gate = [gate]
             #assert self.bsize == 8 and self.axis == 0, "blocksparse gating only implemented for block_size 8 on axis 0"
 
+        fprop_lut = get_constant(self.fprop_lut, name="fprop")
+        bprop_lut = get_constant(self.bprop_lut, name="bprop")
+        updat_lut = get_constant(self.updat_lut, name="updat")
+
         O, _ = blocksparse_matmul(
-            I, W, self.fprop_lut, self.bprop_lut, self.updat_lut, gate,
-            dtype_y=I.dtype, dtype_dw=dw_dtype, gated_dw=dw_gated,
-            blocks=self.blocks, bshift=self.bshift, axis=self.axis, C=self.C, K=self.K,
+            I, W, fprop_lut, bprop_lut, updat_lut, gate,
+            gated_dw=bool(dw_gated), gate_grad=bool(gate_grad),
+            blocks=self.blocks, bsize=self.bsize, axis=self.axis, C=self.C, K=self.K,
             segments=self.fprop_segments, segments_dx=self.bprop_segments,
             locks=self.fprop_locks, locks_dx=self.bprop_locks,
             shared=self.fprop_shared, shared_dx=self.bprop_shared, bench=bench, name=name
@@ -459,15 +486,15 @@ class BlocksparseMatMul(object):
 def blocksparse_matmul_grad(op, dy, temp):
 
     blocks    = op.get_attr("blocks")
-    bshift    = op.get_attr("bshift")
+    bsize     = op.get_attr("bsize")
     axis      = op.get_attr("axis")
     C         = op.get_attr("C")
     K         = op.get_attr("K")
     segments  = op.get_attr("segments_dx")
     shared    = op.get_attr("shared_dx")
     locks     = op.get_attr("locks_dx")
-    dtype_dw  = op.get_attr("dtype_dw")
     gated_dw  = op.get_attr("gated_dw")
+    gate_grad = op.get_attr("gate_grad")
     bench     = op.get_attr("bench")
     x         = op.inputs[0]
     w         = op.inputs[1]
@@ -477,14 +504,14 @@ def blocksparse_matmul_grad(op, dy, temp):
     name      = op.name.split('/')[-1]
 
     dx, _ = blocksparse_matmul_dx(
-        dy, w, lut_dx, gate, dtype_dx=dy.dtype, gated_dw=gated_dw,
-        blocks=blocks, bshift=bshift, axis=axis, C=K, K=C, # swap C,K
+        dy, w, lut_dx, gate, gated_dw=gated_dw, gate_grad=gate_grad,
+        blocks=blocks, bsize=bsize, axis=axis, C=K, K=C, # swap C,K
         segments=segments, locks=locks, shared=shared,
         bench=bench, name=name+"_bprop")
 
     dw = blocksparse_matmul_dw(
-        [x], [dy], lut_dw, gate, dtype_dw=dtype_dw, gated_dw=gated_dw,
-        blocks=blocks, bshift=bshift, axis=axis, C=C, K=K,
+        [x], [dy], lut_dw, gate, gated_dw=gated_dw, gate_grad=gate_grad,
+        blocks=blocks, bsize=bsize, axis=axis, C=C, K=K,
         bench=bench, name=name+"_updat")
 
     # print(dx.op.name, dx.op.device)
@@ -492,8 +519,12 @@ def blocksparse_matmul_grad(op, dy, temp):
 
     if len(gate) == 0:
         return (dx, dw, None, None, None)
+    elif gate_grad:
+        dw, dg = blocksparse_matmul_dg(dw, w, gate[0])
     else:
-        return (dx, dw, None, None, None, None)
+        dg = None
+
+    return (dx, dw, None, None, None, dg)
 
 
 @ops.RegisterGradient("L2NormalizeCK")
@@ -522,20 +553,23 @@ def blocksparse_l2_normalize_grad_ck(op, dy, sum_sqr_x):
 
 # Utils for graph re-writing
 
-def group_param_grads(param_grad, group_size=8, cast32=False):
+def block_reduced_full_dw(param_grad, scale=1.0, norm="max", group_size=8):
+
+    # max(abs()) or l2_norm()
+    norm  = 0 if norm.lower() == "max" else 1
+    # host side scalar, if zero will cause compute for this op to be skipped.
+    scale = scalar_constant(scale, dtype=tf.float32)
 
     assert group_size <= 8
 
     # backward walk param grad to find BlocksparseMatmulDW ops
-    # this should only hit BlocksparseMatmulDWs or AddNs or FloatCasts
+    # this should only hit BlocksparseMatmulDWs, BlocksparseMatmulDGs, AddNs or FloatCasts
     ops = get_parents(param_grad, "BlocksparseMatmulDW")
+    if len(ops) < 1:
+        raise ValueError("BlocksparseMatmulDW op not found")
 
     # this sorting is dependent on the op names being correctly ordered.
     ops.sort(key=lambda op: op.name.split('/')[-1], reverse=True)
-    # for x in ops:
-    #     print(x.name)
-    # print("")
-    # exit()
 
     # use the parent scope for the new ops
     scope = ops[-1].name.split('/')
@@ -543,8 +577,8 @@ def group_param_grads(param_grad, group_size=8, cast32=False):
 
     # we're going to be using absolute names, so clear name_scope
     with tf.name_scope(None):
-        offset = 0
-        # graph  = tf.get_default_graph()
+        dw_full = None
+        offset  = 0
         while offset < len(ops):
 
             xs = [op.inputs[0] for op in ops[offset:offset+group_size] ]
@@ -552,69 +586,227 @@ def group_param_grads(param_grad, group_size=8, cast32=False):
 
             # Get the corresponding activation grad op for the last param grad op in the group
             bprop = None
-            for op in gs[-1].consumers():
-                if op.type=="BlocksparseMatmulDX":
-                    bprop = op
+            for consumer in gs[-1].consumers():
+                if consumer.type == "BlocksparseMatmulDX":
+                    bprop = consumer
+                    break
+            assert bprop is not None
+
+            # get attributes of first op in group
+            up    = ops[offset]
+            bsize = up.get_attr("bsize")
+            axis  = up.get_attr("axis")
+            name  = "%s/block_reduced_full_dw_%03d" % (scope, offset)
+            dw_full = [] if dw_full is None else [dw_full]
+
+            dw_full, _, _ = blocksparse_reduced_dw(xs, gs, scale, dw_full, bsize=bsize, norm=norm, axis=axis, name=name)
+
+            # force the dw op before any more time steps are processed
+            bprop._add_control_input(dw_full.op)
+
+            offset += group_size
+
+    return dw_full
+
+
+def group_param_grads(param_grad, group_size=8):
+
+    assert group_size <= 8
+
+    # backward walk param grad to find BlocksparseMatmulDW ops
+    # this should only hit BlocksparseMatmulDWs, BlocksparseMatmulDGs, AddNs or FloatCasts
+    ops = get_parents(param_grad, "BlocksparseMatmulDW")
+
+    if len(ops) <= 1:
+        return param_grad
+
+    # this sorting is dependent on the op names being correctly ordered.
+    ops.sort(key=lambda op: op.name.split('/')[-1], reverse=True)
+    # for x in ops:
+    #     print(x.name)
+    # print("")
+    # exit()
+    segment_size = len(ops)
+    if ops[0].get_attr("gate_grad") and len(ops[0].inputs) == 4:
+        gate_count = dict()
+        max_count  = 0
+        for op in ops:
+            gate  = op.inputs[3]
+            count = gate_count.get(gate, 0) + 1
+            gate_count[gate] = count
+            max_count = max(max_count, count)
+        for count in gate_count.values():
+            if count != max_count:
+                raise ValueError("Non-uniform gate broadcasting detected.")
+        segment_size = max_count
+        if  group_size > segment_size:
+            group_size = segment_size
+        else:
+            assert segment_size % group_size == 0
+        # nothing to rewrite here.
+        if segment_size == 1:
+            return param_grad
+
+    # use the parent scope for the new ops
+    scope = ops[-1].name.split('/')
+    scope = '/'.join(scope[0:-1])
+
+    # we're going to be using absolute names, so clear name_scope
+    with tf.name_scope(None):
+        dw  = None
+        dws = list()
+        offset  = 0
+        seg_cnt = 0
+        while offset < len(ops):
+
+            xs = [op.inputs[0] for op in ops[offset:offset+group_size] ]
+            gs = [op.inputs[1] for op in ops[offset:offset+group_size] ]
+
+            # Get the corresponding activation grad op for the last param grad op in the group
+            bprop = None
+            for consumer in gs[-1].consumers():
+                if consumer.type == "BlocksparseMatmulDX":
+                    bprop = consumer
+                    break
             assert bprop is not None
 
             # get attributes of first op in group
             up = ops[offset]
-            blocks   = up.get_attr("blocks")
-            bshift   = up.get_attr("bshift")
-            axis     = up.get_attr("axis")
-            dtype_dw = up.get_attr("dtype_dw")
-            gated_dw = up.get_attr("gated_dw")
-            C        = up.get_attr("C")
-            K        = up.get_attr("K")
-            bench    = up.get_attr("bench") // len(xs)
-            lut      = up.inputs[2]
-            name     = "%s/matmul_concat_updat_%03d" % (scope, offset)
-            gate     = [up.inputs[3]] if len(op.inputs) > 3 else []
+            blocks    = up.get_attr("blocks")
+            bsize     = up.get_attr("bsize")
+            axis      = up.get_attr("axis")
+            gated_dw  = up.get_attr("gated_dw")
+            gate_grad = up.get_attr("gate_grad")
+            C         = up.get_attr("C")
+            K         = up.get_attr("K")
+            bench     = up.get_attr("bench") // len(xs)
+            lut       = up.inputs[2]
+            name      = "%s/matmul_concat_updat_%03d" % (scope, offset)
+            gate      = [up.inputs[3]] if len(up.inputs) > 3 else []
 
             # The first op needs to allocate a new dw tensor
-            if offset == 0:
-                grad = blocksparse_matmul_dw(
-                    xs, gs, lut, gate, dtype_dw=dtype_dw, gated_dw=gated_dw,
-                    blocks=blocks, bshift=bshift, axis=axis,
+            if dw is None:
+                dw = blocksparse_matmul_dw(
+                    xs, gs, lut, gate, gated_dw=gated_dw,
+                    gate_grad=gate_grad, blocks=blocks, bsize=bsize, axis=axis,
                     C=C, K=K, bench=bench, name=name)
             # subsequent ops can just accumulate in place
             else:
-                grad = blocksparse_matmul_dwa(
-                    xs, gs, lut, grad, gate, gated_dw=gated_dw,
-                    blocks=blocks, bshift=bshift, axis=axis,
+                dw = blocksparse_matmul_dwa(
+                    xs, gs, lut, dw, gate, gated_dw=gated_dw,
+                    gate_grad=gate_grad, blocks=blocks, bsize=bsize, axis=axis,
                     C=C, K=K, bench=bench, name=name)
 
-            # print(grad.op.name, grad.op.device)
-
             # force the dw op before any more time steps are processed
-            add_control_input(bprop, grad.op)
+            bprop._add_control_input(dw.op)
 
-            #print(grad.op.name)
+            seg_cnt += group_size
+            offset  += group_size
 
-            offset += group_size
+            if gate_grad and seg_cnt >= segment_size:
+                seg_cnt = 0
+                dws.append(dw)
+                dw = None
 
-    # get the grad back to float32 if requested
-    # TODO: splice the graph instead of this hack
-    if cast32 and dtype_dw != tf.float32:
-        grad = ew.float_cast(grad, dtype=tf.float32)
+        if gate_grad:
+            for i, dw in enumerate(dws):
+                # for op in ops[i*group_size:(i+1)*group_size]:
+                #     print(op.name)
+                # print()
+                dw_op  = ops[i*segment_size:(i+1)*segment_size][-1]
+                dws[i] = group_dg_grads(dw_op, dw, scope)
 
-    return grad
+            # add up final dw values in groups of 4 for good mix of perforamnce and memory use
+            dw = ew.add_n8_op(dws[0:4]) if len(dws) > 1 else dws[0]
+            for i in range(4, len(dws), 4):
+                dw = ew.add_n8_op(dws[i:i+4] + [dw])
 
-        # for x in ops:
-        #     print(x.name)
-        #     print(scope)
-        #     print(x.device)
-        #     print(x.inputs[3])
-        #     print(x.inputs[4])
-        #     print("")
-        # exit()
+    # splice in these grad op types sitting on top of the param
+    if param_grad.op.type in ("Cast", "FloatCast", "L2NormalizeGradCK", "L2NormalizeGainGradCK"):
+        param_grad.op._update_input(0, dw)
+        dw = param_grad
+    elif param_grad.op.type not in ("AddN", "AddN8", "BlocksparseMatmulDW","BlocksparseMatmulDG"):
+        raise ValueError("Unexpected grad op type:", param_grad.op.type, param_grad.op.name)
+
+    return dw
+
+def group_dg_grads(bsmm_dw_op, dw, scope):
+
+    # splice the dg + addn ops out of the graph and replace with a single dg op
+    # that takes in the final accumulated dw value
+    dg_op  = bsmm_dw_op.outputs[0].consumers()[0]
+    assert dg_op.type == "BlocksparseMatmulDG"
+    dw, dg = blocksparse_matmul_dg(dw, *dg_op.inputs[1:], name=f"{scope}/BlocksparseMatmulDG")
+
+    # splice old add_n op out of graph
+    addn_op  = dg_op.outputs[1].consumers()[0]
+    addn_ops = list()
+    addn_ops.append(addn_op)
+    if addn_op.type[0:3] != "Add":
+        raise ValueError(f"bad type: {addn_ops[0].type} Cause: this segment does not share a broadcasted gate.")
+    elif addn_op.type == "AddN8":
+        while True:
+            addn_op = addn_op.outputs[0].consumers()[0]
+            if addn_op.type == "AddN8":
+                addn_ops.append(addn_op)
+            else:
+                break
+
+    # print(addn_op.name)
+    # for i in addn_op.inputs:
+    #     print(i.name)
+    # print()
+    addn = addn_ops[-1].outputs[0]
+    dg_consumers = addn.consumers()
+    #for op in dg_consumers:
+
+    assert len(dg_consumers) > 0, "raw dg grad not supported"
+    #print(addn.name)
+    for dg_consumer in dg_consumers:
+        found = False
+        #print(dg_consumer.name)
+        for i, t in enumerate(dg_consumer.inputs):
+            #print(i, t.name)
+            if t is addn:
+                #print(f"splicing dg into: {dg_consumer.name} at {i}")
+                dg_consumer._update_input(i, dg)
+                found = True
+                break
+        if not found:
+            print(f"splice failed for {dg_consumer.name}")
+    return dw
+
+
+def get_bsmm_dx_ops(param_grad):
+
+    dw_ops = get_parents(param_grad, "BlocksparseMatmulDW")
+    dx_ops = list()
+
+    # this sorting is dependent on the op names being correctly ordered.
+    dw_ops.sort(key=lambda op: op.name.split('/')[-1], reverse=True)
+    for dw_op in dw_ops:
+        # Get the corresponding activation grad op
+        dx_op = None
+        for op in dw_op.inputs[1].consumers():
+            if op.type=="BlocksparseMatmulDX":
+                dx_op = op
+                break
+        assert dx_op is not None
+        dx_ops.append(dx_op)
+    return dx_ops
 
 def get_parents(grad, op_type):
+    if grad.op.type == op_type:
+        return [grad.op]
     ops  = list()
     wave = set([grad.op])
     while wave:
         new_wave = set()
         for op in wave:
+            # print(op.name)
+            # for i in op.inputs:
+            #     print("   ", i.name)
+            # print()
             for op in (t.op for t in op.inputs):
                 if op.type == op_type:
                     ops.append(op)
@@ -622,13 +814,6 @@ def get_parents(grad, op_type):
                     new_wave.add(op)
         wave = new_wave
     return ops
-
-def add_control_input(op, control_input):
-    op.control_inputs.append(control_input)
-    op._recompute_node_def()
-
-def ceil_div(x, y):
-    return -(-x // y)
 
 def largest_block(dim):
     for blk in (32,16,8):
@@ -687,30 +872,36 @@ class SparseProj(object):
 
         self.name        = name
         self.gather_lut  = gather_lut
+        self.scatter_lut = scatter_lut
         self.nhidden     = nhidden
         self.nproj       = nproj
 
-        with tf.name_scope(name):
-            self.tf_gather  = tf.constant(gather_lut,  name="gather_lut")
-            self.tf_scatter = tf.constant(scatter_lut, name="scatter_lut")
 
     def gather(self, x):
         assert x.get_shape()[0].value == self.nhidden
-        return gather_scatter_op(x, self.tf_gather, self.tf_scatter, C=self.nhidden, K=self.nproj, op=OP_GAT)
+        gather_lut  = get_constant(self.gather_lut,  name="gather")
+        scatter_lut = get_constant(self.scatter_lut, name="scatter")
+        return gather_scatter_op(x, gather_lut, scatter_lut, C=self.nhidden, K=self.nproj, op=OP_GAT)
 
     def scatter(self, x):
         assert x.get_shape()[0].value == self.nproj
-        return gather_scatter_op(x, self.tf_scatter, self.tf_gather, C=self.nproj, K=self.nhidden, op=OP_SCT)
+        gather_lut  = get_constant(self.gather_lut,  name="gather")
+        scatter_lut = get_constant(self.scatter_lut, name="scatter")
+        return gather_scatter_op(x, scatter_lut, gather_lut, C=self.nproj, K=self.nhidden, op=OP_SCT)
 
     def scatter_add(self, x, y):
         assert x.get_shape()[0].value == self.nhidden
         assert y.get_shape()[0].value == self.nproj
-        return scatter_add_mul_op(x, y, self.tf_gather, self.tf_scatter, C=self.nproj, K=self.nhidden, op=OP_ADD)
+        gather_lut  = get_constant(self.gather_lut,  name="gather")
+        scatter_lut = get_constant(self.scatter_lut, name="scatter")
+        return scatter_add_mul_op(x, y, gather_lut, scatter_lut, C=self.nproj, K=self.nhidden, op=OP_ADD)
 
     def scatter_mul(self, x, y):
         assert x.get_shape()[0].value == self.nhidden
         assert y.get_shape()[0].value == self.nproj
-        return scatter_add_mul_op(x, y, self.tf_gather, self.tf_scatter, C=self.nproj, K=self.nhidden, op=OP_MUL)
+        gather_lut  = get_constant(self.gather_lut,  name="gather")
+        scatter_lut = get_constant(self.scatter_lut, name="scatter")
+        return scatter_add_mul_op(x, y, gather_lut, scatter_lut, C=self.nproj, K=self.nhidden, op=OP_MUL)
 
 
 @ops.RegisterGradient("GatherScatter")

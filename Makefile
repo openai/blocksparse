@@ -24,13 +24,13 @@ CUDA_HOME?=/usr/local/cuda
 NV_INC?=$(CUDA_HOME)/include
 NV_LIB?=$(CUDA_HOME)/lib64
 
-NCCL_HOME?=/usr/local/nccl
-NCCL_INC?=$(NCCL_HOME)/include
-NCCL_LIB?=$(NCCL_HOME)/lib
-
-MPI_HOME?=/usr/lib/mpich
-MPI_INC?=$(MPI_HOME)/include
-MPI_LIB?=$(MPI_HOME)/lib
+# NCCL_HOME?=/usr/local/nccl
+# NCCL_INC?=$(NCCL_HOME)/include
+# NCCL_LIB?=$(NCCL_HOME)/lib
+#
+# MPI_HOME?=/usr/lib/mpich
+# MPI_INC?=$(MPI_HOME)/include
+# MPI_LIB?=$(MPI_HOME)/lib
 
 TF_INC=$(shell python -c 'from os.path import dirname; import tensorflow as tf; print(dirname(dirname(tf.sysconfig.get_include())))')
 TF_LIB=$(shell python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')
@@ -42,18 +42,19 @@ CCFLAGS=-std=c++11 -O3 -fPIC -DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) 
 	-I$(TF_INC)/tensorflow/include \
 	-I$(TF_INC)/tensorflow/include/external/nsync/public \
 	-I$(TF_INC)/external/local_config_cuda/cuda \
-	-I$(NCCL_INC) \
-	-I$(MPI_INC) \
 	-I/usr/local
 
+	# -I$(NCCL_INC) \
+	# -I$(MPI_INC) \
+
 NVCCFLAGS=-DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) -O3 -Xcompiler -fPIC -std=c++11 --prec-div=false --prec-sqrt=false \
+ 	-gencode=arch=compute_35,code=sm_35 \
+	-gencode=arch=compute_50,code=sm_50 \
+	-gencode=arch=compute_52,code=sm_52 \
  	-gencode=arch=compute_60,code=sm_60 \
 	-gencode=arch=compute_61,code=sm_61 \
  	-gencode=arch=compute_70,code=sm_70 \
  	-gencode=arch=compute_70,code=compute_70
-#  	-gencode=arch=compute_35,code=sm_35 \
-# 	-gencode=arch=compute_50,code=sm_50 \
-# 	-gencode=arch=compute_52,code=sm_52 \
 #   --keep --keep-dir tmp
 
 OBJS=\
@@ -62,26 +63,30 @@ OBJS=\
 	$(TARGET)/blocksparse_kernels.o \
 	$(TARGET)/blocksparse_l2_norm_op.o \
 	$(TARGET)/blocksparse_matmul_op.o \
+	$(TARGET)/bst_op.o \
 	$(TARGET)/cwise_linear_op.o \
 	$(TARGET)/edge_bias_op.o \
 	$(TARGET)/ew_op.o \
 	$(TARGET)/gpu_types.o \
 	$(TARGET)/layer_norm_op.o \
-	$(TARGET)/nccl_op.o \
 	$(TARGET)/lstm_op.o \
 	$(TARGET)/optimize_op.o \
 	$(TARGET)/quantize_op.o \
 	$(TARGET)/transformer_op.o \
 	$(TARGET)/embedding_op.o \
 	$(TARGET)/matmul_op.o
+	#$(TARGET)/nccl_op.o \
 
 CU_OBJS=\
 	$(TARGET)/batch_norm_op_gpu.cu.o \
 	$(TARGET)/blocksparse_l2_norm_op_gpu.cu.o \
 	$(TARGET)/blocksparse_matmul_op_gpu.cu.o \
-	$(TARGET)/blocksparse_matmul_gated_op_gpu.cu.o \
-	$(TARGET)/blocksparse_hgemm_cn_op_gpu.cu.o \
-	$(TARGET)/blocksparse_transformer_op_gpu.cu.o \
+	$(TARGET)/blocksparse_hgemm_cn_64_op_gpu.cu.o \
+	$(TARGET)/blocksparse_hgemm_cn_128_op_gpu.cu.o \
+	$(TARGET)/blocksparse_hgemm_nc_op_gpu.cu.o \
+	$(TARGET)/bst_hgemm_op_gpu.cu.o \
+	$(TARGET)/bst_sgemm_op_gpu.cu.o \
+	$(TARGET)/bst_softmax_op_gpu.cu.o \
 	$(TARGET)/cwise_linear_op_gpu.cu.o \
 	$(TARGET)/edge_bias_op_gpu.cu.o \
 	$(TARGET)/ew_op_gpu.cu.o \
@@ -99,7 +104,10 @@ $(TARGET)/blocksparse_kernels.h: src/sass/*.sass
 	python generate_kernels.py
 
 blocksparse/blocksparse_ops.so: $(OBJS) $(CU_OBJS)
-	g++ $^ -shared -o $@ -L$(TF_LIB) -L$(NV_LIB) -L$(NCCL_LIB) -L$(MPI_LIB) -ltensorflow_framework -lcudart -lcuda -lnccl -lmpi
+	g++ $^ -shared -o $@ -L$(TF_LIB) -L$(NV_LIB) -ltensorflow_framework -lcudart -lcuda
+
+	# -L$(NCCL_LIB) -L$(MPI_LIB)
+	# -lnccl -lmpi
 
 $(TARGET)/%.cu.o: src/%.cu $(TARGET)/blocksparse_kernels.h
 	mkdir -p $(shell dirname $@)

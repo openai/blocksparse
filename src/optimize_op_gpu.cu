@@ -58,7 +58,7 @@ __global__ void adafactor_row_variance(
 
             __syncthreads();
 
-            if (tid < blockDim.x/32)
+            if (tid < 32)
             {
                 // first warp loads all prior reductions
                 row_var = Share[tid];
@@ -218,7 +218,7 @@ __global__ void adafactor_normalize_2d(
 
             __syncthreads();
 
-            if (tid < blockDim.x/32)
+            if (tid < 32)
             {
                 // first warp loads all prior reductions
                 rms_x = Share[tid];
@@ -365,11 +365,11 @@ template bool Adafactor<ehalf,ehalf4>(CUstream stream, uint SMs, float* cv, floa
 template bool Adafactor<bhalf,bhalf4>(CUstream stream, uint SMs, float* cv, float* rv, float* x, float* means, float* param, const bhalf* grad, const float* norm_scale, float grad_scale, float learning_rate, float decay, float epsilon, float clip, uint C, uint K, float saturate, bool zero_infs, bool zero_nans);
 
 
-template <typename TG, typename TR>
+template <typename TG, typename RM, typename RV>
 __global__ void apply_lazy_emb_adam(
           float*              Param,
-             TR*              Mean,
-             TR*              Var,
+             RM*              Mean,
+             RV*              Var,
     const    TG* __restrict__ Grad,
     const float* __restrict__ Norm,
     float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint K, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
@@ -426,8 +426,8 @@ __global__ void apply_lazy_emb_adam(
 
         if (k < K && gmax > 0.0f)
         {
-            float v = load(add_ptr_u((const    TR*)Var,   offset));
-            float m = load(add_ptr_u((const    TR*)Mean,  offset));
+            float m = load(add_ptr_u((const    RM*)Mean,  offset));
+            float v = load(add_ptr_u((const    RV*)Var,   offset));
             float p = load(add_ptr_u((const float*)Param, offset));
 
             g *= grad_scale * norm_scale;
@@ -450,11 +450,11 @@ __global__ void apply_lazy_emb_adam(
     }
 }
 
-template <typename TG, typename TR>
+template <typename TG, typename RM, typename RV>
 __global__ void apply_adam(
           float*              Param,
-             TR*              Mean,
-             TR*              Var,
+             RM*              Mean,
+             RV*              Var,
     const    TG* __restrict__ Grad,
     const float* __restrict__ Norm,
     float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, float saturate, uint zero_infs, uint zero_nans, uint use_norm)
@@ -470,8 +470,8 @@ __global__ void apply_adam(
         for (uint offset = bid*blockDim.x + tid; offset < size; offset += gridDim.x*blockDim.x)
         {
             float g = load(add_ptr_u(              Grad,  offset));
-            float v = load(add_ptr_u((const    TR*)Var,   offset));
-            float m = load(add_ptr_u((const    TR*)Mean,  offset));
+            float m = load(add_ptr_u((const    RM*)Mean,  offset));
+            float v = load(add_ptr_u((const    RV*)Var,   offset));
             float p = load(add_ptr_u((const float*)Param, offset));
 
             if (zero_infs)
@@ -484,7 +484,7 @@ __global__ void apply_adam(
             g *= grad_scale * norm_scale;
             v  = decay_var * v + (1.0f - decay_var) * g*g;
 
-            float sigma = sqrtf(v);
+            float sigma = ew_sqrt(v);
             if (clip_sigma != 0.0f)
             {
                 float clip = clip_sigma * sigma;
@@ -492,7 +492,7 @@ __global__ void apply_adam(
                 g = fminf(g,  clip);
             }
             m  = decay_mean * m + (1.0f - decay_mean) * g;
-            p -= lr * m / (sigma + epsilon);
+            p -= lr * m * ew_rcp(sigma + epsilon);
 
             store(add_ptr_u(Mean,  offset), m);
             store(add_ptr_u(Var,   offset), v);
@@ -501,8 +501,8 @@ __global__ void apply_adam(
     }
 }
 
-template <typename TG, typename TR>
-bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, const float* norm_scale, float* param, TR* mean, TR* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint  size, uint  lazy_emb, float saturate, bool zero_infs, bool zero_nans)
+template <typename TG, typename TRM, typename TRV>
+bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, const float* norm_scale, float* param, TRM* mean, TRV* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint  size, uint  lazy_emb, float saturate, bool zero_infs, bool zero_nans)
 {
     if (lazy_emb)
     {
@@ -517,7 +517,7 @@ bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, const float* norm_scal
             threads = 256;
             gridK   = CEIL_DIV(K, 256);
         }
-        apply_lazy_emb_adam<TG,TR><<<dim3(C,gridK,1),threads,0,stream>>>(param, mean, var, grad, norm_scale, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, K, saturate, zero_infs, zero_nans, norm_scale != 0);
+        apply_lazy_emb_adam<TG,TRM,TRV><<<dim3(C,gridK,1),threads,0,stream>>>(param, mean, var, grad, norm_scale, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, K, saturate, zero_infs, zero_nans, norm_scale != 0);
     }
     else
     {
@@ -528,20 +528,24 @@ bool ApplyAdam(CUstream stream, uint SMs, const TG* grad, const float* norm_scal
         else if (size > SMs* 128) { threads =  256; }
         else if (size > SMs*  64) { threads =  128; }
 
-        apply_adam<TG,TR><<<grid,threads,0,stream>>>(param, mean, var, grad, norm_scale, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, size, saturate, zero_infs, zero_nans, norm_scale != 0);
+        apply_adam<TG,TRM,TRV><<<grid,threads,0,stream>>>(param, mean, var, grad, norm_scale, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, size, saturate, zero_infs, zero_nans, norm_scale != 0);
     }
     return true;
 }
-template bool ApplyAdam<float,float>(CUstream stream, uint SMs, const float* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
-template bool ApplyAdam<ehalf,float>(CUstream stream, uint SMs, const ehalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
-template bool ApplyAdam<bhalf,float>(CUstream stream, uint SMs, const bhalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<float,float,float>(CUstream stream, uint SMs, const float* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<ehalf,float,float>(CUstream stream, uint SMs, const ehalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<bhalf,float,float>(CUstream stream, uint SMs, const bhalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+
+template bool ApplyAdam<float,mhalf,vhalf>(CUstream stream, uint SMs, const float* grad, const float* norm_scale, float* param, mhalf* mean, vhalf* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<ehalf,mhalf,vhalf>(CUstream stream, uint SMs, const ehalf* grad, const float* norm_scale, float* param, mhalf* mean, vhalf* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdam<bhalf,mhalf,vhalf>(CUstream stream, uint SMs, const bhalf* grad, const float* norm_scale, float* param, mhalf* mean, vhalf* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint size, uint lazy_update, float saturate, bool zero_infs, bool zero_nans);
 
 
-template <typename TG, typename TR, uint BSIZE, uint THREADS>
+template <typename TG, typename RM, typename RV, uint BSIZE, uint THREADS>
 __global__ void __launch_bounds__(THREADS) apply_adam_gated(
           float*              Param,
-             TR*              Mean,
-             TR*              Var,
+             RM*              Mean,
+             RV*              Var,
     const    TG* __restrict__ Grad,
     const float* __restrict__ Norm,
     const float* __restrict__ Gate,
@@ -549,11 +553,101 @@ __global__ void __launch_bounds__(THREADS) apply_adam_gated(
 {
     const uint U = BSIZE*BSIZE/THREADS;
 
-    uint bid = blockIdx.x;
-    uint tid = threadIdx.x;
-
-    if (Gate[bid] != 0.0f)
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
+    if (norm_scale != 0.0f)
     {
+        uint bid = blockIdx.x;
+        uint tid = threadIdx.x;
+
+        if (Gate[bid] != 0.0f)
+        {
+            uint offset = bid*BSIZE*BSIZE + tid;
+
+            Grad  += offset;
+            Mean  += offset;
+            Var   += offset;
+            Param += offset;
+
+            float g[U], m[U], v[U], p[U];
+            for (uint j = 0; j < U; j++) g[j] = load((const    TG*)Grad,  j*THREADS);
+            for (uint j = 0; j < U; j++) m[j] = load((const    RM*)Mean,  j*THREADS);
+            for (uint j = 0; j < U; j++) v[j] = load((const    RV*)Var,   j*THREADS);
+            for (uint j = 0; j < U; j++) p[j] = load((const float*)Param, j*THREADS);
+
+            for (uint j = 0; j < U; j++)
+            {
+                if (zero_infs)
+                    g[j] = ew_zero_inf(g[j]);
+                if (zero_nans)
+                    g[j] = ew_zero_nan(g[j]);
+                if (saturate != 0.0f)
+                    g[j] = ew_maximum(ew_minimum(g[j], saturate), -saturate);
+
+                g[j] *= grad_scale * norm_scale;
+                v[j]  = decay_var  * v[j] + (1.0f - decay_var ) * g[j] * g[j];
+
+                float sig = sqrtf(v[j]);
+                if (clip_sigma != 0.0f)
+                {
+                    float clip = clip_sigma * sig;
+                    g[j] = fmaxf(g[j], -clip);
+                    g[j] = fminf(g[j],  clip);
+                }
+                m[j]  = decay_mean * m[j] + (1.0f - decay_mean) * g[j];
+                p[j] -= lr * m[j] / (sqrtf(v[j]) + epsilon);
+            }
+            for (uint j = 0; j < U; j++) store(Mean,  m[j], j*THREADS);
+            for (uint j = 0; j < U; j++) store(Var,   v[j], j*THREADS);
+            for (uint j = 0; j < U; j++) store(Param, p[j], j*THREADS);
+        }
+    }
+}
+
+template <typename TG, typename TRM, typename TRV>
+bool ApplyAdamGated(CUstream stream, const float* gate, const TG* grad, const float* norm_scale, float* param, TRM* mean, TRV* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint  blocks, uint  bsize, float saturate, bool zero_infs, bool zero_nans)
+{
+    if (bsize == 8)
+        apply_adam_gated<TG,TRM,TRV, 8,  32><<<blocks,  32,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
+    else if (bsize == 16)
+        apply_adam_gated<TG,TRM,TRV,16,  64><<<blocks,  64,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
+    else if (bsize == 32)
+        apply_adam_gated<TG,TRM,TRV,32, 256><<<blocks, 256,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
+    else if (bsize == 64)
+        apply_adam_gated<TG,TRM,TRV,64,1024><<<blocks,1024,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
+    return true;
+}
+
+template bool ApplyAdamGated<float,float,float>(CUstream stream, const float* gate, const float* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdamGated<ehalf,float,float>(CUstream stream, const float* gate, const ehalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdamGated<bhalf,float,float>(CUstream stream, const float* gate, const bhalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+
+template bool ApplyAdamGated<float,mhalf,vhalf>(CUstream stream, const float* gate, const float* grad, const float* norm_scale, float* param, mhalf* mean, vhalf* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdamGated<ehalf,mhalf,vhalf>(CUstream stream, const float* gate, const ehalf* grad, const float* norm_scale, float* param, mhalf* mean, vhalf* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+template bool ApplyAdamGated<bhalf,mhalf,vhalf>(CUstream stream, const float* gate, const bhalf* grad, const float* norm_scale, float* param, mhalf* mean, vhalf* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
+
+template <typename TG, typename RM, typename RV, uint BSIZE, uint THREADS>
+__global__ void __launch_bounds__(THREADS) apply_blocksparse_adam(
+          float*              Param,
+             RM*              Mean,
+             RV*              Var,
+    const    TG* __restrict__ Grad,
+    const float* __restrict__ Select,
+    const float* __restrict__ Norm,
+    float lr_old, float lr_new, float decay_mean, float decay_var, float epsilon, float grad_scale, float saturate, uint zero_infs, uint zero_nans, uint use_select, uint use_norm)
+{
+    const uint U = BSIZE*BSIZE/THREADS;
+
+    float norm_scale = use_norm ? __ldg(Norm) : 1.0f;
+    if (norm_scale != 0.0f)
+    {
+        grad_scale *= norm_scale;
+
+        uint bid = blockIdx.x;
+        uint tid = threadIdx.x;
+
+        float select = use_select ? __ldg(Select + bid) : 0.0f;
+        float lr = select == 0.0f ? lr_old : lr_new;
+
         uint offset = bid*BSIZE*BSIZE + tid;
 
         Grad  += offset;
@@ -563,8 +657,8 @@ __global__ void __launch_bounds__(THREADS) apply_adam_gated(
 
         float g[U], m[U], v[U], p[U];
         for (uint j = 0; j < U; j++) g[j] = load((const    TG*)Grad,  j*THREADS);
-        for (uint j = 0; j < U; j++) m[j] = load((const    TR*)Mean,  j*THREADS);
-        for (uint j = 0; j < U; j++) v[j] = load((const    TR*)Var,   j*THREADS);
+        for (uint j = 0; j < U; j++) m[j] = load((const    RM*)Mean,  j*THREADS);
+        for (uint j = 0; j < U; j++) v[j] = load((const    RV*)Var,   j*THREADS);
         for (uint j = 0; j < U; j++) p[j] = load((const float*)Param, j*THREADS);
 
         for (uint j = 0; j < U; j++)
@@ -578,47 +672,43 @@ __global__ void __launch_bounds__(THREADS) apply_adam_gated(
 
             g[j] *= grad_scale;
             v[j]  = decay_var  * v[j] + (1.0f - decay_var ) * g[j] * g[j];
-
-            float sig = sqrtf(v[j]);
-            if (clip_sigma != 0.0f)
-            {
-                float clip = clip_sigma * sig;
-                g[j] = fmaxf(g[j], -clip);
-                g[j] = fminf(g[j],  clip);
-            }
             m[j]  = decay_mean * m[j] + (1.0f - decay_mean) * g[j];
-            p[j] -= lr * m[j] / (sqrtf(v[j]) + epsilon);
+            p[j] -= lr * m[j]  * ew_rcp((ew_sqrt(v[j]) + epsilon));
         }
-
         for (uint j = 0; j < U; j++) store(Mean,  m[j], j*THREADS);
         for (uint j = 0; j < U; j++) store(Var,   v[j], j*THREADS);
         for (uint j = 0; j < U; j++) store(Param, p[j], j*THREADS);
     }
 }
 
-template <typename TG, typename TR>
-bool ApplyAdamGated(CUstream stream, const float* gate, const TG* grad, const float* norm_scale, float* param, TR* mean, TR* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint  blocks, uint  bsize, float saturate, bool zero_infs, bool zero_nans)
+template <typename TG, typename TRM, typename TRV> bool BlocksparseAdam(CUstream stream,
+  float* param, TRM* mean, TRV* var,
+  const TG* grad,
+  const float* lr_select,
+  const float* norm_scale,
+  float lr_old, float lr_new,
+  float decay_mean, float decay_var, float epsilon,
+  float grad_scale, float saturate, bool zero_infs, bool zero_nans,
+  uint blocks, uint bsize)
 {
     if (bsize == 8)
-        apply_adam_gated<TG,TR, 8, 32><<<blocks, 32,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
+        apply_blocksparse_adam<TG,TRM,TRV, 8,  32><<<blocks,  32,0,stream>>>(param, mean, var, grad, lr_select, norm_scale, lr_old, lr_new, decay_mean, decay_var, epsilon, grad_scale, saturate, zero_infs, zero_nans, lr_select != 0, norm_scale != 0);
     else if (bsize == 16)
-        apply_adam_gated<TG,TR,16, 64><<<blocks, 64,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
-    else
-        apply_adam_gated<TG,TR,32,256><<<blocks,256,0,stream>>>(param, mean, var, grad, norm_scale, gate, lr, decay_mean, decay_var, epsilon, grad_scale, clip_sigma, saturate, zero_infs, zero_nans, norm_scale != 0);
+        apply_blocksparse_adam<TG,TRM,TRV,16,  64><<<blocks,  64,0,stream>>>(param, mean, var, grad, lr_select, norm_scale, lr_old, lr_new, decay_mean, decay_var, epsilon, grad_scale, saturate, zero_infs, zero_nans, lr_select != 0, norm_scale != 0);
+    else if (bsize == 32)
+        apply_blocksparse_adam<TG,TRM,TRV,32, 256><<<blocks, 256,0,stream>>>(param, mean, var, grad, lr_select, norm_scale, lr_old, lr_new, decay_mean, decay_var, epsilon, grad_scale, saturate, zero_infs, zero_nans, lr_select != 0, norm_scale != 0);
+    else if (bsize == 64)
+        apply_blocksparse_adam<TG,TRM,TRV,64,1024><<<blocks,1024,0,stream>>>(param, mean, var, grad, lr_select, norm_scale, lr_old, lr_new, decay_mean, decay_var, epsilon, grad_scale, saturate, zero_infs, zero_nans, lr_select != 0, norm_scale != 0);
     return true;
 }
-
-template bool ApplyAdamGated<float,float>(CUstream stream, const float* gate, const float* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
-template bool ApplyAdamGated<ehalf,float>(CUstream stream, const float* gate, const ehalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
-template bool ApplyAdamGated<bhalf,float>(CUstream stream, const float* gate, const bhalf* grad, const float* norm_scale, float* param, float* mean, float* var, float lr, float decay_mean, float decay_var, float epsilon, float grad_scale, float clip_sigma, uint blocks, uint bsize, float saturate, bool zero_infs, bool zero_nans);
-
+template bool BlocksparseAdam<float,float,float>(CUstream stream, float* param, float* mean, float* var, const float* grad, const float* lr_select, const float* norm_scale, float lr_old, float lr_new, float decay_mean, float decay_var, float epsilon, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint blocks, uint bsize);
+template bool BlocksparseAdam<ehalf,float,float>(CUstream stream, float* param, float* mean, float* var, const ehalf* grad, const float* lr_select, const float* norm_scale, float lr_old, float lr_new, float decay_mean, float decay_var, float epsilon, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint blocks, uint bsize);
+template bool BlocksparseAdam<float,mhalf,vhalf>(CUstream stream, float* param, mhalf* mean, vhalf* var, const float* grad, const float* lr_select, const float* norm_scale, float lr_old, float lr_new, float decay_mean, float decay_var, float epsilon, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint blocks, uint bsize);
+template bool BlocksparseAdam<ehalf,mhalf,vhalf>(CUstream stream, float* param, mhalf* mean, vhalf* var, const ehalf* grad, const float* lr_select, const float* norm_scale, float lr_old, float lr_new, float decay_mean, float decay_var, float epsilon, float grad_scale, float saturate, bool zero_infs, bool zero_nans, uint blocks, uint bsize);
 
 
 template <typename T, uint U>
-__global__ void __launch_bounds__(32) apply_ema(
-          T*              Ema,
-    const T* __restrict__ Param,
-    float decay, uint size)
+__global__ void __launch_bounds__(32) apply_ema(T* Ema, const float* __restrict__ Param, float decay, uint size)
 {
     uint tid = threadIdx.x;
     uint bid = blockIdx.x;
@@ -637,31 +727,30 @@ __global__ void __launch_bounds__(32) apply_ema(
     for (uint j = 0; j < U; j++) e[j] -= (1.0f - decay) * (e[j] - p[j]);
     for (uint j = 0; j < U; j++) store(Ema, e[j], j*32, pred[j]);
 }
-
 template <typename T>
-bool ApplyEma(CUstream stream, T* ema, const T* param, float decay, uint size)
+bool ApplyEma(CUstream stream, T* ema, const float* param, float decay, uint size)
 {
-    uint grid = (size >> 7) + ((size & 127) != 0); // 1 warp with 4 unrolls
+    uint grid = CEIL_DIV(size, 128); // 1 warp with 4 unrolls
     if (grid > 200)
     {
         apply_ema<T,4><<<grid,32,0,stream>>>(ema, param, decay, size);
     }
     else
     {
-        grid  = (size >> 5) + ((size &  31) != 0); // 1 warp with 1 unroll
+        grid = CEIL_DIV(size, 32); // 1 warp with 1 unroll
         apply_ema<T,1><<<grid,32,0,stream>>>(ema, param, decay, size);
     }
     return true;
 }
-
 template bool ApplyEma<float>(CUstream stream, float* ema, const float* param, float decay, uint size);
+template bool ApplyEma<ehalf>(CUstream stream, ehalf* ema, const float* param, float decay, uint size);
 
 
 
 template <typename T, uint BSIZE, uint THREADS>
 __global__ void __launch_bounds__(THREADS) apply_ema_gated(
               T*              Ema,
-    const     T* __restrict__ Param,
+    const float* __restrict__ Param,
     const float* __restrict__ Gate,
     float decay)
 {
@@ -684,20 +773,22 @@ __global__ void __launch_bounds__(THREADS) apply_ema_gated(
         for (uint j = 0; j < U; j++) store(Ema, e[j],  j*THREADS);
     }
 }
-
 template <typename T>
-bool ApplyEmaGated(CUstream stream, T* ema, const T* param, const float* gate, float decay, uint blocks, uint bsize)
+bool ApplyEmaGated(CUstream stream, T* ema, const float* param, const float* gate, float decay, uint blocks, uint bsize)
 {
     if (bsize == 8)
-        apply_ema_gated<T, 8, 32><<<blocks, 32,0,stream>>>(ema, param, gate, decay);
+        apply_ema_gated<T, 8,  32><<<blocks,  32,0,stream>>>(ema, param, gate, decay);
     else if (bsize == 16)
-        apply_ema_gated<T,16, 64><<<blocks, 64,0,stream>>>(ema, param, gate, decay);
-    else
-        apply_ema_gated<T,32,256><<<blocks,256,0,stream>>>(ema, param, gate, decay);
+        apply_ema_gated<T,16,  64><<<blocks,  64,0,stream>>>(ema, param, gate, decay);
+    else if (bsize == 32)
+        apply_ema_gated<T,32, 256><<<blocks, 256,0,stream>>>(ema, param, gate, decay);
+    else if (bsize == 64)
+        apply_ema_gated<T,64,1024><<<blocks,1024,0,stream>>>(ema, param, gate, decay);
     return true;
 }
-
 template bool ApplyEmaGated<float>(CUstream stream, float* ema, const float* param, const float* gate, float decay, uint blocks, uint bsize);
+template bool ApplyEmaGated<ehalf>(CUstream stream, ehalf* ema, const float* param, const float* gate, float decay, uint blocks, uint bsize);
+
 
 template <typename T, uint BSIZE, uint THREADS, uint GATED>
 __global__ void __launch_bounds__(THREADS) blocksparse_l2_decay(T* Param, const float* __restrict__ Gate, float rate, float epsilon)
@@ -729,15 +820,15 @@ __global__ void __launch_bounds__(THREADS) blocksparse_l2_decay(T* Param, const 
         // if using more than 1 warp, further reduced with shared memory
         if (THREADS > 32)
         {
-            __shared__ float Share[THREADS/32];
+            __shared__ float Share[32];
 
             // first thread of each warp store to shared
             if ((tid & 31) == 0)
-                Share[tid >> 5] = sum_sqared;
+                Share[tid / 32] = sum_sqared;
 
             __syncthreads();
 
-            if (tid < THREADS/32)
+            if (tid < 32)
             {
                 // first warp loads all prior reductions
                 sum_sqared = Share[tid];
@@ -769,29 +860,150 @@ bool BlocksparseL2Decay(CUstream stream, T* param, const float* gate, float rate
     if (gate != NULL)
     {
         if (bsize == 8)
-            blocksparse_l2_decay<T, 8, 32,1><<<blocks, 32,0,stream>>>(param, gate, rate, epsilon);
+            blocksparse_l2_decay<T, 8,  32,1><<<blocks,  32,0,stream>>>(param, gate, rate, epsilon);
         else if (bsize == 16)
-            blocksparse_l2_decay<T,16, 64,1><<<blocks, 64,0,stream>>>(param, gate, rate, epsilon);
-        else
-            blocksparse_l2_decay<T,32,256,1><<<blocks,256,0,stream>>>(param, gate, rate, epsilon);
+            blocksparse_l2_decay<T,16,  64,1><<<blocks,  64,0,stream>>>(param, gate, rate, epsilon);
+        else if (bsize == 32)
+            blocksparse_l2_decay<T,32, 256,1><<<blocks, 256,0,stream>>>(param, gate, rate, epsilon);
+        else if (bsize == 64)
+            blocksparse_l2_decay<T,64,1024,1><<<blocks,1024,0,stream>>>(param, gate, rate, epsilon);
     }
     else
     {
         if (bsize == 8)
-            blocksparse_l2_decay<T, 8, 32,0><<<blocks, 32,0,stream>>>(param, gate, rate, epsilon);
+            blocksparse_l2_decay<T, 8,  32,0><<<blocks,  32,0,stream>>>(param, gate, rate, epsilon);
         else if (bsize == 16)
-            blocksparse_l2_decay<T,16, 64,0><<<blocks, 64,0,stream>>>(param, gate, rate, epsilon);
-        else
-            blocksparse_l2_decay<T,32,256,0><<<blocks,256,0,stream>>>(param, gate, rate, epsilon);
+            blocksparse_l2_decay<T,16,  64,0><<<blocks,  64,0,stream>>>(param, gate, rate, epsilon);
+        else if (bsize == 32)
+            blocksparse_l2_decay<T,32, 256,0><<<blocks, 256,0,stream>>>(param, gate, rate, epsilon);
+        else if (bsize == 64)
+            blocksparse_l2_decay<T,64,1024,0><<<blocks,1024,0,stream>>>(param, gate, rate, epsilon);
     }
-
     return true;
 }
 template bool BlocksparseL2Decay<float>(CUstream stream, float* param, const float* gate, float rate, float epsilon, uint blocks, uint bsize);
 
 
-template <typename T, uint BSIZE, uint THREADS>
-__global__ void __launch_bounds__(THREADS) blocksparse_maxnorm_prune(const T* __restrict__ Param, float* Gate, float threshold)
+#define MAX_NORM 0
+#define L2_NORM  1
+
+template <typename T, uint BSIZE, uint THREADS, uint NORM>
+__global__ void __launch_bounds__(THREADS) blocksparse_norm(float* Norm, const T* __restrict__ Param)
+{
+    const uint U = BSIZE*BSIZE/THREADS;
+
+    uint bid = blockIdx.x;
+    uint tid = threadIdx.x;
+    uint offset = bid*BSIZE*BSIZE + tid;
+
+    Param += offset;
+
+    float p[U];
+    for (uint j = 0; j < U; j++)
+            p[j] = load(Param, j*THREADS);
+
+    // Reduce max within this thread
+    float norm = 0.0f;
+    for (uint j = 0; j < U; j++)
+        if (NORM == MAX_NORM)
+            norm  = fmaxf(fabsf(p[j]), norm);
+        else
+            norm += ew_sqr(p[j]);
+
+    // reduce within warp
+    for (int i = 16; i > 0; i >>= 1)
+        if (NORM == MAX_NORM)
+            norm  = fmaxf(norm, shfl_xor(norm, i));
+        else
+            norm += shfl_xor(norm, i);
+
+    // if using more than 1 warp, further reduced with shared memory
+    if (THREADS > 32)
+    {
+        __shared__ float Share[32];
+
+        // first thread of each warp store to shared
+        if ((tid & 31) == 0)
+            Share[tid / 32] = norm;
+
+        __syncthreads();
+
+        if (tid < 32)
+        {
+            // first warp loads all prior reductions
+            norm = Share[tid];
+
+            // reduce within this first warp
+            for (int i = THREADS/64; i > 0; i >>= 1)
+                if (NORM == MAX_NORM)
+                    norm  = fmaxf(norm, shfl_xor(norm, i));
+                else
+                    norm += shfl_xor(norm, i);
+        }
+    }
+    // first thread has the final reduced max_abs
+    if (tid == 0)
+    {
+        if (NORM == L2_NORM)
+            norm = ew_sqrt(norm);
+        Norm[bid] = norm;
+    }
+}
+
+template <typename T>
+bool BlocksparseNorm(CUstream stream, float* norm, const T* param, uint blocks, uint bsize, uint norm_type)
+{
+    if (norm_type == MAX_NORM)
+    {
+        if (bsize == 8)
+            blocksparse_norm<T, 8,  32,MAX_NORM><<<blocks,  32,0,stream>>>(norm, param);
+        else if (bsize == 16)
+            blocksparse_norm<T,16,  64,MAX_NORM><<<blocks,  64,0,stream>>>(norm, param);
+        else if (bsize == 32)
+            blocksparse_norm<T,32, 256,MAX_NORM><<<blocks, 256,0,stream>>>(norm, param);
+        else if (bsize == 64)
+            blocksparse_norm<T,64,1024,MAX_NORM><<<blocks,1024,0,stream>>>(norm, param);
+    }
+    else
+    {
+        if (bsize == 8)
+            blocksparse_norm<T, 8,  32, L2_NORM><<<blocks,  32,0,stream>>>(norm, param);
+        else if (bsize == 16)
+            blocksparse_norm<T,16,  64, L2_NORM><<<blocks,  64,0,stream>>>(norm, param);
+        else if (bsize == 32)
+            blocksparse_norm<T,32, 256, L2_NORM><<<blocks, 256,0,stream>>>(norm, param);
+        else if (bsize == 64)
+            blocksparse_norm<T,64,1024, L2_NORM><<<blocks,1024,0,stream>>>(norm, param);
+    }
+    return true;
+}
+template bool BlocksparseNorm<float>(CUstream stream, float* norm, const float* param, uint blocks, uint bsize, uint norm_type);
+template bool BlocksparseNorm<ehalf>(CUstream stream, float* norm, const ehalf* param, uint blocks, uint bsize, uint norm_type);
+template bool BlocksparseNorm<bhalf>(CUstream stream, float* norm, const bhalf* param, uint blocks, uint bsize, uint norm_type);
+
+
+__global__ void __launch_bounds__(256) blocksparse_prune(float* Gate, const uint* __restrict__ Idx, uint blocks, uint keep)
+{
+    uint tid = threadIdx.x;
+    uint bid = blockIdx.x;
+
+    #pragma unroll 1
+    for (uint i = bid*256 + tid; i < blocks; i += gridDim.x*256)
+    {
+        Gate[Idx[i]] = i < keep ? 1.0f : 0.0f;
+    }
+}
+bool BlocksparsePrune(CUstream stream, uint SMs, float* gate, const uint* idx, uint blocks, uint keep)
+{
+    uint grid = blocks > SMs*512 ? SMs*4 : blocks > SMs*256 ? SMs*2 : SMs;
+    blocksparse_prune<<<grid,256,0,stream>>>(gate, idx, blocks, keep);
+    return true;
+}
+
+
+
+template <typename T, uint BSIZE, uint THREADS, uint NORM>
+__global__ void __launch_bounds__(THREADS) blocksparse_threshold_prune(const T* __restrict__ Param, float* Gate, float threshold)
 {
     const uint U = BSIZE*BSIZE/THREADS;
 
@@ -806,33 +1018,42 @@ __global__ void __launch_bounds__(THREADS) blocksparse_maxnorm_prune(const T* __
         p[j] = load(Param, j*THREADS);
 
     // Reduce max within this thread
-    float max_abs = 0.0f;
+    float norm = 0.0f;
     for (uint j = 0; j < U; j++)
-        max_abs = fmaxf(fabsf(p[j]), max_abs);
+        if (NORM == MAX_NORM)
+            norm  = fmaxf(fabsf(p[j]), norm);
+        else
+            norm += ew_sqr(p[j]);
 
     // reduce within warp
     for (int i = 16; i > 0; i >>= 1)
-        max_abs = fmaxf(max_abs, shfl_xor(max_abs, i));
+        if (NORM == MAX_NORM)
+            norm  = fmaxf(norm, shfl_xor(norm, i));
+        else
+            norm += shfl_xor(norm, i);
 
     // if using more than 1 warp, further reduced with shared memory
     if (THREADS > 32)
     {
-        __shared__ float Share[THREADS/32];
+        __shared__ float Share[32];
 
         // first thread of each warp store to shared
         if ((tid & 31) == 0)
-            Share[tid >> 5] = max_abs;
+            Share[tid/32] = norm;
 
         __syncthreads();
 
-        if (tid < THREADS/32)
+        if (tid < 32)
         {
             // first warp loads all prior reductions
-            max_abs = Share[tid];
+            norm = Share[tid];
 
             // reduce within this first warp
             for (int i = THREADS/64; i > 0; i >>= 1)
-                max_abs = fmaxf(max_abs, shfl_xor(max_abs, i));
+                if (NORM == MAX_NORM)
+                    norm  = fmaxf(norm, shfl_xor(norm, i));
+                else
+                    norm += shfl_xor(norm, i);
         }
     }
     // first thread has the final reduced max_abs
@@ -840,21 +1061,41 @@ __global__ void __launch_bounds__(THREADS) blocksparse_maxnorm_prune(const T* __
     // if (bid < 2 && tid == 0)
     //     printf("%d %d %.5f %.5f\n", bid, gridDim.x, max_abs, threshold);
     if (tid == 0)
-        Gate[bid] = max_abs < threshold ? 0.0f : 1.0f;
+    {
+        if (NORM == L2_NORM)
+            norm = ew_sqrt(norm);
+        Gate[bid] = norm < threshold ? 0.0f : 1.0f;
+    }
 }
 
 template <typename T>
-bool BlocksparseMaxnormPrune(CUstream stream, const T* param, float* gate, float threshold, uint blocks, uint bsize)
+bool BlocksparseThresholdPrune(CUstream stream, const T* param, float* gate, float threshold, uint blocks, uint bsize, uint norm_type)
 {
-    if (bsize == 8)
-        blocksparse_maxnorm_prune<T, 8, 32><<<blocks, 32,0,stream>>>(param, gate, threshold);
-    else if (bsize == 16)
-        blocksparse_maxnorm_prune<T,16, 64><<<blocks, 64,0,stream>>>(param, gate, threshold);
+    if (norm_type == MAX_NORM)
+    {
+        if (bsize == 8)
+            blocksparse_threshold_prune<T, 8,  32,MAX_NORM><<<blocks,  32,0,stream>>>(param, gate, threshold);
+        else if (bsize == 16)
+            blocksparse_threshold_prune<T,16,  64,MAX_NORM><<<blocks,  64,0,stream>>>(param, gate, threshold);
+        else if (bsize == 32)
+            blocksparse_threshold_prune<T,32, 256,MAX_NORM><<<blocks, 256,0,stream>>>(param, gate, threshold);
+        else if (bsize == 64)
+            blocksparse_threshold_prune<T,64,1024,MAX_NORM><<<blocks,1024,0,stream>>>(param, gate, threshold);
+    }
     else
-        blocksparse_maxnorm_prune<T,32,256><<<blocks,256,0,stream>>>(param, gate, threshold);
+    {
+        if (bsize == 8)
+            blocksparse_threshold_prune<T, 8,  32, L2_NORM><<<blocks,  32,0,stream>>>(param, gate, threshold);
+        else if (bsize == 16)
+            blocksparse_threshold_prune<T,16,  64, L2_NORM><<<blocks,  64,0,stream>>>(param, gate, threshold);
+        else if (bsize == 32)
+            blocksparse_threshold_prune<T,32, 256, L2_NORM><<<blocks, 256,0,stream>>>(param, gate, threshold);
+        else if (bsize == 64)
+            blocksparse_threshold_prune<T,64,1024, L2_NORM><<<blocks,1024,0,stream>>>(param, gate, threshold);
+    }
     return true;
 }
-template bool BlocksparseMaxnormPrune<float>(CUstream stream, const float* param, float* gate, float threshold, uint blocks, uint bsize);
+template bool BlocksparseThresholdPrune<float>(CUstream stream, const float* param, float* gate, float threshold, uint blocks, uint bsize, uint norm_type);
 
 
 

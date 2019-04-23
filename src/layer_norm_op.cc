@@ -42,6 +42,7 @@ REGISTER_OP("LayerNorm")
       int axis; TF_RETURN_IF_ERROR(ctx->GetAttr("axis", &axis));
 
       ShapeHandle x = ctx->input(0);
+
       int rank = ctx->Rank(x);
       if (rank > 0)
       {
@@ -56,6 +57,14 @@ REGISTER_OP("LayerNorm")
         ctx->set_output(1, n);
         ctx->set_output(2, n);
       }
+      else
+      {
+        ctx->set_output(0, ctx->UnknownShape());
+        ctx->set_output(1, ctx->UnknownShape());
+        ctx->set_output(2, ctx->UnknownShape());
+      }
+      ctx->set_output(3, ctx->UnknownShape());
+      ctx->set_output(4, ctx->UnknownShape());
       return Status::OK();
     })
     .Doc(R"doc(
@@ -189,6 +198,8 @@ REGISTER_OP("LayerNormGrad")
       ctx->set_output(0, ctx->input(1));
       ctx->set_output(1, ctx->input(2));
       ctx->set_output(2, ctx->input(3));
+      ctx->set_output(3, ctx->UnknownShape());
+      ctx->set_output(4, ctx->UnknownShape());
       return Status::OK();
     })
     .Doc(R"doc(

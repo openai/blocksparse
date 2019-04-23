@@ -116,7 +116,7 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
     const float* __restrict__ B,
     int CDHW, int NDHW, int DHW, int magic_DHW, int shift_DHW, float rcpNDHW, float epsilon)
 {
-    __shared__ float Share[THREADS>>5];
+    __shared__ float Share[32];
 
     const int tid = threadIdx.x;
     const int c   = blockIdx.x;
@@ -145,13 +145,13 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
     if ((tid & 31) == 0)
         Share[tid >> 5] = mean;
     __syncthreads();
-    if (tid < (THREADS>>5))
+    if (tid < 32)
     {
         // first warp loads all prior reductions
         mean = Share[tid];
         // reduce within this last warp
         #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
+        for (int i = THREADS/64; i > 0; i >>= 1)
             mean += shfl_xor(mean, i);
         // outputs final reduction to shared
         Share[tid] = mean * rcpNDHW;
@@ -180,13 +180,13 @@ __global__ void __launch_bounds__(THREADS) batchnorm_forward_ncdhw(
     if ((tid & 31) == 0)
         Share[tid >> 5] = var;
     __syncthreads();
-    if (tid < (THREADS>>5))
+    if (tid < 32)
     {
         // first warp loads all prior reductions
         var = Share[tid];
         // reduce within this last warp
         #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
+        for (int i = THREADS/64; i > 0; i >>= 1)
             var += shfl_xor(var, i);
 
         // outputs final reduction to shared
@@ -277,8 +277,8 @@ __global__ void __launch_bounds__(THREADS) batchnorm_backward_ncdhw(
     const float* __restrict__ V,
     int CDHW, int NDHW, int DHW, int magic_DHW, int shift_DHW, float rcpNDHW, float epsilon)
 {
-    __shared__ float Share1[THREADS>>5];
-    __shared__ float Share2[THREADS>>5];
+    __shared__ float Share1[32];
+    __shared__ float Share2[32];
 
     const int tid = threadIdx.x;
     const int c   = blockIdx.x;
@@ -320,14 +320,14 @@ __global__ void __launch_bounds__(THREADS) batchnorm_backward_ncdhw(
         Share2[tid >> 5] = db;
     }
     __syncthreads();
-    if (tid < (THREADS>>5))
+    if (tid < 32)
     {
         // first warp loads all prior reductions
         dg = Share1[tid];
         db = Share2[tid];
         // reduce within this last warp
         #pragma unroll
-        for (int i = (THREADS>>6); i > 0; i >>= 1)
+        for (int i = THREADS/64; i > 0; i >>= 1)
         {
             dg += shfl_xor(dg, i);
             db += shfl_xor(db, i);

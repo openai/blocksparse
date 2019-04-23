@@ -4,17 +4,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import sys
-import os.path
 import numpy as np
 import tensorflow as tf
-from operator import mul, lt
+from operator import lt
 from tensorflow.python.framework import ops
-if sys.version_info >= (3, 0):
-    from functools import reduce
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
+from blocksparse.utils import _op_module, reduce_mul, ceil_div, z_order_3d, magic32u, magic64u
 
 blocksparse_conv_op     = _op_module.blocksparse_conv
 blocksparse_deconv_op   = _op_module.blocksparse_deconv
@@ -269,9 +264,9 @@ class BlocksparseConv(object):
         else:
             MPQ = expand_dims(MPQ)
 
-        trs = reduce(mul, TRS, 1)
-        dhw = reduce(mul, DHW, 1)
-        mpq = reduce(mul, MPQ, 1)
+        trs = reduce_mul(TRS)
+        dhw = reduce_mul(DHW)
+        mpq = reduce_mul(MPQ)
 
         # contruct feature portion of the grid data loaded to each cuda block
         cMax = kMax = sizeF = 0
@@ -359,7 +354,7 @@ class BlocksparseConv(object):
         # merge the spatial and feature outer product grid info
         fpropGrid = list()
         for dim_K, block_C, block_K, offset_CK, offset_F in fpropGridF:
-            for order, idx_MPQ, idx_K in sorted([ (morton(0,o,k), o,k) for o,k in np.ndindex(dim_O, dim_K) ]):
+            for order, idx_MPQ, idx_K in sorted([ (z_order_3d(0,o,k), o,k) for o,k in np.ndindex(dim_O, dim_K) ]):
                 # idx_K/idx_MPQ, block_K/block_C, offset_CK, offset_F
                 fpropGrid.append( [
                     idx_MPQ + (idx_K   << 16),
@@ -368,7 +363,7 @@ class BlocksparseConv(object):
 
         bpropGrid = list()
         for dim_C, block_C, block_K, offset_CK, offset_F in bpropGridF:
-            for order, idx_DHW, idx_C in sorted([ (morton(0,i,c), i,c) for i,c in np.ndindex(dim_I, dim_C) ]):
+            for order, idx_DHW, idx_C in sorted([ (z_order_3d(0,i,c), i,c) for i,c in np.ndindex(dim_I, dim_C) ]):
                 # idx_C/idx_DHW, block_K/block_C, offset_CK, offset_F
                 bpropGrid.append( [
                     idx_DHW + (idx_C   << 16),
@@ -377,7 +372,7 @@ class BlocksparseConv(object):
 
         updatGrid = list()
         for dim_CTRS, dim_K, block_C, block_K, offset_CK, offset_F in updatGridF:
-            for order, idx_MPQ, idx_K, idx_CTRS in sorted([ (morton(o,k,c), o,k,c) for o,k,c in np.ndindex(dim_O, dim_K, dim_CTRS) ]):
+            for order, idx_MPQ, idx_K, idx_CTRS in sorted([ (z_order_3d(o,k,c), o,k,c) for o,k,c in np.ndindex(dim_O, dim_K, dim_CTRS) ]):
                 # idx_MPQ, idx_CTRS/idx_K, block_C, block_K, offset_CK, offset_F
                 updatGrid.append( [
                     idx_MPQ, idx_CTRS + (idx_K << 16),
@@ -439,7 +434,7 @@ class BlocksparseConv(object):
         ulilization = list()
                   # xxxxx    yxxxx    yyxxx   zyyxx
         for sb in ((1,1,32),(1,2,16),(1,4,8),(2,4,4)):
-            util = float(mpq) / reduce(mul, [ ceil_div(*dims) for dims in zip(MPQ, sb) ], 32)
+            util = float(mpq) / reduce_mul( [ ceil_div(*dims) for dims in zip(MPQ, sb) ], 32)
             ulilization.append((1.0 - util, 32 - sb[2], sb))
         sb = sorted(ulilization)[0][2]
 
@@ -460,7 +455,7 @@ class BlocksparseConv(object):
         mpq_lut = list()
 
         # Iterate over superblocks to build the lut
-        for order, sb_mpq in sorted([ (morton(*mpq), mpq) for mpq in np.ndindex(*mpqDim) ]):
+        for order, sb_mpq in sorted([ (z_order_3d(*mpq), mpq) for mpq in np.ndindex(*mpqDim) ]):
 
             lut32 = [ list() for i in range(trs+1) ]
             for i32 in range(32):
@@ -1005,9 +1000,6 @@ def cwise_linear_grad_test(dy, x, a=1, b=0, relu=False):
 
 ############################## Helpers #####################################
 
-def ceil_div(x, y):
-    return -(-x // y)
-
 def dilation_size(S, dilate):
     return S * dilate - dilate + 1
 
@@ -1041,46 +1033,6 @@ def get_padding(padding, TRS, dilates):
     else:
         padding = expand_dims(padding, 0)
     return padding
-
-# Morton ordering (z-order) of 3D coords
-def morton(z, y, x):
-    answer = 0
-    bits = max(len(bin(x)), len(bin(y)), len(bin(z))) - 2
-    for i in range(bits):
-        mshifted = 1 << i;
-        shift = i << 1
-        answer |= ((x & mshifted) << shift) | ((y & mshifted) << (shift + 1)) | ((z & mshifted) << (shift + 2))
-        #print mshifted, shift, answer, bin(answer)
-    return answer
-
-# Magic numbers and shift amounts for integer division
-# Suitable for when nmax*magic fits in 32 bits
-# Shamelessly pulled directly from:
-# http://www.hackersdelight.org/hdcodetxt/magicgu.py.txt
-def magic32u(nmax, d):
-    nc = ((nmax + 1) // d) * d - 1
-    nbits = len(bin(nmax)) - 2
-    for p in range(0, 2 * nbits + 1):
-        if 2 ** p > nc * (d - 1 - (2 ** p - 1) % d):
-            m = (2 ** p + d - 1 - (2 ** p - 1) % d) // d
-            return (m, p)
-    raise ValueError("Can't find magic number for division")
-
-
-# Magic numbers and shift amounts for integer division
-# Suitable for when nmax*magic fits in 64 bits and the shift
-# lops off the lower 32 bits
-def magic64u(d):
-    # 3 is a special case that only ends up in the high bits
-    # if the nmax is 0xffffffff
-    # we can't use 0xffffffff for all cases as some return a 33 bit
-    # magic number
-    nmax = 0xffffffff if d == 3 else 0x7fffffff
-    magic, shift = magic32u(nmax, d)
-    if magic != 1:
-        shift -= 32
-    return (magic, shift)
-
 
 def fprop_lut(q, X, S, padding, stride, dilate):
     qs = q * stride - padding

@@ -4,17 +4,12 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import time
-import os.path
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.framework import ops
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
-# for x in dir(_op_module):
-#     print(x)
-# exit()
+from blocksparse.utils import _op_module, get_entropy, scalar_constant
+
 
 ew_z_xy_op      = _op_module.ew_z_xy
 ew_z_xa_op      = _op_module.ew_z_xa
@@ -43,8 +38,10 @@ SIG_OP     = 12
 TANH_OP    = 13
 RELU_OP    = 14
 ELU_OP     = 15
-BIASADD_OP = 16
-GAINMUL_OP = 17
+GELU_OP    = 16
+SWISH_OP   = 17
+BIASADD_OP = 18
+GAINMUL_OP = 19
 
 ew_names = [
     "Add",
@@ -63,13 +60,15 @@ ew_names = [
     "Tanh",
     "Relu",
     "Elu",
+    "Gelu",
+    "Swish",
     "Biasadd",
     "Gainmul",
 ]
 
 def broadcast_check(x, y, ew_op, bc_op, tf_op, name):
-    xshape = x.get_shape().as_list()
-    yshape = y.get_shape().as_list()
+    xshape = x.shape.as_list()
+    yshape = y.shape.as_list()
 
     if xshape == yshape:
         if name is None: name = ew_names[ew_op]
@@ -105,7 +104,14 @@ def    sigmoid(x,    name=None): return ew_z_xa_op(x, op= SIG_OP, name=ew_names[
 def       tanh(x,    name=None): return ew_z_xa_op(x, op=TANH_OP, name=ew_names[TANH_OP] if name is None else name)
 def       relu(x,    name=None): return ew_z_xa_op(x, op=RELU_OP, name=ew_names[RELU_OP] if name is None else name)
 
-def elu (x, alpha=1.0, name=None): return ew_z_xa_op(x, op=ELU_OP, alpha=alpha, name=ew_names[ELU_OP] if name is None else name)
+# WARNING: gelu op, not numerically stable... need to investigate more.  Use fast_gelu for now.
+
+def elu   (x, alpha=1.0,      name=None): return ew_z_xa_op(x, op=ELU_OP,   alpha=alpha, name=ew_names[ELU_OP]   if name is None else name)
+def gelu  (x, alpha=0.044715, name=None): return ew_z_xa_op(x, op=GELU_OP,  alpha=alpha, name=ew_names[GELU_OP]  if name is None else name)
+def swish (x, alpha=1.0,      name=None): return ew_z_xa_op(x, op=SWISH_OP, alpha=alpha, name=ew_names[SWISH_OP] if name is None else name)
+
+def fast_gelu(x, name=None):
+    return swish(x, alpha=1.702, name=name)
 
 @ops.RegisterGradient("EwZXy")
 def ew_z_xy_grad(op, dz):
@@ -155,7 +161,7 @@ filter_tensor_op = _op_module.filter_tensor
 
 # set saturate to 65504.0 to saturate fp16 infinities
 def filter_tensor(x, scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
-    return filter_tensor_op(x, scale, saturate=float(saturate), zero_infs=zero_infs, zero_nans=zero_nans)
+    return filter_tensor_op(x, scalar_constant(scale, dtype=tf.float32), saturate=float(saturate), zero_infs=zero_infs, zero_nans=zero_nans)
 
 # alias to filter_tensor that just does scaling by host side scalar value
 def scale_tensor(x, scale=1.0):
@@ -169,7 +175,7 @@ def filter_tensor_grad(op, dy):
 
 float_cast_op = _op_module.float_cast
 
-def float_cast(x, dtype, dx_dtype=None):
+def float_cast(x, dtype, dx_dtype=None, name=None):
 
     dev = x.op.device.lower()
     if not dev or "cpu" in dev:
@@ -186,7 +192,7 @@ def float_cast(x, dtype, dx_dtype=None):
     if dx_dtype is None:
         dx_dtype = x.dtype.base_dtype
 
-    return float_cast_op(x, TY=dtype, dx_dtype=dx_dtype)
+    return float_cast_op(x, TY=dtype, dx_dtype=dx_dtype, name=name)
 
 @ops.RegisterGradient("FloatCast")
 def float_cast_grad(op, dz):
@@ -201,37 +207,62 @@ def float_cast_grad(op, dz):
 ############################## Dropout #####################################
 
 
-dropout_op      = _op_module.dropout
-dropout_mask_op = _op_module.dropout_mask
-dropout_grad_op = _op_module.dropout_grad
+gen_dropout_mask_op   = _op_module.gen_dropout_mask
+apply_dropout_mask_op = _op_module.apply_dropout_mask
 
-def dropout(x, keep_prob=None, scale=None, mask=None):
 
-    assert keep_prob is not None or mask is not None
+def dropout(x, keep_prob, mask=None, mask_shape=None):
 
-    if keep_prob is None:
-        keep_prob = 1.0
-    if type(keep_prob) in (float, int):
-        keep_prob = tf.constant(float(keep_prob))
-
-    if scale is None:
-        scale = tf.reciprocal(keep_prob)
-    elif type(scale) in (float, int):
-        scale = tf.constant(float(scale))
+    keep_prob = scalar_constant(keep_prob)
 
     if mask is None:
-        return dropout_op(x, keep_prob, scale)
-    return dropout_mask_op(x, mask, scale)
 
-@ops.RegisterGradient("Dropout")
-def dropout_grad(op, dy, dm):
-    dx = dropout_grad_op(dy, op.outputs[1], op.inputs[2])
-    return dx, None, None
+        if mask_shape is not None and len(mask_shape) > 0:
+            size = 1
+            for m_dim, x_dim in zip(mask_shape, x.shape.as_list()):
+                # we don't currently support placeholder dims when broadcasting the dropout mask
+                assert m_dim == 1 or m_dim == x_dim, f"incompatible mask_shape: {mask_shape} x.shape: {x.shape}"
+                size *= m_dim
+        else:
+            size = 0
 
-@ops.RegisterGradient("DropoutMask")
+        mask = gen_dropout_mask_op(x, get_entropy(), keep_prob, size=size)
+
+    if mask_shape is None:
+        mask_shape = []
+
+    return apply_dropout_mask_op(x, mask, keep_prob, mask_shape=mask_shape), mask
+
+@ops.RegisterGradient("ApplyDropoutMask")
 def dropout_grad(op, dy):
-    dx = dropout_grad_op(dy, op.inputs[1], op.inputs[2])
+    mask_shape = op.get_attr("mask_shape")
+
+    dx = apply_dropout_mask_op(dy, op.inputs[1], op.inputs[2], mask_shape=mask_shape)
+
     return dx, None, None
+
+############################## Concrete Gate for L0 Norm Pruning #####################################
+
+concrete_gate_op       = _op_module.concrete_gate
+concrete_gate_grad_op  = _op_module.concrete_gate_grad
+concrete_gate_infer_op = _op_module.concrete_gate_infer
+
+def concrete_gate(loga, tempurature=2.0/3.0, limit_a=-0.1, limit_b=1.1, epsilon=1e-6):
+
+    gate, _ = concrete_gate_op(loga, get_entropy(), scalar_constant(tempurature, dtype=tf.float32), limit_a=limit_a, limit_b=limit_b, epsilon=epsilon)
+    return gate
+
+def concrete_gate_infer(loga, limit_a=-0.1, limit_b=1.1):
+    return concrete_gate_infer_op(loga, limit_a=limit_a, limit_b=limit_b)
+
+@ops.RegisterGradient("ConcreteGate")
+def concrete_gate_grad(op, dg, _):
+    limit_a = op.get_attr("limit_a")
+    limit_b = op.get_attr("limit_b")
+
+    dloga = concrete_gate_grad_op(dg, op.outputs[1], op.inputs[2], limit_a=limit_a, limit_b=limit_b)
+
+    return dloga, None, None
 
 
 ############################## add_n8 #####################################
@@ -279,31 +310,42 @@ bias_relu_op      = _op_module.bias_relu
 bias_relu_grad_op = _op_module.bias_relu_grad
 bias_grad_op      = _op_module.bias_grad
 
-def bias_relu(x, b, relu=True, atomics=True, bench=0, use_tf=False):
+def bias_relu(x, b, axis=-1, relu=False, fast_gelu=False, atomics=True, bench=0, use_tf=False):
+
+    if relu and fast_gelu:
+        raise ValueError("relu and fast_gelu can not both be enabled.")
 
     dev = x.op.device.lower()
     if use_tf or not dev or "cpu" in dev:
-        y = tf.nn.bias_add(x, b)
+        if b.shape.ndims > 1:
+            y = x + b
+        else:
+            y = tf.nn.bias_add(x, b)
         if relu:
             y = tf.nn.relu(y)
+        elif fast_gelu:
+            y = y * tf.nn.sigmoid(1.702 * y)
+
         return y
 
-    return bias_relu_op(x, b, relu=relu, bench=bench, atomics=atomics)
+    relu = 1 if relu else (2 if fast_gelu else 0)
+
+    return bias_relu_op(x, b, axis=axis, relu=relu, bench=bench, atomics=atomics)
 
 @ops.RegisterGradient("BiasRelu")
 def bias_relu_grad(op, dy):
 
+    axis    = op.get_attr("axis")
+    relu    = op.get_attr("relu")
     atomics = op.get_attr("atomics")
     bench   = op.get_attr("bench")
 
-    if op.get_attr("relu"):
-        #return bias_relu_grad_op(dy, op.outputs[0], op.inputs[1], bench=op.get_attr("bench"))
-        dx, db, _ = bias_relu_grad_op(dy, op.outputs[0], op.inputs[1], atomics=atomics, bench=bench)
+    if relu:
+        x_or_y = op.outputs[0] if relu == 1 else op.inputs[0]
+        dx, db, _ = bias_relu_grad_op(dy, x_or_y, op.inputs[1], axis=axis, relu=relu, atomics=atomics, bench=bench)
         return dx, db
 
-    # dx = dy if no relu
-    #db = bias_grad_op(dy, op.inputs[1], bench=op.get_attr("bench"))
-    db, _ = bias_grad_op(dy, op.inputs[1], atomics=atomics, bench=bench)
+    db, _ = bias_grad_op(dy, op.inputs[1], axis=axis, atomics=atomics, bench=bench)
 
     return (dy, db)
 
@@ -376,6 +418,10 @@ def reduce_max_grad(op, dy, a):
 
     return reduce_max_grad_op(dy, op.outputs[1], axis=axis, axis_size=axis_size, keepdims=keepdims)
 
+############################## AssignAdd #####################################
+
+def assign_add(y, x, name=None):
+    return _op_module.assign_add_op(y, x, name=name)
 
 
 # if mpi_rank == 0:
@@ -384,73 +430,6 @@ def reduce_max_grad(op, dy, a):
 #             name = param.op.name + "_" + "_".join(str(x) for x in param.shape.as_list())
 #             grads[i] = ew.log_stats(grad, step, logfile="scale_14.txt", name=name)
 
-# def sig_test(x):
-#     return 1.0/(1.0 + np.exp(-x))
-
-# def relu_test(x):
-#     return np.maximum(x, 0.0)
-
-# def elu_test(x, a=1.0):
-#     return x * (x > 0.0)  +  a * (np.exp(x) - 1.0) * (x <= 0.0)
-
-
-# def add_grad_test(dz, x, y):
-#     return (dz, dz)
-
-# def mul_grad_test(dz, x, y):
-#     return (dz*y, dz*x)
-
-# def sub_grad_test(dz, x, y):
-#     return (dz, -dz)
-
-# def div_grad_test(dz, x, y):
-#     return (dz/y, -dz * x / (y*y))
-
-# def max_grad_test(dz, x, y):
-#     return (dz * (x >= y), dz * (y >= x))
-
-# def min_grad_test(dz, x, y):
-#     return (dz * (x <= y), dz * (y <= x))
-
-
-# def sig_grad_test(dz, z):
-#     return dz * (z - z*z)
-
-# def tanh_grad_test(dz, z):
-#     return dz * (1.0 - z*z)
-
-# def relu_grad_test(dz, z):
-#     return dz * (z > 0.0)
-
-
-# def neg_grad_test(dz, x):
-#     return -dz
-
-# def rcp_grad_test(dz, x):
-#     return -dz / (x*x)
-
-# def sqr_grad_test(dz, x):
-#     return dz * x * 2.0
-
-# def sqrt_grad_test(dz, x):
-#     return 0.5 * dz / np.sqrt(x)
-
-# def exp_grad_test(dz, x):
-#     return dz * np.exp(x)
-
-# def log_grad_test(dz, x):
-#     return dz / x
-
-
-# def elu_grad_test(dz, x, a=1.0):
-#     return dz * (x > 0.0) + dz * (x <= 0.0) *(a * (np.exp(x) - 1.0) + a)
-
-
-# def bias_add_grad_test(dz, x, b):
-#     return (dz, np.sum(dz, axis=0, keepdims=True))
-
-# def gain_mul_grad_test(dz, x, g):
-#     return (dz * g, np.sum(dz * x, axis=0, keepdims=True))
 # ebits = 4
 # fbits = 3
 # ebias = 8

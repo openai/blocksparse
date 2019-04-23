@@ -10,118 +10,51 @@ import tensorflow as tf
 from tensorflow.python.framework import ops
 from tensorflow.python.training  import slot_creator
 from tensorflow.python.training  import optimizer
+from blocksparse.utils import _op_module, scalar_constant, is_param_casted
+from blocksparse.ewops import float_cast
 from blocksparse.quantize import quantize
 
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
+############################## AdamOptimizer #####################################
 
+adam_op = _op_module.adam
+blocksparse_adam_op =_op_module.blocksparse_adam
 
-############################## Old Adam Implementation #####################################
-
-adam_op       = _op_module.adam
-adam_gated_op = _op_module.adam_gated
-
-
-def BlocksparseAdam(grads, params,
-        lr=0.001, decay_mean=0.9, decay_var=0.999, epsilon=1e-8, clip_sigma=0.0, global_step=None, gated=False,
+class AdamOptimizer(optimizer.Optimizer):
+    def __init__(self,
+        learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, clip_sigmas=0.0,
         norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False,
-        param_qspec=None, mean_qspec=None, var_qspec=None):
+        gated=False, param_qspec=None, mean_qspec=None, var_qspec=None,
+        fp16=False, zero_init_variables=False, name="Adam"):
 
-    with tf.device("/cpu:0"), tf.variable_scope("adam_lr"):
-
-        if global_step is None:
-            t = tf.Variable(initial_value=0.0, name="t", trainable=False)
-            t = t.assign_add(1.0)
-        else:
-            t = tf.cast(global_step.assign_add(1), tf.float32)
-        one = tf.constant(1.0)
-
-        lr = lr * tf.sqrt((one - tf.pow(decay_var, t))) /  (one - tf.pow(decay_mean, t))
-
-        if type(grad_scale) is float:
-            grad_scale = tf.constant(grad_scale)
-        if type(clip_sigma) is float:
-            clip_sigma = tf.constant(clip_sigma)
-
-    norm_scale = [] if norm_scale is None else [norm_scale]
-
-    updates = list()
-    for grad, param in zip(grads, params):
-
-        mean = slot_creator.create_zeros_slot(param, "adam_mean")
-        var  = slot_creator.create_zeros_slot(param, "adam_variance")
-        gate = getattr(param, "gate", None)
-
-        colon = param.name.find(":")
-        name  = param.name if colon < 0 else param.name[0:colon]
-
-        with tf.device("/gpu:0"), tf.variable_scope("adam/" + name):
-            if gated and gate is not None:
-                op = adam_gated_op(gate, grad, param, mean, var, lr, grad_scale, clip_sigma, norm_scale,
-                        decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon,
-                        saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
-            else:
-                op = adam_op(grad, param, mean, var, lr, grad_scale, clip_sigma, norm_scale,
-                        decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon,
-                        saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
-
-            if param_qspec is not None:
-                updates.append(param.assign(quantize(op.out_param, param_qspec, name="param")))
-            else:
-                updates.append(op.out_param)
-
-            if mean_qspec is not None:
-                updates.append(mean.assign(quantize(op.out_mean, mean_qspec, name="mean")))
-
-            if var_qspec is not None:
-                updates.append(var.assign(quantize(op.out_var, var_qspec, name="var")))
-
-    return tf.group(*updates)
-
-def Adam(grads, params,
-        lr=0.001, decay_mean=0.9, decay_var=0.999, epsilon=1e-8, clip_sigma=0.0, global_step=None,
-        norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False,
-        param_qspec=None, mean_qspec=None, var_qspec=None):
-
-    return BlocksparseAdam(grads, params,
-        lr=lr, decay_mean=decay_mean, decay_var=decay_var, epsilon=epsilon, global_step=global_step,
-        norm_scale=norm_scale, grad_scale=grad_scale, saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans,
-        param_qspec=param_qspec, mean_qspec=mean_qspec, var_qspec=var_qspec)
-
-
-############################## ClipAdamOptimizer #####################################
-
-
-class ClipAdamOptimizer(optimizer.Optimizer):
-    def __init__(self, learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, clip_sigmas=0.0, norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False, name="ClipAdam"):
         super().__init__(False, name)
-        self.beta1      = beta1
-        self.beta2      = beta2
-        self.epsilon    = epsilon
-        self.saturate   = saturate
-        self.zero_infs  = zero_infs
-        self.zero_nans  = zero_nans
-        self.name       = name
-        self.norm_scale = [] if norm_scale is None else [norm_scale]
+        self.beta1       = beta1
+        self.beta2       = beta2
+        self.epsilon     = epsilon
+        self.saturate    = saturate
+        self.zero_infs   = zero_infs
+        self.zero_nans   = zero_nans
+        self.gated       = gated
+        self.param_qspec = param_qspec
+        self.mean_qspec  = mean_qspec
+        self.var_qspec   = var_qspec
+        self.name        = name
+        self.norm_scale  = [] if norm_scale is None else [norm_scale]
+        self.fp16        = fp16
+
+        beta1_init = 0.0 if zero_init_variables else beta1
+        beta2_init = 0.0 if zero_init_variables else beta2
 
         with tf.device("/cpu:0"), tf.variable_scope("adam_beta"):
 
-            if type(learning_rate) in (float, int):
-                learning_rate = tf.constant(float(learning_rate))
-            if type(clip_sigmas)   in (float, int):
-                clip_sigmas   = tf.constant(float(clip_sigmas))
-            if type(grad_scale)    in (float, int):
-                grad_scale    = tf.constant(float(grad_scale))
-            one = tf.constant(1.0)
-
-            self.beta1_t     = tf.constant(beta1)
-            self.beta2_t     = tf.constant(beta2)
-            self.beta1_power = tf.Variable(initial_value=beta1, name="beta1_power", trainable=False)
-            self.beta2_power = tf.Variable(initial_value=beta2, name="beta2_power", trainable=False)
-            self.clip_sigma  = clip_sigmas
-            self.grad_scale  = grad_scale
-            self.lr          = learning_rate * tf.sqrt(one - self.beta2_power) / (one - self.beta1_power)
+            one = scalar_constant(1.0, dtype=tf.float32)
+            self.beta1_power = tf.Variable(initial_value=beta1_init, name="beta1_power", trainable=False)
+            self.beta2_power = tf.Variable(initial_value=beta2_init, name="beta2_power", trainable=False)
+            self.beta1_t     = scalar_constant(beta1,         dtype=tf.float32)
+            self.beta2_t     = scalar_constant(beta2,         dtype=tf.float32)
+            self.clip_sigma  = scalar_constant(clip_sigmas,   dtype=tf.float32)
+            self.grad_scale  = scalar_constant(grad_scale,    dtype=tf.float32)
+            self.lr          = scalar_constant(learning_rate, dtype=tf.float32) * tf.sqrt(one - self.beta2_power) / (one - self.beta1_power)
 
     def _get_beta_accumulators(self):
         return self.beta1_power, self.beta2_power
@@ -131,18 +64,39 @@ class ClipAdamOptimizer(optimizer.Optimizer):
 
     def _create_slots(self, params):
         # Create slots for the first and second moments.
-        for param in params:
-            self._zeros_slot(param, "m", self.name + "Mean")
-            self._zeros_slot(param, "v", self.name + "Var")
+        with tf.device("/gpu:0"), tf.control_dependencies(None):
+            for param in params:
+                # only use fp16 for larger params that benefit from memory savings
+                dtype = tf.float16 if self.fp16 and param.shape.num_elements() >= 8*1024 else tf.float32  #is_param_casted(param)
+
+                self._get_or_make_slot(param, tf.zeros(param.shape, dtype=dtype), "Mean", self.name)
+                self._get_or_make_slot(param, tf.zeros(param.shape, dtype=dtype), "Var", self.name)
 
     def _apply_dense(self, grad, param):
 
-        m = self.get_slot(param, "m")
-        v = self.get_slot(param, "v")
+        m = self.get_slot(param, "Mean")
+        v = self.get_slot(param, "Var")
 
-        return adam_op(grad, param, m, v, self.lr, self.grad_scale, self.clip_sigma, self.norm_scale,
+        gate = getattr(param, "gate", None)
+        gate = [gate] if self.gated and gate is not None else []
+
+        op = adam_op(grad, param, m, v, self.lr, self.grad_scale, self.clip_sigma, self.norm_scale, gate,
             decay_mean=self.beta1, decay_var=self.beta2, epsilon=self.epsilon,
-            saturate=self.saturate, zero_infs=self.zero_infs, zero_nans=self.zero_nans, lazy_emb=hasattr(grad, "lazy")).out_param
+            saturate=self.saturate, zero_infs=self.zero_infs, zero_nans=self.zero_nans, lazy_emb=hasattr(grad, "lazy"))
+
+        updates = list()
+        if self.param_qspec is not None:
+            updates.append(param.assign(quantize(op.out_param, self.param_qspec, name="param_" + param.op.name)))
+        else:
+            updates.append(op.out_param)
+
+        if self.mean_qspec is not None:
+            updates.append(m.assign(quantize(op.out_mean, self.mean_qspec, name="mean_" + param.op.name)))
+
+        if self.var_qspec is not None:
+            updates.append(v.assign(quantize(op.out_var, self.var_qspec, name="var_" + param.op.name)))
+
+        return tf.group(*updates) if len(updates) > 1 else updates[0]
 
     def _apply_sparse(self, grad, param):
         raise NotImplementedError("Sparse gradient updates are not supported.")
@@ -156,18 +110,16 @@ class ClipAdamOptimizer(optimizer.Optimizer):
         return tf.group(*update_ops + [update_beta1, update_beta2], name=name_scope)
 
 
-class AdamOptimizer(ClipAdamOptimizer):
-    def __init__(self, learning_rate=3e-4, beta1=0.9, beta2=0.999, epsilon=1e-8, norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False, name="Adam"):
-        super().__init__(learning_rate=learning_rate, beta1=beta1, beta2=beta2, epsilon=epsilon, norm_scale=norm_scale, grad_scale=grad_scale, saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans, name=name)
-
-
-############################## ClipAdamOptimizer #####################################
+############################## AdafactorOptimizer #####################################
 
 adafactor1d_op = _op_module.adafactor1d
 adafactor2d_op = _op_module.adafactor2d
 
 class AdafactorOptimizer(optimizer.Optimizer):
-    def __init__(self, learning_rate=5e-4, beta2=0.999, epsilon=1e-30, clip_thresh=1.0, norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False, name="Adafactor"):
+    def __init__(self, learning_rate=5e-4, beta2=0.999, epsilon=1e-30, clip_thresh=1.0,
+        norm_scale=None, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False,
+        name="Adafactor", zero_init_variables=False):
+
         super().__init__(False, name)
         self.epsilon    = epsilon
         self.saturate   = saturate
@@ -176,22 +128,17 @@ class AdafactorOptimizer(optimizer.Optimizer):
         self.name       = name
         self.norm_scale = [] if norm_scale is None else [norm_scale]
 
+        beta2_init = 0.0 if zero_init_variables else beta2
+
         with tf.device("/cpu:0"), tf.variable_scope("adafactor_decay"):
 
-            if type(learning_rate) in (float, int):
-                learning_rate = tf.constant(float(learning_rate))
-            if type(clip_thresh)   in (float, int):
-                clip_thresh   = tf.constant(float(clip_thresh))
-            if type(grad_scale)    in (float, int):
-                grad_scale    = tf.constant(float(grad_scale))
-            one = tf.constant(1.0)
-
-            self.decay1_power = tf.Variable(initial_value=beta2,       name="decay1_power", trainable=False)
-            self.decay2_power = tf.Variable(initial_value=beta2*beta2, name="decay2_power", trainable=False)
-            self.learn_rate   = learning_rate
-            self.clip_thresh  = clip_thresh
-            self.grad_scale   = grad_scale
-            self.decay_t      = tf.constant(beta2)
+            one = scalar_constant(1.0, dtype=tf.float32)
+            self.decay1_power = tf.Variable(initial_value=beta2_init,            name="decay1_power", trainable=False)
+            self.decay2_power = tf.Variable(initial_value=beta2_init*beta2_init, name="decay2_power", trainable=False)
+            self.learn_rate   = scalar_constant(learning_rate, dtype=tf.float32)
+            self.clip_thresh  = scalar_constant(clip_thresh,   dtype=tf.float32)
+            self.grad_scale   = scalar_constant(grad_scale,    dtype=tf.float32)
+            self.decay_t      = scalar_constant(beta2,         dtype=tf.float32)
             self.decay        = self.decay_t * (one - self.decay1_power) / (one - self.decay2_power)
 
     def _get_beta_accumulators(self):
@@ -247,7 +194,7 @@ class AdafactorOptimizer(optimizer.Optimizer):
 
 clip_global_norm_op = _op_module.clip_global_norm
 
-def ClipGlobalNorm(grads, clip_norm=1.0, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
+def clip_by_global_norm(grads, clip_norm=1.0, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
 
     grad_float = list()
     grad_ehalf = list()
@@ -263,130 +210,132 @@ def ClipGlobalNorm(grads, clip_norm=1.0, grad_scale=1.0, saturate=0.0, zero_infs
         else:
             raise ValueError("unsupported grad dtype")
 
-    with tf.device("/cpu:0"):
-        if type(clip_norm)  in (float, int):
-            clip_norm  = tf.constant(float(clip_norm))
-        if type(grad_scale) in (float, int):
-            grad_scale = tf.constant(float(grad_scale))
-
     with tf.device("/gpu:0"):
         global_norm, norm_scale, _ = clip_global_norm_op(
-            grad_scale, clip_norm, grad_float, grad_ehalf, grad_bhalf,
+            scalar_constant(grad_scale, dtype=tf.float32),
+            scalar_constant(clip_norm,  dtype=tf.float32),
+            grad_float, grad_ehalf, grad_bhalf,
             saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
 
     return global_norm, norm_scale
 
+def global_norm(grads, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
+    gn, _ = clip_by_global_norm(grads, clip_norm=9e9, grad_scale=grad_scale, saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
+    return gn
 
-
-############################## Group LASSO / Blocksparse L2 decay #####################################
-
-l2_decay_op       = _op_module.blocksparse_l2_decay
-l2_decay_gated_op = _op_module.blocksparse_l2_decay_gated
-
-class BlocksparseL2Decay(object):
-
-    def __init__(self, rate=1e-5, gated=False, epsilon=1e-12):
-
-        self.rate    = rate
-        self.gated   = gated
-        self.epsilon = epsilon
-
-    def apply(self, grad_params, gpu=0):
-
-        updates = []
-
-        for grad, param in grad_params:
-
-            # only apply to block-sparse tensors
-            shape = param.get_shape().as_list()
-            if len(shape) == 3 and shape[1] == shape[2] and shape[1] in (8,16,32):
-
-                gate = getattr(param, "gate", None)
-
-                with tf.device("/gpu:%d" % gpu), ops.name_scope("l2_decay"):
-                    if self.gated and gate is not None:
-                        op = l2_decay_gated_op(param, gate, self.rate, epsilon=self.epsilon)
-                    else:
-                        op = l2_decay_op(param, self.rate, epsilon=self.epsilon)
-
-                    updates.append(op)
-
-        return tf.group(*updates)
+# old function name
+def ClipGlobalNorm(grads, clip_norm=1.0, grad_scale=1.0, saturate=0.0, zero_infs=False, zero_nans=False):
+    return clip_by_global_norm(grads, clip_norm=clip_norm, grad_scale=grad_scale, saturate=saturate, zero_infs=zero_infs, zero_nans=zero_nans)
 
 
 ############################## Exponential Moving Average #####################################
 
-ema_op       = _op_module.ema
-ema_gated_op = _op_module.ema_gated
+ema_op = _op_module.ema
 
-class BlocksparseEma(object):
+class Ema(object):
 
-    def __init__(self, decay=0.999, gated=False):
+    def __init__(self, decay=0.999, gated=False, fp16=False, name="Ema"):
         self.decay    = decay
         self.gated    = gated
+        self.fp16     = fp16
+        self.name     = name
         self.averages = dict()
 
-    def apply(self, grad_params, gpu=0, qspec=None):
+    def apply(self, params, qspec=None):
 
-        for grad, param in grad_params:
-            with ops.init_scope():
+        with tf.device("/gpu:0"), tf.control_dependencies(None):
+            for param in params:
+                if self.fp16 == 2 or (self.fp16 and is_param_casted(param)):
+                    # only use fp16 for params that are explicitly cast to fp16 before use
+                    init  = float_cast(param.initialized_value(), dtype=tf.float16)
+                    dtype = tf.float16
+                else:
+                    init  = param.initialized_value()
+                    dtype = tf.float32
 
-                self.averages[param] = slot_creator.create_slot(param, param.initialized_value(), "ema")
-
+                with tf.variable_scope(None, param.op.name + "/" + self.name):
+                    # use the Identity read op output as the key
+                    # this lets us lookup ema vars by Cast op outputs
+                    self.averages[param.value()] = tf.get_variable("ema", dtype=dtype, initializer=init, trainable=False)
                 ops.add_to_collection(ops.GraphKeys.MOVING_AVERAGE_VARIABLES, param)
 
         ema_ops = []
-        for grad, param in grad_params:
+        for param in params:
 
-            colon = param.name.find(":")
-            name  = param.name if colon < 0 else param.name[0:colon]
+            ema   = self.averages[param.value()]
+            gate  = getattr(param, "gate", None)
+            gate  = [gate] if self.gated and gate is not None else []
 
-            with tf.device("/gpu:%d" % gpu), tf.variable_scope("ema/" + name):
-                ema  = self.averages[param]
-                gate = getattr(param, "gate", None)
-                if self.gated and gate is not None:
-                    op = ema_gated_op(ema, param, gate, decay=self.decay)
-                else:
-                    op = ema_op(ema, param, decay=self.decay)
+            op = ema_op(ema, param, gate, decay=self.decay)
 
-                if qspec is not None:
-                    ema_ops.append(ema.assign(quantize(op, qspec, name="ema")))
-                else:
-                    ema_ops.append(op)
+            if qspec is not None:
+                ema_ops.append(ema.assign(quantize(op, qspec, name="ema_" + param.op.name)))
+            else:
+                ema_ops.append(op)
 
         return tf.group(*ema_ops)
 
     def average(self, param):
-        return self.averages.get(param, None)
+        if isinstance(param, tf.Variable):
+            # this is just a raw param
+            key = param.value()
+        elif isinstance(param, tf.Tensor):
+            # we're given a Cast op output
+            # TODO: maybe traverse deeper?
+            key = param.op.inputs[0]
+        else:
+            raise TypeError("bad param type")
+
+        return self.averages.get(key, None)
+
+
+############################## Group LASSO / Blocksparse L2 decay #####################################
+
+l2_decay_op = _op_module.blocksparse_l2_decay
+
+def _check_param_shape(param, gate=None):
+    assert len(param.shape) == 3 and param.shape[1].value == param.shape[2].value and param.shape[1].value in (8,16,32,64)
+    if gate is not None:
+        assert gate.shape.num_elements() == param.shape[0].value
+
+def blocksparse_l2_decay(param, gate=None, rate=0.05, epsilon=1e-12):
+
+    _check_param_shape(param, gate)
+
+    gate = [gate] if gate is not None else []
+
+    return l2_decay_op(param, scalar_constant(rate, dtype=tf.float32), gate, epsilon=epsilon)
 
 ############################## Blocksparse Pruning #####################################
 
+blocksparse_norm_op            = _op_module.blocksparse_norm
+blocksparse_prune_op           = _op_module.blocksparse_prune
+blocksparse_threshold_prune_op = _op_module.blocksparse_threshold_prune
 
-maxnorm_prune_op = _op_module.blocksparse_maxnorm_prune
+def blocksparse_norm(param, norm="max"):
+    _check_param_shape(param)
+    return blocksparse_norm_op(param, norm_type=1 if norm.lower() == "l2" else 0)
 
-class BlocksparseMaxnormPrune(object):
+def blocksparse_prune(param, gate, step, sparsity=None, threshold=None, norm="max", frequency=1):
 
-    def __init__(self, threshold=1e-5, ema=None):
+    _check_param_shape(param, gate)
 
-        self.threshold = threshold
-        self.ema       = ema
+    # one must be set
+    assert (sparsity is None) ^ (threshold is None)
 
-    def apply(self, grad_params, gpu=0):
+    if sparsity is not None:
 
-        updates = []
-        for grad, param in grad_params:
+        # apply pruning to the moving average
+        norms = blocksparse_norm(param, norm=norm)
 
-            # only apply to gated block-sparse tensors
-            gate = getattr(param, "gate", None)
+        k = scalar_constant(param.shape[0].value, dtype=tf.int32)
 
-            if gate is not None:
+        _, idx = tf.nn.top_k(norms, k=k, sorted=True)
 
-                # apply pruning to the moving average
-                if self.ema is not None:
-                    param = self.ema.average(param)
+        return blocksparse_prune_op(gate, idx, scalar_constant(sparsity, dtype=tf.float32), step, frequency=frequency)
 
-                with tf.device("/gpu:%d" % gpu), ops.name_scope("maxnorm_prune"):
+    elif threshold is not None:
 
-                    updates.append(maxnorm_prune_op(gate, param, self.threshold))
+        norm = 1 if norm.lower() == "l2" else 0
 
-        return tf.group(*updates)
+        return blocksparse_threshold_prune_op(gate, param, scalar_constant(threshold, dtype=tf.float32), step, frequency=frequency, norm_type=norm)

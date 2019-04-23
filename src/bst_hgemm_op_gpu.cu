@@ -14,7 +14,7 @@
 
 // 32x64x16 warp tile
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(256) hgemm_bst_64x64x64_xn(
+__global__ void __launch_bounds__(256) bst_hgemm_64x64x64_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -180,7 +180,7 @@ __global__ void __launch_bounds__(256) hgemm_bst_64x64x64_xn(
 // A is sparse, B is dense, C is dense
 
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
+__global__ void __launch_bounds__(128) bst_hgemm_32x64x32_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -193,8 +193,8 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
     const uint stdB = 80;
     const uint stdC = 132;
 
-    __shared__ ehalf hShare[(stdA + stdB)*32];
-    float* fShare = (float*)hShare;
+    __shared__ float fShare[stdC*16]; // stdC*16*4 > (stdA + stdB)*32*2
+    ehalf* hShare = (ehalf*)fShare;
     uint2* Lut2s = (uint2*)&hShare[(stdA + stdB)*32];
 
     uint tid    = threadIdx.x;
@@ -214,8 +214,8 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
     uint  lut_offset = lut_head.x;
     uint  lut_size   = lut_head.y;
 
-    uint txb = tid % 8;
-    uint tyb = tid / 8;
+    uint tx = tid % 8;
+    uint ty = tid / 8;
 
     if (lut_size > 0)
     {
@@ -231,18 +231,15 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
         }
         __syncthreads();
 
-        uint txa = tid % 4;
-        uint tya = tid / 4;
-
-        uint storA = tya*stdA + txa*8;
-        uint storB = tyb*stdB + txb*8 + stdA*32;
+        uint storA = ty*stdA + tx*4;
+        uint storB = ty*stdB + tx*8 + stdA*32;
 
         uint loadA = fragmentA<OP_A,M16N16K16>::get_idx(tid, stdA, (tid & 64)*(OP_A == OP_N ? 1 : stdA)*16/64);
         uint loadB = fragmentB<OP_N,M16N16K16>::get_idx(tid, stdB, (tid & 64)*stdB*16/64 + (tid & 32) + stdA*32);
 
-        uint b = idx_N*64 + txb*8;
-        uint offsetA = idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + tid*8;
-        uint offsetB = idx_B*szCtxHeadStateB + tyb*szHeadState + idx_H*szState + b;
+        uint b = idx_N*64 + tx*8;
+        uint offsetA = idx_B*szHeadBlocksBlk + idx_H*szBlocksBlk + tid*4;
+        uint offsetB = idx_B*szCtxHeadStateB + ty*szHeadState + idx_H*szState + b;
 
         bool inB = N64 || b < szState;
 
@@ -258,17 +255,17 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
             uint4 b00 = {0};
             uint4 b16 = {0};
 
-            entry.x += offsetA;
-            entry.y += offsetB;
-
-            uint4 a00 = *(uint4*)&A[entry.x];
+            const ehalf* pA = A + (entry.x + offsetA);
+            uint2 a00 = *(uint2*)&pA[ 0*32];
+            uint2 a16 = *(uint2*)&pA[16*32];
             if (inB)
             {
-                b00 = *(uint4*)&B[entry.y +  0*szHeadState];
-                b16 = *(uint4*)&B[entry.y + 16*szHeadState];
+                b00 = *(uint4*)&B[entry.y + offsetB +  0*szHeadState];
+                b16 = *(uint4*)&B[entry.y + offsetB + 16*szHeadState];
             }
             __syncthreads();
-            *(uint4*)&hShare[storA] = a00;
+            *(uint2*)&hShare[storA +  0*stdA] = a00;
+            *(uint2*)&hShare[storA + 16*stdA] = a16;
             *(uint4*)&hShare[storB +  0*stdB] = b00;
             *(uint4*)&hShare[storB + 16*stdB] = b16;
             __syncthreads();
@@ -322,8 +319,8 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
     }
     else
     {
-        uint c       = idx_N*64 + txb*8;
-        uint offsetC = idx_B*szCtxHeadStateC + (idx_M*32 + tyb)*szHeadState + idx_H*szState + c;
+        uint c       = idx_N*64 + tx*8;
+        uint offsetC = idx_B*szCtxHeadStateC + (idx_M*32 + ty)*szHeadState + idx_H*szState + c;
 
         if (N64 || c < szState)
         {
@@ -340,7 +337,7 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
 // A is sparse, B is dense, C is dense
 
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(64) hgemm_bst_16x64x16_xn(
+__global__ void __launch_bounds__(64) bst_hgemm_16x64x16_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -492,7 +489,7 @@ __global__ void __launch_bounds__(64) hgemm_bst_16x64x16_xn(
 }
 
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(64) hgemm_bst_8x64x8_xn(
+__global__ void __launch_bounds__(64) bst_hgemm_8x64x8_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -652,7 +649,7 @@ __global__ void __launch_bounds__(64) hgemm_bst_8x64x8_xn(
 
 // 32x32x32 warp tile
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(256) hgemm_bst_64x64x64_nt(
+__global__ void __launch_bounds__(256) bst_hgemm_64x64x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -778,7 +775,7 @@ __global__ void __launch_bounds__(256) hgemm_bst_64x64x64_nt(
 // A is dense, B is dense, C is sparse
 
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(128) hgemm_bst_32x32x64_nt(
+__global__ void __launch_bounds__(128) bst_hgemm_32x32x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -900,7 +897,7 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x32x64_nt(
 // dds: A is dense, B is dense, C is sparse
 
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(64) hgemm_bst_16x16x64_nt(
+__global__ void __launch_bounds__(64) bst_hgemm_16x16x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1007,7 +1004,7 @@ __global__ void __launch_bounds__(64) hgemm_bst_16x16x64_nt(
 }
 
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(32) hgemm_bst_8x8x64_nt(
+__global__ void __launch_bounds__(32) bst_hgemm_8x8x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1103,7 +1100,7 @@ __global__ void __launch_bounds__(32) hgemm_bst_8x8x64_nt(
 #else // __CUDA_ARCH__ >= 700
 
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(256) hgemm_bst_64x64x64_xn(
+__global__ void __launch_bounds__(256) bst_hgemm_64x64x64_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1115,7 +1112,7 @@ __global__ void __launch_bounds__(256) hgemm_bst_64x64x64_xn(
     *C = 0;
 }
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
+__global__ void __launch_bounds__(128) bst_hgemm_32x64x32_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1127,7 +1124,7 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x64x32_xn(
     *C = 0;
 }
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(64) hgemm_bst_16x64x16_xn(
+__global__ void __launch_bounds__(64) bst_hgemm_16x64x16_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1139,7 +1136,7 @@ __global__ void __launch_bounds__(64) hgemm_bst_16x64x16_xn(
     *C = 0;
 }
 template <uint OP_A, bool N64>
-__global__ void __launch_bounds__(64) hgemm_bst_8x64x8_xn(
+__global__ void __launch_bounds__(64) bst_hgemm_8x64x8_xn(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1152,7 +1149,7 @@ __global__ void __launch_bounds__(64) hgemm_bst_8x64x8_xn(
 }
 
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(256) hgemm_bst_64x64x64_nt(
+__global__ void __launch_bounds__(256) bst_hgemm_64x64x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1164,7 +1161,7 @@ __global__ void __launch_bounds__(256) hgemm_bst_64x64x64_nt(
     *C = 0;
 }
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(128) hgemm_bst_32x32x64_nt(
+__global__ void __launch_bounds__(128) bst_hgemm_32x32x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1176,7 +1173,7 @@ __global__ void __launch_bounds__(128) hgemm_bst_32x32x64_nt(
     *C = 0;
 }
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(64) hgemm_bst_16x16x64_nt(
+__global__ void __launch_bounds__(64) bst_hgemm_16x16x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1188,7 +1185,7 @@ __global__ void __launch_bounds__(64) hgemm_bst_16x16x64_nt(
     *C = 0;
 }
 template <typename CT, typename CV, bool K64>
-__global__ void __launch_bounds__(32) hgemm_bst_8x8x64_nt(
+__global__ void __launch_bounds__(32) bst_hgemm_8x8x64_nt(
     const uint2* __restrict__ Lut,
     const ehalf* __restrict__ A,
     const ehalf* __restrict__ B,
@@ -1202,7 +1199,9 @@ __global__ void __launch_bounds__(32) hgemm_bst_8x8x64_nt(
 
 #endif // __CUDA_ARCH__ >= 700
 
-bool blocksparse_transformer_xn(CUstream stream,
+
+
+bool bst_hgemm_xn(CUstream stream,
     const uint2* lut,
     const ehalf* a,
     const ehalf* b,
@@ -1229,33 +1228,39 @@ bool blocksparse_transformer_xn(CUstream stream,
     uint shared = ((max_lut+1)/2)*2*8; // round up to nearest even, 8 bytes per entry
 
     dim3 grid(gridX, batch_dim, head_dim);
-    if (op == 1) // NN
+    if (op == NN_OP) // NN
     {
         if (block_size == 8)
-              hgemm_bst_8x64x8_xn<OP_N,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+              bst_hgemm_8x64x8_xn<OP_N,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
         else if (block_size == 16)
-            hgemm_bst_16x64x16_xn<OP_N,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+            bst_hgemm_16x64x16_xn<OP_N,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
         else if (block_size == 32)
-            hgemm_bst_32x64x32_xn<OP_N,false><<<grid,128,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
-        else
-            hgemm_bst_64x64x64_xn<OP_N,false><<<grid,256,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+        {
+            shared = shared > 256 ? shared - 256 : 0;
+            bst_hgemm_32x64x32_xn<OP_N,false><<<grid,128,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+        }
+        else if (block_size == 64)
+            bst_hgemm_64x64x64_xn<OP_N,false><<<grid,256,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
     }
     else // TN
     {
         if (block_size == 8)
-              hgemm_bst_8x64x8_xn<OP_T,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+              bst_hgemm_8x64x8_xn<OP_T,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
         else if (block_size == 16)
-            hgemm_bst_16x64x16_xn<OP_T,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+            bst_hgemm_16x64x16_xn<OP_T,false><<<grid, 64,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
         else if (block_size == 32)
-            hgemm_bst_32x64x32_xn<OP_T,false><<<grid,128,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
-        else
-            hgemm_bst_64x64x64_xn<OP_T,false><<<grid,256,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+        {
+            shared = shared > 256 ? shared - 256 : 0;
+            bst_hgemm_32x64x32_xn<OP_T,false><<<grid,128,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
+        }
+        else if (block_size == 64)
+            bst_hgemm_64x64x64_xn<OP_T,false><<<grid,256,shared,stream>>>(lut, a, b, c, szCtxHeadStateB, szCtxHeadStateC, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, gridM, gridN, magic, shift);
     }
     return true;
 }
 
 template <typename CT, typename CV2, typename CV4>
-bool blocksparse_transformer_nt(CUstream stream,
+bool bst_hgemm_nt(CUstream stream,
     const uint2* lut,
     const ehalf* a,
     const ehalf* b,
@@ -1282,769 +1287,30 @@ bool blocksparse_transformer_nt(CUstream stream,
     if (block_size == 8)
     {
         if (k64)
-            hgemm_bst_8x8x64_nt<CT,CV2, true><<<grid, 32,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+            bst_hgemm_8x8x64_nt<CT,CV2, true><<<grid, 32,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
         else
-            hgemm_bst_8x8x64_nt<CT,CV2,false><<<grid, 32,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+            bst_hgemm_8x8x64_nt<CT,CV2,false><<<grid, 32,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
     }
     else if (block_size == 16)
     {
         if (k64)
-            hgemm_bst_16x16x64_nt<CT,CV4, true><<<grid, 64,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+            bst_hgemm_16x16x64_nt<CT,CV4, true><<<grid, 64,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
         else
-            hgemm_bst_16x16x64_nt<CT,CV4,false><<<grid, 64,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+            bst_hgemm_16x16x64_nt<CT,CV4,false><<<grid, 64,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
     }
     else if (block_size == 32)
-        hgemm_bst_32x32x64_nt<CT,CV4,false><<<grid,128,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
-    else
-        hgemm_bst_64x64x64_nt<CT,CV4,false><<<grid,256,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+        bst_hgemm_32x32x64_nt<CT,CV4,false><<<grid,128,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
+
+    else if (block_size == 64)
+        bst_hgemm_64x64x64_nt<CT,CV4,false><<<grid,256,0,stream>>>(lut, a, b, c, szCtxHeadStateA, szCtxHeadStateB, szHeadState, szState, szHeadBlocksBlk, szBlocksBlk, szLut, loops);
 
     // cudaError_t error = cudaGetLastError();
     // printf("%s\n%s\n", cudaGetErrorName(error), cudaGetErrorString(error));
 
     return true;
 }
-template bool blocksparse_transformer_nt<ehalf,ehalf2,ehalf4>(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks_a, uint ctx_blks_b, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
-template bool blocksparse_transformer_nt<bhalf,bhalf2,bhalf4>(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, bhalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks_a, uint ctx_blks_b, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
+template bool bst_hgemm_nt<ehalf,ehalf2,ehalf4>(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, ehalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks_a, uint ctx_blks_b, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
+template bool bst_hgemm_nt<bhalf,bhalf2,bhalf4>(CUstream stream, const uint2* lut, const ehalf* a, const ehalf* b, bhalf* c, uint block_size, uint blocks, uint batch_dim, uint ctx_blks_a, uint ctx_blks_b, uint head_dim, uint state_dim, uint lut_heads, uint lut_dim);
 
-
-template <uint U, uint BSIZE, typename MASKT>
-__global__ void blocksparse_masked_softmax(
-    const uint2* __restrict__ Lut,
-    const MASKT* __restrict__ Mask,
-    const bhalf* __restrict__ X,
-          ehalf*              Y,
-    uint blocks, uint szLut, uint szMask, uint szHead, uint szBatch, float scale, uint shfl_init, uint use_mask)
-{
-    __shared__ float Max[32];
-    __shared__ float Sum[32];
-    uint2* Lut2s = (uint2*)&Sum[32];
-
-    uint tid   = threadIdx.x;
-    uint idx_Q = blockIdx.x / BSIZE; // Q dim
-    uint idx_q = blockIdx.x % BSIZE; // Q dim
-    uint idx_B = blockIdx.y; // batch dim
-    uint idx_H = blockIdx.z; // head dim
-
-    // each head can optionally have its own lut
-    Lut  += idx_H * szLut;
-    Mask += idx_H * szMask + idx_q * blocks;
-    uint2 lut_head = Lut[idx_Q];
-
-    if (tid < 32)
-    {
-        // Allows non-power of 2 threads to work
-        Max[tid] = -FLT_MAX;
-        Sum[tid] = 0.0f;
-    }
-
-    // prefetch the lut data into shared
-    uint lut_offset = lut_head.x;
-    uint lut_size   = lut_head.y;
-    Lut += lut_offset;
-    #pragma unroll 1
-    for (uint i = tid; i < lut_size; i += blockDim.x)
-    {
-        uint2 entry = Lut[i];
-        entry.y     = use_mask ? (uint)__ldg(Mask + entry.x) : 0xffffffff;
-        entry.x    *= BSIZE*BSIZE;
-        Lut2s[i]    = entry;
-
-        //printf("%3d %3d %3d %08x\n", idx_Q, idx_q, i, entry.y);
-    }
-    __syncthreads();
-
-    uint lut_idx = (tid & (1024-BSIZE))*U/BSIZE;
-    uint tidx = tid % BSIZE;
-    uint mask_bit = 1 << tidx;
-    uint offset = idx_B*szBatch + idx_H*szHead + idx_q*BSIZE + tidx;
-
-    float xval[U];
-    #pragma unroll
-    for (int i = 0; i < U; i++)
-    {
-        uint2 entry = Lut2s[lut_idx + i];
-        uint offsetX = offset + entry.x;
-        bool in = lut_idx + i < lut_size;
-        float val = load(X + offsetX, 0, in);
-
-        xval[i] = in && (entry.y & mask_bit) != 0 ? val : -FLT_MAX;
-    }
-
-    // reduce within thread
-    float Xmax[U];
-    for (int i = 0; i < U; i++)
-        Xmax[i] = xval[i];
-
-    for (int j = U >> 1; j > 0; j >>= 1)
-        for (int i = 0; i < j; i++)
-            Xmax[i] = fmaxf(Xmax[i], Xmax[i+j]);
-    float xmax = Xmax[0];
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        xmax = fmaxf(xmax, shfl_xor(xmax, i));
-
-    if (blockDim.x > 32)
-    {
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Max[tid/32] = xmax;
-        __syncthreads();
-        if (tid < 32)
-        {
-            // first warp loads all prior reductions
-            xmax = Max[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (uint i = shfl_init; i > 0; i >>= 1)
-                xmax = fmaxf(xmax, shfl_xor(xmax, i));
-            // final reduction to shared
-            Max[tid] = xmax;
-        }
-        __syncthreads();
-        xmax = Max[0];
-    }
-    // compute exponent of softmax
-    float Xsum[U];
-    for (int i = 0; i < U; i++)
-    {
-        // use fast approx math: e**x == 2**(x * log2(e))
-        float exp = (xval[i] - xmax) * scale;
-        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(exp) :);
-        Xsum[i] = xval[i] = exp;
-    }
-
-    // reduce within thread
-    for (int j = U >> 1; j > 0; j >>= 1)
-        for (int i = 0; i < j; i++)
-            Xsum[i] = Xsum[i] + Xsum[i+j];
-    float exp_sum = Xsum[0];
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        exp_sum += shfl_xor(exp_sum, i);
-
-    if (blockDim.x > 32)
-    {
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Sum[tid/32] = exp_sum;
-        __syncthreads();
-
-        if (tid < 32)
-        {
-            // first warp loads all prior reductions
-            exp_sum = Sum[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (uint i = shfl_init; i > 0; i >>= 1)
-                exp_sum += shfl_xor(exp_sum, i);
-            // final reduction to shared
-            Sum[tid] = exp_sum;
-        }
-        __syncthreads();
-        exp_sum = Sum[0];
-    }
-    float rcp_exp_sum = exp_sum;
-    asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(rcp_exp_sum) :);
-
-    #pragma unroll
-    for (int i = 0; i < U; i++)
-    {
-        ehalf out;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(out.x) : "f"(xval[i] * rcp_exp_sum));
-        uint offsetY = offset + Lut2s[lut_idx + i].x;
-        if (lut_idx + i < lut_size)
-            __stg(Y + offsetY, out);
-    }
-}
-
-template <uint U, uint BSIZE, typename MASKT>
-__global__ void blocksparse_masked_softmax_grad(
-    const uint2* __restrict__ Lut,
-    const MASKT* __restrict__ Mask,
-    const ehalf* __restrict__ DY,
-    const ehalf* __restrict__ Y,
-          ehalf*              DX,
-    uint blocks, uint szLut, uint szMask, uint szHead, uint szBatch, float scale, uint shfl_init, uint use_mask)
-{
-    __shared__ float Sum[32];
-    uint2* Lut2s = (uint2*)&Sum[32];
-
-    uint tid   = threadIdx.x;
-    uint idx_Q = blockIdx.x / BSIZE; // Q dim
-    uint idx_q = blockIdx.x % BSIZE; // Q dim
-    uint idx_B = blockIdx.y; // batch dim
-    uint idx_H = blockIdx.z; // head dim
-
-    // each head can optionally have its own lut and/or mask
-    Lut  += idx_H * szLut;
-    Mask += idx_H * szMask + idx_q * blocks;
-    uint2 lut_head = Lut[idx_Q];
-
-    if (tid < 32)
-        Sum[tid] = 0.0f;
-
-    // prefetch the lut data into shared
-    uint lut_offset = lut_head.x;
-    uint lut_size   = lut_head.y;
-    Lut += lut_offset;
-    #pragma unroll 1
-    for (uint i = tid; i < lut_size; i += blockDim.x)
-    {
-        uint2 entry = Lut[i];
-        entry.y     = use_mask ? (uint)__ldg(Mask + entry.x) : 0xffffffff;
-        entry.x    *= BSIZE*BSIZE;
-        Lut2s[i]    = entry;
-    }
-    __syncthreads();
-
-    uint lut_idx = (tid & (1024-BSIZE))*U/BSIZE;
-    uint tidx = tid % BSIZE;
-    uint mask_bit = 1 << tidx;
-    uint offset = idx_B*szBatch + idx_H*szHead + idx_q*BSIZE + tidx;
-
-    float dy[U], y[U];
-    #pragma unroll
-    for (int i = 0; i < U; i++)
-    {
-        uint2 entry = Lut2s[lut_idx + i];
-        uint offsetY = offset + entry.x;
-        bool in = lut_idx + i < lut_size && (entry.y & mask_bit) != 0;
-        dy[i] = load(DY + offsetY, 0, in);
-        y[i]  = load(Y  + offsetY, 0, in);
-    }
-
-    // compute dy * y
-    float dyy[U];
-    for (int i = 0; i < U; i++)
-        dyy[i] = dy[i] * y[i];
-
-    // reduce within thread
-    for (int j = U >> 1; j > 0; j >>= 1)
-        for (int i = 0; i < j; i++)
-            dyy[i] = dyy[i] + dyy[i+j];
-    float sum_dyy = dyy[0];
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        sum_dyy += shfl_xor(sum_dyy, i);
-
-    if (blockDim.x > 32)
-    {
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Sum[tid/32] = sum_dyy;
-        __syncthreads();
-
-        if (tid < 32)
-        {
-            // first warp loads all prior reductions
-            sum_dyy = Sum[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (uint i = shfl_init; i > 0; i >>= 1)
-                sum_dyy += shfl_xor(sum_dyy, i);
-            // final reduction to shared
-            Sum[tid] = sum_dyy;
-        }
-        __syncthreads();
-        sum_dyy = Sum[0];
-    }
-
-    // dx = (dy - sum_dyy) * y * scale
-    #pragma unroll
-    for (int i = 0; i < U; i++)
-    {
-        float dx = (dy[i] - sum_dyy) * y[i] * scale;
-        ehalf out;
-        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(out.x) : "f"(dx));
-        uint offsetX = offset + Lut2s[lut_idx + i].x;
-        if (lut_idx + i < lut_size)
-            __stg(DX + offsetX, out);
-    }
-}
-
-typedef unsigned long long uint64;
-
-template <uint UNROLL>
-__global__ void __launch_bounds__(1024,2) blocksparse_masked_softmax_64x64(
-    const uint2*  __restrict__ Lut,
-    const uint64* __restrict__ Mask,
-    const bhalf*  __restrict__ X,
-          ehalf*               Y,
-    uint blocks, uint szLut, uint szMask, uint szHead, uint szBatch, float scale, uint shfl_init, uint max_lut, uint use_mask)
-{
-    __shared__ float Max[32];
-    __shared__ float Sum[32];
-    uint64* LutMask64 = (uint64*)&Sum[32];
-    uint*   LutMask32 = (uint*)&Sum[32];
-    uint*   LutOffset = (uint*)&LutMask64[max_lut];
-
-    uint tid   = threadIdx.x;
-    uint idx_Q = blockIdx.x / 64;
-    uint idx_q = blockIdx.x % 64;
-    uint idx_B = blockIdx.y; // batch dim
-    uint idx_H = blockIdx.z; // head dim
-
-    // each head can optionally have its own lut
-    Lut  += idx_H * szLut;
-    Mask += idx_H * szMask + idx_q * blocks;
-    uint2 lut_head = Lut[idx_Q];
-
-    if (tid < 32)
-    {
-        // Allows non-power of 2 threads to work
-        Max[tid] = -FLT_MAX;
-        Sum[tid] = 0.0f;
-    }
-
-    // prefetch the lut data into shared
-    uint lut_offset = lut_head.x;
-    uint lut_size   = lut_head.y;
-
-    Lut += lut_offset;
-    #pragma unroll 1
-    for (uint i = tid; i < max_lut; i += blockDim.x)
-    {
-        uint64 mask = 0;
-        if (i < lut_size)
-        {
-            uint2 entry  = Lut[i];
-            uint blk_id  = entry.x;
-            LutOffset[i] = blk_id * 64*64;
-            mask = use_mask ? __ldg(Mask + blk_id) : 0xffffffffffffffff;
-        }
-        LutMask64[i] = mask;
-    }
-    __syncthreads();
-
-    uint lut_idx = (tid & (1024-32))*UNROLL/32;
-    uint tidx    = (tid & 31)*2;
-    uint offset  = idx_B*szBatch + idx_H*szHead + idx_q*64 + tidx + LutOffset[lut_idx];
-    X += offset;
-
-    bhalf2 xval[UNROLL];
-    #pragma unroll
-    for (uint i = 0; i < UNROLL; i++)
-    {
-        // nvcc/ptxas is really bad at generating sass that maximizes use of immediate offsets.
-        // This means way more registers are tied up in memory load addresses than are needed.
-        // This kernel's performance is hugely dependent on efficient register use so give the compiler a hand:
-        asm (
-            "{                            \n\t"
-            ".reg .pred p;                \n\t"
-            ".reg .s64 X, offset;         \n\t"
-            "setp.lt.u32 p, %3, %4;       \n\t"
-            "mov.b64 offset, {%2, 0};     \n\t"
-            "add.s64 X, %1, offset;       \n\t"
-            "mov.u32 %0, 0xff80ff80;      \n\t" // bhalf2 -inf, -inf
-            "@p ld.global.nc.u32 %0, [X]; \n\t"
-            "}" :"=r"(xval[i].x) : "l"(X), "r"(i*64*64*2), "r"(lut_idx + i), "r"(lut_size));
-    }
-
-    // split the 64 bit mask by half warp
-    uint tid16 = (tid & 16)/16;
-    uint mask0 = 1 << (tidx - tid16*32);
-    uint mask1 = mask0 << 1;
-
-    #pragma unroll
-    for (int i = 0; i < UNROLL; i++)
-    {
-        uint mask32 = LutMask32[(lut_idx + i)*2 + tid16];
-        if ((mask32 & mask0) == 0)
-            xval[i].x = (xval[i].x & 0xffff0000) | 0x0000ff80; // 0x0000fc00
-        if ((mask32 & mask1) == 0)
-            xval[i].x = (xval[i].x & 0x0000ffff) | 0xff800000;
-    }
-
-    // reduce within thread
-    float Xmax[UNROLL];
-    for (int i = 0; i < UNROLL; i++)
-        Xmax[i] = ew_max(to_float(xval[i]));
-
-    float xmax = Xmax[0];
-    for (int i = 1; i < UNROLL; i++)
-        xmax = fmaxf(Xmax[i], xmax);
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        xmax = fmaxf(xmax, shfl_xor(xmax, i));
-
-    if (blockDim.x > 32)
-    {
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Max[tid/32] = xmax;
-        __syncthreads();
-        if (tid < 32)
-        {
-            // first warp loads all prior reductions
-            xmax = Max[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (uint i = shfl_init; i > 0; i >>= 1)
-                xmax = fmaxf(xmax, shfl_xor(xmax, i));
-            // final reduction to shared
-            Max[tid] = xmax;
-        }
-        __syncthreads();
-        xmax = Max[0];
-    }
-
-    // subtract xmax and compute exponent
-    float exp_sum = 0;
-    for (int i = 0; i < UNROLL; i++)
-    {
-        // use fast approx math: e**x == 2**(x * log2(e))
-        float2 Xval = ew_mul(ew_sub(to_float(xval[i]), xmax), scale);
-        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(Xval.x) :);
-        asm("ex2.approx.ftz.f32 %0, %0;" : "+f"(Xval.y) :);
-        exp_sum += ew_sum(Xval);
-        xval[i] = to_bhalf(Xval);
-    }
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        exp_sum += shfl_xor(exp_sum, i);
-
-    if (blockDim.x > 32)
-    {
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Sum[tid/32] = exp_sum;
-        __syncthreads();
-
-        if (tid < 32)
-        {
-            // first warp loads all prior reductions
-            exp_sum = Sum[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (uint i = shfl_init; i > 0; i >>= 1)
-                exp_sum += shfl_xor(exp_sum, i);
-            // final reduction to shared
-            Sum[tid] = exp_sum;
-        }
-        __syncthreads();
-        exp_sum = Sum[0];
-    }
-    float rcp_exp_sum = exp_sum;
-    asm("rcp.approx.ftz.f32 %0, %0;" : "+f"(rcp_exp_sum) :);
-
-    Y += offset;
-
-    #pragma unroll
-    for (int i = 0; i < UNROLL; i++)
-    {
-        ehalf2 y = to_ehalf(ew_mul(to_float(xval[i]), rcp_exp_sum));
-        asm (
-            "{                            \n\t"
-            ".reg .pred p;                \n\t"
-            ".reg .s64 X, offset;         \n\t"
-            "setp.lt.u32 p, %3, %4;       \n\t"
-            "mov.b64 offset, {%1, 0};     \n\t"
-            "add.s64 X, %0, offset;       \n\t"
-            "@p st.global.wb.u32 [X], %2; \n\t"
-            "}" :: "l"(Y), "r"(i*64*64*2), "r"(y.x), "r"(lut_idx + i), "r"(lut_size));
-    }
-}
-
-
-template <uint UNROLL>
-__global__ void __launch_bounds__(1024,2) blocksparse_masked_softmax_64x64_grad(
-    const uint2* __restrict__ Lut,
-    const ehalf* __restrict__ DY,
-    const ehalf* __restrict__ Y,
-          ehalf*              DX,
-    uint blocks, uint szLut, uint szMask, uint szHead, uint szBatch, float scale, uint shfl_init)
-{
-    __shared__ float Sum[32];
-    uint* LutOffset = (uint*)&Sum[32];
-
-    uint tid   = threadIdx.x;
-    uint idx_Q = blockIdx.x / 64;
-    uint idx_q = blockIdx.x % 64;
-    uint idx_B = blockIdx.y; // batch dim
-    uint idx_H = blockIdx.z; // head dim
-
-    // each head can optionally have its own lut
-    Lut  += idx_H * szLut;
-    uint2 lut_head = Lut[idx_Q];
-
-    if (tid < 32)
-        Sum[tid] = 0.0f;
-
-    // prefetch the lut data into shared
-    uint lut_offset = lut_head.x;
-    uint lut_size   = lut_head.y;
-
-    Lut += lut_offset;
-    #pragma unroll 1
-    for (uint i = tid; i < lut_size; i += blockDim.x)
-        LutOffset[i] = Lut[i].x * 64*64;
-    __syncthreads();
-
-    uint lut_idx = (tid & (1024-32))*UNROLL/32;
-    uint tidx    = (tid & 31)*2;
-    uint offset  = idx_B*szBatch + idx_H*szHead + idx_q*64 + tidx + LutOffset[lut_idx];
-    DY += offset;
-    Y  += offset;
-
-    ehalf2 dy[UNROLL], y[UNROLL];
-    #pragma unroll
-    for (uint i = 0; i < UNROLL; i++)
-    {
-        asm (
-            "{                             \n\t"
-            ".reg .pred p;                 \n\t"
-            ".reg .s64 DY, Y, offset;      \n\t"
-            "setp.lt.u32 p, %5, %6;        \n\t"
-            "mov.b64 offset, {%4, 0};      \n\t"
-            "add.s64 DY, %2, offset;       \n\t"
-            "add.s64 Y,  %3, offset;       \n\t"
-            "mov.u32 %0, 0;                \n\t"
-            "mov.u32 %1, 0;                \n\t"
-            "@p ld.global.nc.u32 %0, [DY]; \n\t"
-            "@p ld.global.nc.u32 %1, [Y];  \n\t"
-            "}" : "=r"(dy[i].x), "=r"(y[i].x) : "l"(DY), "l"(Y), "r"(i*64*64*2), "r"(lut_idx + i), "r"(lut_size));
-    }
-
-    // compute dy * y and start reduction
-    float sum_dyy = 0.0f;
-    for (int i = 0; i < UNROLL; i++)
-        sum_dyy += ew_sum(ew_mul(to_float(dy[i]), to_float(y[i])));
-
-    // reduce within warp
-    for (int i = 16; i > 0; i >>= 1)
-        sum_dyy += shfl_xor(sum_dyy, i);
-
-    if (blockDim.x > 32)
-    {
-        // first thread of each warp store to shared
-        if ((tid & 31) == 0)
-            Sum[tid/32] = sum_dyy;
-        __syncthreads();
-
-        if (tid < 32)
-        {
-            // first warp loads all prior reductions
-            sum_dyy = Sum[tid];
-            // reduce within this last warp
-            #pragma unroll 1
-            for (uint i = shfl_init; i > 0; i >>= 1)
-                sum_dyy += shfl_xor(sum_dyy, i);
-            // final reduction to shared
-            Sum[tid] = sum_dyy;
-        }
-        __syncthreads();
-        sum_dyy = Sum[0];
-    }
-    DX += offset;
-
-    #pragma unroll
-    for (uint i = 0; i < UNROLL; i++)
-    {
-        // dx = (dy - sum_dyy) * y * scale
-        ehalf2 dx = to_ehalf(ew_mul(ew_mul(ew_sub(to_float(dy[i]), sum_dyy), to_float(y[i])), scale));
-        asm (
-            "{                             \n\t"
-            ".reg .pred p;                 \n\t"
-            ".reg .s64 DX, offset;         \n\t"
-            "setp.lt.u32 p, %3, %4;        \n\t"
-            "mov.b64 offset, {%1, 0};      \n\t"
-            "add.s64 DX, %0, offset;       \n\t"
-            "@p st.global.wb.u32 [DX], %2; \n\t"
-            "}" :: "l"(DX), "r"(i*64*64*2), "r"(dx.x), "r"(lut_idx + i), "r"(lut_size));
-    }
-}
-
-#define LOG2e 1.4426950408889634f
-typedef unsigned char uchar;
-
-bool BlocksparseMaskedSoftmax(CUstream stream,
-    const uint2* lut,
-    const  char* mask,
-    const bhalf* x,
-          ehalf* y,
-    uint block_size, uint blocks,
-    uint batch_dim,  uint head_dim, uint ctx_blks,
-    uint lut_heads,  uint lut_dim,  uint max_lut,
-    uint mask_heads, float scale)
-{
-    uint szLut   = lut_heads  > 1 ? lut_dim  : 0;
-    uint szMask  = mask_heads > 1 ? blocks * block_size : 0;
-    uint gridQ   = ctx_blks * block_size;
-    uint szHead  = blocks * block_size * block_size;
-    uint szBatch = head_dim * szHead;
-    uint maxK    = max_lut * block_size;
-    //cuMemsetD16Async((CUdeviceptr)c, 0, szBatch*batch_dim, stream);
-
-    // combine scaling with fast e**x compute
-    scale *= LOG2e;
-
-    dim3 grid(gridQ, batch_dim, head_dim);
-
-    if (block_size == 64)
-    {
-        // Unroll factor 8 (ctx_size up to 16K)
-        if (maxK > 1024*8)
-        {
-            uint threads   = 1024;
-            uint shfl_init = 16;
-            uint lut_max   = threads * 8 / 32;
-            uint shared    = lut_max * 12;
-            blocksparse_masked_softmax_64x64<8><<<grid,threads,shared,stream>>>(lut, (const uint64*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, lut_max, mask != NULL);
-        }
-        // Unroll factor of 4 is preferred (keeps these kernels under 32 registers for max occupancy)
-        else if (maxK >= 64*4)
-        {
-            uint threads   = CEIL_DIV(maxK, 64*4) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            uint lut_max   = threads * 4 / 32;
-            uint shared    = lut_max * 12;
-            blocksparse_masked_softmax_64x64<4><<<grid,threads,shared,stream>>>(lut, (const uint64*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, lut_max, mask != NULL);
-        }
-        // Unroll factor 1
-        else
-        {
-            uint threads   = CEIL_DIV(maxK, 64) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            uint lut_max   = threads * 1 / 32;
-            uint shared    = lut_max * 12;
-            blocksparse_masked_softmax_64x64<1><<<grid,threads,shared,stream>>>(lut, (const uint64*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, lut_max, mask != NULL);
-        }
-    }
-    else
-    {
-        uint shared = max_lut*8;
-
-        // Unroll factor 8 (ctx_size up to 8K)
-        if (maxK > 1024*4)
-        {
-            if (block_size == 8)
-                blocksparse_masked_softmax<8, 8, uchar><<<grid,1024,shared,stream>>>(lut, (const  uchar*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, 16, mask != NULL);
-            else if (block_size == 16)
-                blocksparse_masked_softmax<8,16,ushort><<<grid,1024,shared,stream>>>(lut, (const ushort*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, 16, mask != NULL);
-            else
-                blocksparse_masked_softmax<8,32,  uint><<<grid,1024,shared,stream>>>(lut, (const   uint*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, 16, mask != NULL);
-        }
-        // Unroll factor of 4 is preferred
-        else if (maxK > 32*4)
-        {
-            uint threads   = CEIL_DIV(maxK, 32*4) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            if (block_size == 8)
-                blocksparse_masked_softmax<4, 8, uchar><<<grid,threads,shared,stream>>>(lut, (const  uchar*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else if (block_size == 16)
-                blocksparse_masked_softmax<4,16,ushort><<<grid,threads,shared,stream>>>(lut, (const ushort*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else
-                blocksparse_masked_softmax<4,32,  uint><<<grid,threads,shared,stream>>>(lut, (const   uint*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-        }
-        // Unroll factor 1
-        else
-        {
-            uint threads   = CEIL_DIV(maxK, 32) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            if (block_size == 8)
-                blocksparse_masked_softmax<1, 8, uchar><<<grid,threads,shared,stream>>>(lut, (const  uchar*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else if (block_size == 16)
-                blocksparse_masked_softmax<1,16,ushort><<<grid,threads,shared,stream>>>(lut, (const ushort*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else
-                blocksparse_masked_softmax<1,32,  uint><<<grid,threads,shared,stream>>>(lut, (const   uint*)mask, x, y, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-        }
-    }
-    return true;
-}
-
-bool BlocksparseMaskedSoftmaxGrad(CUstream stream,
-    const uint2* lut,
-    const  char* mask,
-    const ehalf* dy,
-    const ehalf* y,
-          ehalf* dx,
-    uint block_size, uint blocks,
-    uint batch_dim,  uint head_dim, uint ctx_blks,
-    uint lut_heads,  uint lut_dim,  uint max_lut,
-    uint mask_heads, float scale)
-{
-    uint szLut   = lut_heads  > 1 ? lut_dim  : 0;
-    uint szMask  = mask_heads > 1 ? blocks * block_size : 0;
-    uint gridQ   = ctx_blks * block_size;
-    uint szHead  = blocks * block_size * block_size;
-    uint szBatch = head_dim * szHead;
-    uint maxK    = max_lut * block_size;
-    //cuMemsetD16Async((CUdeviceptr)c, 0, szBatch*batch_dim, stream);
-
-    dim3 grid(gridQ, batch_dim, head_dim);
-
-    if (block_size == 64)
-    {
-        uint shared = max_lut*4;
-
-        // Unroll factor 8
-        if (maxK > 1024*8)
-        {
-            uint threads   = 1024;
-            uint shfl_init = 16;
-            blocksparse_masked_softmax_64x64_grad<8><<<grid,threads,shared,stream>>>(lut, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init);
-        }
-        // Unroll factor of 4 is preferred
-        else if (maxK >= 64*4)
-        {
-            uint threads   = CEIL_DIV(maxK, 64*4) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            blocksparse_masked_softmax_64x64_grad<4><<<grid,threads,shared,stream>>>(lut, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init);
-        }
-        // Unroll factor 1
-        else
-        {
-            uint threads   = CEIL_DIV(maxK, 64) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            blocksparse_masked_softmax_64x64_grad<1><<<grid,threads,shared,stream>>>(lut, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init);
-        }
-    }
-    else
-    {
-        uint shared  = max_lut*8;
-
-        // Unroll factor 8
-        if (maxK > 1024*4)
-        {
-            if (block_size == 8)
-                blocksparse_masked_softmax_grad<8, 8, uchar><<<grid,1024,shared,stream>>>(lut, (const  uchar*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, 16, mask != NULL);
-            else if (block_size == 16)
-                blocksparse_masked_softmax_grad<8,16,ushort><<<grid,1024,shared,stream>>>(lut, (const ushort*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, 16, mask != NULL);
-            else
-                blocksparse_masked_softmax_grad<8,32,  uint><<<grid,1024,shared,stream>>>(lut, (const   uint*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, 16, mask != NULL);
-        }
-        // Unroll factor of 4 is preferred
-        else if (maxK > 32*4)
-        {
-            uint threads   = CEIL_DIV(maxK, 32*4) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            if (block_size == 8)
-                blocksparse_masked_softmax_grad<4, 8, uchar><<<grid,threads,shared,stream>>>(lut, (const  uchar*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else if (block_size == 16)
-                blocksparse_masked_softmax_grad<4,16,ushort><<<grid,threads,shared,stream>>>(lut, (const ushort*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else
-                blocksparse_masked_softmax_grad<4,32,  uint><<<grid,threads,shared,stream>>>(lut, (const   uint*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-        }
-        // Unroll factor 1
-        else
-        {
-            uint threads   = CEIL_DIV(maxK, 32) * 32;
-            uint shfl_init = THREAD_POW2(threads) / 64;
-            if (block_size == 8)
-                blocksparse_masked_softmax_grad<1, 8, uchar><<<grid,threads,shared,stream>>>(lut, (const  uchar*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else if (block_size == 16)
-                blocksparse_masked_softmax_grad<1,16,ushort><<<grid,threads,shared,stream>>>(lut, (const ushort*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-            else
-                blocksparse_masked_softmax_grad<1,32,  uint><<<grid,threads,shared,stream>>>(lut, (const   uint*)mask, dy, y, dx, blocks, szLut, szMask, szHead, szBatch, scale, shfl_init, mask != NULL);
-        }
-    }
-
-    return true;
-}
 
 #endif // GOOGLE_CUDA

@@ -119,11 +119,11 @@ __global__ void __launch_bounds__(1024) quantization_stats(float* S, const T* X,
         {
             float x = load(add_ptr_u(X, offset));
 
-            // Nans => Zero
+            // Nans => Inf
             asm("{                               \n\t"
                 ".reg .pred is_number;           \n\t"
                 "testp.number.f32 is_number, %0; \n\t"
-                "selp.f32 %0, %0, 0.0, is_number;\n\t"
+                "selp.f32 %0, %0, 0F7f800000, is_number;\n\t"
                 "}" : "+f"(x) :);
 
             // Saturate fp16 infinity values

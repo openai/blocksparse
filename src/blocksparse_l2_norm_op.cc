@@ -32,7 +32,7 @@ Status L2NormalizeShape(InferenceContext* ctx)
 
 REGISTER_OP("L2NormalizeKCTRS")
     .Input("x: TX")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("y: TY")
     .Output("sum_sqr_x: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -46,7 +46,7 @@ l2_normalize for blocksparse convolution with KCTRS filter layout.
 
 REGISTER_OP("L2NormalizeCKTRS")
     .Input("x: TX")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("y: TY")
     .Output("sum_sqr_x: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -63,7 +63,7 @@ l2_normalize for blocksparse convolution with CKTRS filter layout.
 
 REGISTER_OP("L2NormalizeCK")
     .Input("x: TX")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("y: TY")
     .Output("sum_sqr_x: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -102,7 +102,7 @@ class L2NormalizeKCTRSOp : public OpKernel {
              VY*     y_ptr = (VY*)y->flat<TY>().data();
           float* sum_x_ptr = sum_sqr_x->flat<float>().data();
     const    VX*     x_ptr = (const VX*)x.flat<TX>().data();
-    const   int*   lut_ptr = lut.flat<int32>().data();
+    const   int*   lut_ptr = (const int*)lut.flat<int64>().data();
 
     CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
@@ -165,7 +165,7 @@ REGISTER_KERNEL_BUILDER(Name("L2NormalizeCK").Device(DEVICE_GPU).TypeConstraint<
 REGISTER_OP("L2NormalizeGainKCTRS")
     .Input("x: TX")
     .Input("g: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("y: TY")
     .Output("sum_sqr_x: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -180,7 +180,7 @@ l2_normalize for blocksparse convolution with KCTRS filter layout.
 REGISTER_OP("L2NormalizeGainCKTRS")
     .Input("x: TX")
     .Input("g: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("y: TY")
     .Output("sum_sqr_x: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -198,7 +198,7 @@ l2_normalize for blocksparse convolution with CKTRS filter layout.
 REGISTER_OP("L2NormalizeGainCK")
     .Input("x: TX")
     .Input("g: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("y: TY")
     .Output("sum_sqr_x: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -238,7 +238,7 @@ class L2NormalizeGainKCTRSOp : public OpKernel {
           float* sum_x_ptr = sum_sqr_x->flat<float>().data();
     const    VX*     x_ptr = (const VX*)x.flat<TX>().data();
     const float*     g_ptr = g.flat<float>().data();
-    const   int*   lut_ptr = lut.flat<int32>().data();
+    const   int*   lut_ptr = (const int*)lut.flat<int64>().data();
 
     CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
 
@@ -315,7 +315,7 @@ REGISTER_OP("L2NormalizeGradKCTRS")
     .Input("grad_y: TY")
     .Input("x: TX")
     .Input("sum_sqr_x: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("grad_x: TX")
     .Attr("TX: {half, float, bfloat16}")
     .Attr("TY: {half, float, bfloat16}")
@@ -330,7 +330,7 @@ REGISTER_OP("L2NormalizeGradCKTRS")
     .Input("grad_y: TY")
     .Input("x: TX")
     .Input("sum_sqr_x: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("grad_x: TX")
     .Attr("TX: {half, float, bfloat16}")
     .Attr("TY: {half, float, bfloat16}")
@@ -348,7 +348,7 @@ REGISTER_OP("L2NormalizeGradCK")
     .Input("grad_y: TY")
     .Input("x: TX")
     .Input("sum_sqr_x: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("grad_x: TX")
     .Attr("TX: {half, float, bfloat16}")
     .Attr("TY: {half, float, bfloat16}")
@@ -382,7 +382,7 @@ class L2NormalizeGradKCTRSOp : public OpKernel {
     const    VY* grad_y_ptr = (const VY*)grad_y.flat<TY>().data();
     const    VX*      x_ptr = (const VX*)x.flat<TX>().data();
     const float*  sum_x_ptr = sum_x.flat<float>().data();
-    const   int*    lut_ptr = lut.flat<int32>().data();
+    const   int*    lut_ptr = (const int*)lut.flat<int64>().data();
              VX* grad_x_ptr = (VX*)grad_x->flat<TX>().data();
 
     CUstream stream = ((CUDAStream*)ctx->op_device_context()->stream()->implementation())->cuda_stream();
@@ -454,7 +454,7 @@ REGISTER_OP("L2NormalizeGainGradKCTRS")
     .Input("x: TX")
     .Input("g: float")
     .Input("sum_sqr_x: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("grad_x: TX")
     .Output("grad_g: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -471,7 +471,7 @@ REGISTER_OP("L2NormalizeGainGradCKTRS")
     .Input("x: TX")
     .Input("g: float")
     .Input("sum_sqr_x: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("grad_x: TX")
     .Output("grad_g: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -491,7 +491,7 @@ REGISTER_OP("L2NormalizeGainGradCK")
     .Input("x: TX")
     .Input("g: float")
     .Input("sum_sqr_x: float")
-    .Input("lut: int32")
+    .Input("lut: int64")
     .Output("grad_x: TX")
     .Output("grad_g: float")
     .Attr("TX: {half, float, bfloat16}")
@@ -530,7 +530,7 @@ class L2NormalizeGainGradKCTRSOp : public OpKernel {
     const    VX*      x_ptr = (const VX*)x.flat<TX>().data();
     const float*      g_ptr = g.flat<float>().data();
     const float*  sum_x_ptr = sum_x.flat<float>().data();
-    const   int*    lut_ptr = lut.flat<int32>().data();
+    const   int*    lut_ptr = (const int*)lut.flat<int64>().data();
              VX* grad_x_ptr = (VX*)grad_x->flat<TX>().data();
           float* grad_g_ptr = grad_g->flat<float>().data();
 

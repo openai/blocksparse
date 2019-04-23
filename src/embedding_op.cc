@@ -29,15 +29,20 @@ REGISTER_OP("EmbeddingLookup")
 
       ShapeHandle emb = ctx->input(0);
       ShapeHandle idx = ctx->input(1);
+      if (ctx->RankKnown(emb) && ctx->RankKnown(idx))
+      {
+        int rank = ctx->Rank(idx);
 
-      int rank = ctx->Rank(idx);
-      std::vector<DimensionHandle> dims;
-      dims.reserve(rank+1);
-      for (int i = 0; i < rank; ++i)
-          dims.emplace_back(ctx->Dim(idx, i));
-      dims.emplace_back(ctx->Dim(emb, 1));
+        std::vector<DimensionHandle> dims;
+        dims.reserve(rank+1);
+        for (int i = 0; i < rank; ++i)
+            dims.emplace_back(ctx->Dim(idx, i));
+        dims.emplace_back(ctx->Dim(emb, 1));
 
-      ctx->set_output(0, ctx->MakeShape(dims));
+        ctx->set_output(0, ctx->MakeShape(dims));
+      }
+      else
+        ctx->set_output(0, ctx->UnknownShape());
       return Status::OK();
     })
     .Doc(R"doc(
@@ -123,13 +128,19 @@ REGISTER_OP("EmbeddingLookupGrad")
     .Attr("TI: {int32, uint16, uint8}")
     .Attr("sorted: bool = true")
     .Attr("bench: int = 0")
-    .SetShapeFn([](InferenceContext* ctx) {
-
-      DimensionHandle c_dim;
-      TF_RETURN_IF_ERROR(ctx->MakeDimForScalarInput(2, &c_dim));
-
+    .SetShapeFn([](InferenceContext* ctx)
+    {
       ShapeHandle dy = ctx->input(0);
-      ctx->set_output(0, ctx->MakeShape({ c_dim, ctx->Dim(dy, ctx->Rank(dy)-1) }));
+      if (ctx->RankKnown(dy))
+      {
+        DimensionHandle c_dim;
+        TF_RETURN_IF_ERROR(ctx->MakeDimForScalarInput(2, &c_dim));
+
+        ctx->set_output(0, ctx->MakeShape({ c_dim, ctx->Dim(dy, ctx->Rank(dy)-1) }));
+      }
+      else
+        ctx->set_output(0, ctx->UnknownShape());
+
       return Status::OK();
     })
     .Doc(R"doc(

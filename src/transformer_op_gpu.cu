@@ -687,6 +687,69 @@ template bool MaskedSoftmaxGrad<float>(CUstream stream, float* dx, const float* 
 template bool MaskedSoftmaxGrad<ehalf>(CUstream stream, ehalf* dx, const ehalf* dy, const ehalf* y, const float* m, uint D0, uint D1, uint D2, uint D3, uint M1, uint M2, float scale);
 template bool MaskedSoftmaxGrad<bhalf>(CUstream stream, bhalf* dx, const bhalf* dy, const bhalf* y, const float* m, uint D0, uint D1, uint D2, uint D3, uint M1, uint M2, float scale);
 
+template <typename T, typename V4>
+__global__ void __launch_bounds__(256) transpose_64x64_2D(T* B, const T* A, uint dimAY, uint dimAX)
+{
+    __shared__ T Share[16][64*4 + 4];
+
+    uint tx = threadIdx.x;
+    uint ty = threadIdx.y;
+    uint bx = blockIdx.x;
+    uint by = blockIdx.y;
+    uint x  = bx*64 + tx*4;
+    uint y  = by*64 + ty*4;
+
+    uint offsetA = y*dimAX + x;
+
+    // Load 4x4 block from global and store to shared
+    // Dims need to be even multiples of 4
+    if (x < dimAX && y < dimAY)
+        for (uint i = 0; i < 4; ++i)
+            *(V4*)&Share[ty][i*64 + tx*4] = __ldg((const V4*)(A + (offsetA + i*dimAX)));
+
+    __syncthreads();
+
+    // Swap Dims
+    uint dimBX = dimAY;
+    uint dimBY = dimAX;
+    // block ids hold their dimension affinity but threads get remapped though shared memory
+    // We want global writes to be thread contiguous.
+    x = by*64 + tx*4;
+    y = bx*64 + ty*4;
+
+    if (x < dimBX && y < dimBY)
+    {
+        // Load 4x4 block from shared in transposed order (tx <=> ty)
+        V4 vals[4];
+        for (uint i = 0; i < 4; ++i)
+            vals[i] = *(V4*)&Share[tx][i*64 + ty*4];
+
+        // Transpose within 4x4 block in registers
+        V4 trans[4];
+        for (uint i = 0; i < 4; ++i)
+            for (uint j = 0; j < 4; ++j)
+                ((T*)&trans[j])[i] = ((T*)&vals[i])[j];
+
+        uint offsetB = y*dimBX + x;
+
+        // Store transposed 4x4 block to global
+        for (uint i = 0; i < 4; ++i)
+            __stg((V4*)(B + (offsetB + i*dimBX)), trans[i]);
+    }
+}
+template <typename T, typename V4>
+bool Transpose_2D(CUstream stream, T* y, const T* x, uint D0, uint D1)
+{
+    uint gridX = CEIL_DIV(D1, 64);
+    uint gridY = CEIL_DIV(D0, 64);
+
+    transpose_64x64_2D<T,V4><<<dim3(gridX,gridY,1),dim3(16,16,1),0,stream>>>(y, x, D0, D1);
+    return true;
+}
+template bool Transpose_2D<float,float4>(CUstream stream, float* y, const float* x, uint D0, uint D1);
+template bool Transpose_2D<ehalf,ehalf4>(CUstream stream, ehalf* y, const ehalf* x, uint D0, uint D1);
+template bool Transpose_2D<bhalf,bhalf4>(CUstream stream, bhalf* y, const bhalf* x, uint D0, uint D1);
+
 
 // split_heads: (batch, pixel, head, state) -> (batch, head, pixel, state)
 // merge_heads: (batch, head, pixel, state) -> (batch, pixel, head, state)
@@ -766,9 +829,9 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
     uint tid   = threadIdx.x; // feature dim
     uint idx_N = blockIdx.x;  // batch dim
 
-    const uint vsize = sizeof(V)/4;
+    const uint VSIZE = sizeof(V)/4;
 
-    uint k = ((tid & (1024-32))*UNROLL + (tid & 31))*vsize;
+    uint k = ((tid & (1024-32))*UNROLL + (tid & 31))*VSIZE;
     uint offset = idx_N*K + k;
     Logits += offset;
     asm("mov.b64 %0, %0;" : "+l"(Logits) : );
@@ -779,8 +842,8 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
     {
         ew_set(logits[i], 0xfc00fc00); //-inf, -inf
 
-        if (k + i*vsize*32 < K)
-            logits[i] = __ldg((const T*)(Logits + i*vsize*32));
+        if (k + i*VSIZE*32 < K)
+            logits[i] = __ldg((const T*)(Logits + i*VSIZE*32));
     }
 
     // reduce within thread
@@ -821,7 +884,7 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
     T exp_max[UNROLL];
     for (uint i = 0; i < UNROLL; i++)
     {
-        V exp      = ew_exp_approx(ew_sub(to_float(logits[i]), xmax));
+        V exp      = ew_exp(ew_sub(to_float(logits[i]), xmax));
         exp_sum   += ew_sum(exp);
         exp_max[i] = to_ehalf(ew_mul(exp, 32768.0f)); // scale to maximize fp16 bit utilization
         xor1(exp_max[i]); // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
@@ -841,7 +904,7 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
         for (uint i = 16; i > 0; i >>= 1)
             exp_sum += shfl_xor(exp_sum, i);
     }
-    float rcp_exp_sum = ew_rcp_approx(exp_sum) * (1.0f/32768.0f); // undo fp16 scaling
+    float rcp_exp_sum = ew_rcp(exp_sum) * (1.0f/32768.0f); // undo fp16 scaling
 
     uint label = (uint)__ldg(Labels + idx_N);
 
@@ -850,22 +913,22 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
     #pragma unroll
     for (uint i = 0; i < UNROLL; i++)
     {
-        if (k + i*vsize*32 < K)
+        if (k + i*VSIZE*32 < K)
         {
             xor1(exp_max[i]); // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
             V softmax = ew_mul(to_float(exp_max[i]), rcp_exp_sum);
-            V loss    = ew_neg(ew_log_approx(softmax));
+            V loss    = ew_neg(ew_log(ew_maximum(softmax, 1.8189894035458565e-12f))); // cap loss at softmax of 2^-39 (fp16 2^-24 min * 2^-15 scaling)
 
-            for (uint j = 0; j < vsize; j++)
+            for (uint j = 0; j < VSIZE; j++)
             {
-                if (k + i*vsize*32 + j == label)
+                if (k + i*VSIZE*32 + j == label)
                 {
                     Max[0] = ((float*)&loss)[j];
                     ((float*)&softmax)[j] -= 1.0f;
                 }
                 ((float*)&softmax)[j] *= 32768.0f; // scale to maximize fp16 bit utilization
             }
-            __stg((T*)(Grad + i*vsize*32), to_ehalf(softmax));
+            __stg((T*)(Grad + i*VSIZE*32), to_ehalf(softmax));
         }
     }
     __syncthreads();

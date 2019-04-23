@@ -9,9 +9,8 @@ import time
 import numpy as np
 import tensorflow as tf
 from tensorflow.python.framework import ops
+from blocksparse.utils import _op_module, get_entropy
 
-data_files_path = tf.resource_loader.get_data_files_path()
-_op_module = tf.load_op_library(os.path.join(data_files_path, 'blocksparse_ops.so'))
 
 ############################## Quantization #####################################
 
@@ -71,12 +70,6 @@ def get_timestamp():
         log_timestamp = time.strftime('%Y_%m_%d_%H_%M_%S')
     return log_timestamp
 
-# tf Variable of random ints of size (3 * GPU_SMs * 1024)
-# tf doesn't support int32 variables?  Hack with float32 view.
-Entropy = None
-def set_entropy(var):
-    global Entropy
-    Entropy = var
 
 def quantize(x, qspec, b_qspec=None, name=None):
 
@@ -97,8 +90,7 @@ def quantize(x, qspec, b_qspec=None, name=None):
                 log.write("\t".join(quant_headers) + "\n")
             log_init.add(spec.logfile)
 
-    global Entropy
-    e = [Entropy] if qspec.stoch == 2 else []
+    e = [get_entropy()] if qspec.stoch == 2 else []
 
     reuse = tf.get_variable_scope().reuse
 
@@ -132,8 +124,7 @@ def quantize(x, qspec, b_qspec=None, name=None):
 @ops.RegisterGradient("Quantize")
 def quantize_grad(op, dy):
 
-    global Entropy
-    e = [Entropy] if op.get_attr("b_stoch") == 2 else []
+    e = [get_entropy()] if op.get_attr("b_stoch") == 2 else []
     dx = quantize_op(dy, op.inputs[2], op.inputs[1], e,
         ebits      = op.get_attr("b_ebits"),
         fbits      = op.get_attr("b_fbits"),

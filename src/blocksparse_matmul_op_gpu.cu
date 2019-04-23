@@ -959,7 +959,7 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_xprop(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x8_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     TU* U,
     int params8, int N, int loops, float alpha, float beta)
@@ -1180,7 +1180,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x8_updat(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x4_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     TU* U,
     int params8, int N, int loops, float alpha, float beta)
@@ -1393,7 +1393,7 @@ __global__ void __launch_bounds__(32) gemm_blocksparse_08x64x08x4_updat(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     TU* U,
     int params8, int N, int loops, float alpha, float beta)
@@ -1617,7 +1617,7 @@ __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x4_updat(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(64) gemm_blocksparse_16x64x16x8_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     TU* U,
     int params8, int N, int loops, float alpha, float beta)
@@ -2423,7 +2423,7 @@ __global__ void __launch_bounds__(128) gemm_blocksparse_32x64x32x4_xprop(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(256) gemm_blocksparse_32x64x32x8_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     TU* U,
     int params8, int N, int loops, float alpha, float beta)
@@ -2637,7 +2637,7 @@ __global__ void __launch_bounds__(256) gemm_blocksparse_32x64x32x8_updat(
 
 template <typename TX, typename TE, typename TU>
 __global__ void __launch_bounds__(256) gemm_blocksparse_32x64x32x4_updat(
-    struct plist8<TX> X, struct plist8<TE> E,
+    struct Plist<TX,8> X, struct Plist<TE,8> E,
     const  int2* __restrict__ Lut,
     TU* U,
     int params8, int N, int loops, float alpha, float beta)
@@ -2891,117 +2891,105 @@ __global__ void __launch_bounds__(256) gemm_blocksparse_32x64x32x4_updat(
     store(U, u2, offset + 256);
 }
 
-#define GridDim(size, shift) ((size >> shift) + ((size & ((1<<shift)-1)) != 0))
 
-template <bool Fprop, CTYPE3(TX, TW, TY)>
-cudaError_t BsmmXprop_CN(const TX* X, const TW* W, TY* Y, bsmm_params* params)
+template <bool Fprop, CTYPE(T)>
+cudaError_t BsmmXprop_CN(const T* X, const T* W, T* Y, bsmm_params* params)
 {
-    dim3 grid(GridDim(params->N, 6), params->segments, 1);
+    dim3 grid(CEIL_DIV(params->N, 64), params->segments, 1);
 
     const int2* L2 = (const int2*)params->Lut;
-    const  TW2* W2 = (const  TW2*)W;
-    const  TW4* W4 = (const  TW4*)W;
-    const  TX4* X4 = (const  TX4*)X;
-    const  TX8* X8 = (const  TX8*)X;
-           TY2* Y2 = (       TY2*)Y;
-           TY4* Y4 = (       TY4*)Y;
-           TY8* Y8 = (       TY8*)Y;
+    const   T2* W2 = (const   T2*)W;
+    const   T4* W4 = (const   T4*)W;
+    const   T4* X4 = (const   T4*)X;
+    const   T8* X8 = (const   T8*)X;
+            T2* Y2 = (        T2*)Y;
+            T4* Y4 = (        T4*)Y;
+            T8* Y8 = (        T8*)Y;
 
     if (params->locks > 0)
         cuMemsetD32Async((CUdeviceptr)params->Lock, 0, grid.x * params->locks * 2, params->stream);
 
-    if (params->bshift == 3)
+    if (params->bsize == 8)
     {
-        if (sizeof(TW) == 2 && sizeof(TX) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_08x64x08x8_xprop<Fprop,TW2,TX8,TY8><<<grid,32,params->shared,params->stream>>>(L2, W2, X8, Y8, params->Lock, params->locks, params->N>>3);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_08x64x08x8_xprop<Fprop,T2,T8,T8><<<grid,32,params->shared,params->stream>>>(L2, W2, X8, Y8, params->Lock, params->locks, params->N>>3);
         else
-            gemm_blocksparse_08x64x08x4_xprop<Fprop,TW2,TX4,TY2><<<grid,32,params->shared,params->stream>>>(L2, W2, X4, Y2, params->Lock, params->locks, params->N);
+            gemm_blocksparse_08x64x08x4_xprop<Fprop,T2,T4,T2><<<grid,32,params->shared,params->stream>>>(L2, W2, X4, Y2, params->Lock, params->locks, params->N);
     }
-    else if (params->bshift == 4)
+    else if (params->bsize == 16)
     {
-        if (sizeof(TW) == 2 && sizeof(TX) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_16x64x16x8_xprop<Fprop,TW4,TX8,TY8><<<grid,64,params->shared,params->stream>>>(L2, W4, X8, Y8, params->Lock, params->locks, params->N>>3);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_16x64x16x8_xprop<Fprop,T4,T8,T8><<<grid,64,params->shared,params->stream>>>(L2, W4, X8, Y8, params->Lock, params->locks, params->N>>3);
         else
-            gemm_blocksparse_16x64x16x4_xprop<Fprop,TW4,TX4,TY2><<<grid,64,params->shared,params->stream>>>(L2, W4, X4, Y2, params->Lock, params->locks, params->N);
+            gemm_blocksparse_16x64x16x4_xprop<Fprop,T4,T4,T2><<<grid,64,params->shared,params->stream>>>(L2, W4, X4, Y2, params->Lock, params->locks, params->N);
     }
     else
     {
-        if (sizeof(TW) == 2 && sizeof(TX) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_32x64x32x8_xprop<Fprop,TW4,TX8,TY8><<<grid,128,params->shared,params->stream>>>(L2, W4, X8, Y8, params->Lock, params->locks, params->N>>3);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_32x64x32x8_xprop<Fprop,T4,T8,T8><<<grid,128,params->shared,params->stream>>>(L2, W4, X8, Y8, params->Lock, params->locks, params->N>>3);
         else
-            gemm_blocksparse_32x64x32x4_xprop<Fprop,TW4,TX4,TY4><<<grid,128,params->shared,params->stream>>>(L2, W4, X4, Y4, params->Lock, params->locks, params->N>>2);
+            gemm_blocksparse_32x64x32x4_xprop<Fprop,T4,T4,T4><<<grid,128,params->shared,params->stream>>>(L2, W4, X4, Y4, params->Lock, params->locks, params->N>>2);
     }
     return cudaPeekAtLastError();
 }
+template cudaError_t BsmmXprop_CN<true,  VTYPE(float)>(const float* X, const float* W, float* Y, bsmm_params* params);
+template cudaError_t BsmmXprop_CN<true,  VTYPE(ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
+template cudaError_t BsmmXprop_CN<true,  VTYPE(bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
 
-template cudaError_t BsmmXprop_CN<true,  VTYPE3(float,float,float)>(const float* X, const float* W, float* Y, bsmm_params* params);
-template cudaError_t BsmmXprop_CN<true,  VTYPE3(ehalf,ehalf,ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
-template cudaError_t BsmmXprop_CN<true,  VTYPE3(bhalf,bhalf,bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
+template cudaError_t BsmmXprop_CN<false, VTYPE(float)>(const float* X, const float* W, float* Y, bsmm_params* params);
+template cudaError_t BsmmXprop_CN<false, VTYPE(ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
+template cudaError_t BsmmXprop_CN<false, VTYPE(bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
 
-template cudaError_t BsmmXprop_CN<false, VTYPE3(float,float,float)>(const float* X, const float* W, float* Y, bsmm_params* params);
-template cudaError_t BsmmXprop_CN<false, VTYPE3(ehalf,ehalf,ehalf)>(const ehalf* X, const ehalf* W, ehalf* Y, bsmm_params* params);
-template cudaError_t BsmmXprop_CN<false, VTYPE3(bhalf,bhalf,bhalf)>(const bhalf* X, const bhalf* W, bhalf* Y, bsmm_params* params);
 
-// template cudaError_t BsmmXprop_CN<false, VTYPE3(float,ehalf,float)>(const float* X, const ehalf* W, float* Y, bsmm_params* params);
-// template cudaError_t BsmmXprop_CN<false, VTYPE3(float,bhalf,float)>(const float* X, const bhalf* W, float* Y, bsmm_params* params);
-
-template <CTYPE3(TX, TE, TU)>
-cudaError_t BsmmUpdat_CN(const TX* X, const TE* E, TU* U, bsmm_params* params)
+template <CTYPE(T)>
+cudaError_t BsmmUpdat_CN(const T* X, const T* E, T* U, bsmm_params* params)
 {
     dim3 grid(params->blocks, 1, 1);
-    int loops = GridDim(params->N, 6);
+    int loops = CEIL_DIV(params->N, 64);
 
-    struct plist8<TX4>* X4 = (struct plist8<TX4>*)X;
-    struct plist8<TE4>* E4 = (struct plist8<TE4>*)E;
-    struct plist8<TX8>* X8 = (struct plist8<TX8>*)X;
-    struct plist8<TE8>* E8 = (struct plist8<TE8>*)E;
+    struct Plist<T4,8>* X4 = (struct Plist<T4,8>*)X;
+    struct Plist<T4,8>* E4 = (struct Plist<T4,8>*)E;
+    struct Plist<T8,8>* X8 = (struct Plist<T8,8>*)X;
+    struct Plist<T8,8>* E8 = (struct Plist<T8,8>*)E;
 
     const int2* L2 = (const int2*)params->Lut;
-           TU2* U2 = (       TU2*)U;
-           TU4* U4 = (       TU4*)U;
+            T2* U2 = (        T2*)U;
+            T4* U4 = (        T4*)U;
 
-    if (params->bshift == 3)
+    if (params->bsize == 8)
     {
-        if (sizeof(TX) == 2 && sizeof(TE) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_08x64x08x8_updat<TX8,TE8,TU2><<<grid,32,0,params->stream>>>(*X8, *E8, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_08x64x08x8_updat<T8,T8,T2><<<grid,32,0,params->stream>>>(*X8, *E8, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
         else
-            gemm_blocksparse_08x64x08x4_updat<TX4,TE4,TU2><<<grid,32,0,params->stream>>>(*X4, *E4, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
+            gemm_blocksparse_08x64x08x4_updat<T4,T4,T2><<<grid,32,0,params->stream>>>(*X4, *E4, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
     }
-    else if (params->bshift == 4)
+    else if (params->bsize == 16)
     {
-        if (sizeof(TX) == 2 && sizeof(TE) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_16x64x16x8_updat<TX8,TE8,TU4><<<grid,64,0,params->stream>>>(*X8, *E8, L2, U4, params->pcount*8, params->N, loops, params->alpha, params->beta);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_16x64x16x8_updat<T8,T8,T4><<<grid,64,0,params->stream>>>(*X8, *E8, L2, U4, params->pcount*8, params->N, loops, params->alpha, params->beta);
         else
-            gemm_blocksparse_16x64x16x4_updat<TX4,TE4,TU4><<<grid,64,0,params->stream>>>(*X4, *E4, L2, U4, params->pcount*8, params->N, loops, params->alpha, params->beta);
+            gemm_blocksparse_16x64x16x4_updat<T4,T4,T4><<<grid,64,0,params->stream>>>(*X4, *E4, L2, U4, params->pcount*8, params->N, loops, params->alpha, params->beta);
     }
     else
     {
-        if (sizeof(TX) == 2 && sizeof(TE) == 2 && (params->N & 7) == 0)
-            gemm_blocksparse_32x64x32x8_updat<TX8,TE8,TU2><<<grid,256,0,params->stream>>>(*X8, *E8, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
+        if (sizeof(T) == 2 && (params->N & 7) == 0)
+            gemm_blocksparse_32x64x32x8_updat<T8,T8,T2><<<grid,256,0,params->stream>>>(*X8, *E8, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
         else
-            gemm_blocksparse_32x64x32x4_updat<TX4,TE4,TU2><<<grid,256,0,params->stream>>>(*X4, *E4, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
+            gemm_blocksparse_32x64x32x4_updat<T4,T4,T2><<<grid,256,0,params->stream>>>(*X4, *E4, L2, U2, params->pcount*8, params->N, loops, params->alpha, params->beta);
     }
     return cudaPeekAtLastError();
 }
+template cudaError_t BsmmUpdat_CN<VTYPE(float)>(const float* X, const float* E, float* U, bsmm_params* params);
+template cudaError_t BsmmUpdat_CN<VTYPE(ehalf)>(const ehalf* X, const ehalf* E, ehalf* U, bsmm_params* params);
+template cudaError_t BsmmUpdat_CN<VTYPE(bhalf)>(const bhalf* X, const bhalf* E, bhalf* U, bsmm_params* params);
 
 
 
-template cudaError_t BsmmUpdat_CN<VTYPE3(float,float,float)>(const float* X, const float* E, float* U, bsmm_params* params);
-template cudaError_t BsmmUpdat_CN<VTYPE3(ehalf,ehalf,ehalf)>(const ehalf* X, const ehalf* E, ehalf* U, bsmm_params* params);
-template cudaError_t BsmmUpdat_CN<VTYPE3(bhalf,bhalf,bhalf)>(const bhalf* X, const bhalf* E, bhalf* U, bsmm_params* params);
-
-// template cudaError_t BsmmUpdat_CN<VTYPE3(ehalf,ehalf,float)>(const ehalf* X, const ehalf* E, float* U, bsmm_params* params);
-// template cudaError_t BsmmUpdat_CN<VTYPE3(ehalf,float,float)>(const ehalf* X, const float* E, float* U, bsmm_params* params);
-// template cudaError_t BsmmUpdat_CN<VTYPE3(ehalf,float,ehalf)>(const ehalf* X, const float* E, ehalf* U, bsmm_params* params);
-
-// template cudaError_t BsmmUpdat_CN<VTYPE3(bhalf,bhalf,float)>(const bhalf* X, const bhalf* E, float* U, bsmm_params* params);
-// template cudaError_t BsmmUpdat_CN<VTYPE3(bhalf,float,float)>(const bhalf* X, const float* E, float* U, bsmm_params* params);
-// template cudaError_t BsmmUpdat_CN<VTYPE3(bhalf,float,bhalf)>(const bhalf* X, const float* E, bhalf* U, bsmm_params* params);
-
-
-
-__global__ void __launch_bounds__(1024) identity_init_CK(float* W, const int2* __restrict__ lut, int CB, int KB, int bshift)
+template <uint BSIZE, uint THREADS>
+__global__ void __launch_bounds__(THREADS) identity_init_CK(float* W, const int2* __restrict__ lut, int CB, int KB, float scale)
 {
+    const uint U = BSIZE*BSIZE/THREADS;
+
     int tid = threadIdx.x;
     int bid = blockIdx.x;
 
@@ -3009,20 +2997,33 @@ __global__ void __launch_bounds__(1024) identity_init_CK(float* W, const int2* _
 
     int cb = entry.x;
     int kb = entry.y;
-    int c  = tid >> bshift;
-    int k  = tid & ((1 << bshift) - 1);
 
-    float init = 0.0f;
-    if (c == k && (cb % KB) == (kb % CB))
-        init = 1.0f;
+    #pragma unroll
+    for (int u = 0; u < U; u++)
+    {
+        int i = u*THREADS + tid;
 
-    W[(bid<<(bshift + bshift)) + tid] = init;
+        int c  = i / BSIZE;
+        int k  = i % BSIZE;
+
+        float init = 0.0f;
+        if (c == k && (cb % KB) == (kb % CB))
+            init = scale;
+
+        W[bid*BSIZE*BSIZE + i] = init;
+    }
 }
 
-bool IdentityInitCK(CUstream stream, float* W, const int* lut, int CB, int KB, int blocks, int bshift)
+bool IdentityInitCK(CUstream stream, float* W, const int* lut, int CB, int KB, int blocks, int bsize, float scale)
 {
-    int threads = 1 << (bshift + bshift);
-    identity_init_CK<<<blocks, threads, 0, stream>>>(W, (const int2*)lut, CB, KB, bshift);
+         if (bsize ==  8)
+        identity_init_CK< 8,  32><<<blocks,  32, 0, stream>>>(W, (const int2*)lut, CB, KB, scale);
+    else if (bsize == 16)
+        identity_init_CK<16,  64><<<blocks,  64, 0, stream>>>(W, (const int2*)lut, CB, KB, scale);
+    else if (bsize == 32)
+        identity_init_CK<32, 256><<<blocks, 256, 0, stream>>>(W, (const int2*)lut, CB, KB, scale);
+    else if (bsize == 64)
+        identity_init_CK<64,1024><<<blocks,1024, 0, stream>>>(W, (const int2*)lut, CB, KB, scale);
     return true; // TODO
 }
 
