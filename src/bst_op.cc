@@ -165,7 +165,6 @@ class BlocksparseTransformerOp : public OpKernel {
     if (major_ == 0)
     {
       GetCountSMsVersion(&major_, NULL);
-      OP_REQUIRES(ctx, major_ >= 7, errors::InvalidArgument("Tensorcore GPU required"));
       if (bench_)
       {
         const char* op; // =  ? "NT" : OP == NN_OP ? "NN" : "TN";
