@@ -21,12 +21,12 @@ def layernorm(x, scope, epsilon=1e-5, relu=False):
     """
     n_state = x.shape[-1].value
     with tf.variable_scope(scope):
-        gain = tf.get_variable('gain', [n_state], initializer=tf.constant_initializer(1.0))
-        bias = tf.get_variable('bias', [n_state], initializer=tf.constant_initializer(0.0))
+        gain = tf.get_variable('g', [n_state], initializer=tf.constant_initializer(1.0))
+        bias = tf.get_variable('b', [n_state], initializer=tf.constant_initializer(0.0))
         return bs.layer_norm(x, gain, bias, axis=-1, epsilon=epsilon, relu=relu)
 
 
-def conv1d(x, scope, nf, relu=False):
+def conv1d(x, scope, nf, relu=False, fast_gelu=False):
     with tf.variable_scope(scope):
         nx    = x.shape[-1].value
         ndims = x.shape.ndims
@@ -34,13 +34,18 @@ def conv1d(x, scope, nf, relu=False):
         w = tf.get_variable("w", [nx, nf], initializer=tf.random_normal_initializer(stddev=0.02))
         b = tf.get_variable("b", [    nf], initializer=tf.constant_initializer(0.0))
 
+        if hps.float16:
+            # by setting dx_dtype to float16 we prevent useless casting in the backwards pass
+            # our all-reduce and fused optimizers can accept fp16 natively.
+            w = bs.float_cast(w, dtype=tf.float16, dx_dtype=tf.float16)
+
         # merge context and batch dims for more efficient matmul
         if ndims > 2:
             y_shape = tf.concat([tf.shape(x)[: ndims - 1], [nf]], axis=0)
             x = tf.reshape(x, [-1, nx])
 
         # avoid atomics in bias grad, but be careful as tf handles temp memory badly in the presense of async ops like all-reduce
-        y = bs.bias_relu(tf.matmul(x, fp16(w)), b, relu=relu, atomics=False)
+        y = bs.bias_relu(tf.matmul(x, w), b, relu=relu, fast_gelu=fast_gelu, atomics=False)
 
         if ndims > 2:
             y = tf.reshape(y, y_shape)
@@ -64,10 +69,11 @@ def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
     return mask
 
 # Coarse sparse structure
-# Only layout==1 blocks are computed and materialized in memory
-# Block sizes of 8, 16, 32 and 64 are supported (64 being most appropriate for dense attention)
-def get_blocksparse_attention_ops(n_timesteps, n_heads):
-    blocksize = 64
+# Only layout[q,k] == 1 blocks are computed and materialized in memory
+# Block sizes of 8, 16, 32 and 64 are supported on volta fp16 tensorcores (64 being most appropriate for dense attention)
+# Only blocoksize 32 currently supported in fp32 on on other gpus.
+def get_blocksparse_transformer(n_timesteps, n_heads):
+    blocksize = 64 if hps.float16 else 32
     n_time_blocks = n_timesteps // blocksize
     layout = np.ones([n_time_blocks, n_time_blocks], dtype=np.bool)
     # No query blocks may attend to key blocks in the future.
@@ -78,67 +84,64 @@ def get_blocksparse_attention_ops(n_timesteps, n_heads):
     bst = bs.BlocksparseTransformer(layout, block_size=blocksize, mask_callback=causal_subblock_mask, heads=n_heads)
     return bst
 
-
-def fp16(x):
-    # no need to cast the gradients back to fp32 as the all-reduce and optimizers handle fp16/fp32 mixed precision
-    return bs.float_cast(x, dtype=tf.float16, dx_dtype=tf.float16)
-
-
-def fp32(x):
-    return bs.float_cast(x, dtype=tf.float32)
-
-
-def attention(x, scope, n_head, n_timesteps):
-    """
-    perform multi-head qkv dot-product attention and linear project result
-    """
-    n_state = x.shape[-1].value
-    with tf.variable_scope(scope):
-        queries = conv1d(x, 'q', n_state)
-        keys    = conv1d(x, 'k', n_state)
-        values  = conv1d(x, 'v', n_state)
-        # note that split/merge heads is fused into attention ops (no resahpe/transpose needed)
-
-        bst = get_blocksparse_attention_ops(n_timesteps, n_head)
-        attention_energies = bst.query_key_op(queries, keys)
-        attention_weights  = bst.masked_softmax(attention_energies, scale=tf.rsqrt(n_state / n_head))
-        weighted_values    = bst.weight_value_op(attention_weights, values)
-
-        result = conv1d(weighted_values, 'proj', n_state)
-        return result
-
-
-def mlp(x, scope, ratio=4):
-    """
-    2 layer relu residual mlp with wider first layer
-    """
-    n_state = x.shape[-1].value
-    with tf.variable_scope(scope):
-        hidden   = conv1d(x,        'hidden', n_state * ratio, relu=True)  # relu fc layer
-        residual = conv1d(hidden, 'residual', n_state)  # project back to state size
-        return x + residual
-
-
-def transformer_block(x, scope, n_head, n_timesteps):
+# very simple to use recompute decorator.  Be sure to pair with bs.gradients() for it to work
+@bs.recomputable
+def transformer_block(x, scope, train=False):
     """
     core component of transformer
     performs attention + residual mlp + layer normalization
     """
+    n_state = x.shape[-1].value
+
     with tf.variable_scope(scope):
-        a = attention(x, 'attention', n_head, n_timesteps)
-        a = layernorm(a + x, 'norm_a')
-        m = mlp(a, 'mlp')
-        m = layernorm(m + a, 'norm_m')
-        return m
+
+        h = layernorm(x, "norm_a")
+
+        q = conv1d(h, 'proj_q', n_state)
+        k = conv1d(h, 'proj_k', n_state)
+        v = conv1d(h, 'proj_v', n_state)
+
+        bst = hps.bst_cache.get(scope)
+        if bst is None:
+            bst = get_blocksparse_transformer(hps.n_timesteps, hps.n_head)
+            hps.bst_cache[scope] = bst
+
+        w = bst.query_key_op(q, k)
+        w = bst.masked_softmax(w, scale=1.0/np.sqrt(n_state / hps.n_head))
+        a = bst.weight_value_op(w, v)
+
+        a = conv1d(a, 'proj_a', n_state)
+
+        if train and hps.resid_pdrop > 0.0:
+            # preserve the dropout mask through recompute
+            key = scope + "_dropout_a"
+            a, hps.dropout_cache[key] = bs.dropout(a, keep_prob=1.0 - hps.resid_pdrop, mask=hps.dropout_cache.get(key))
+
+        x = bs.add(x, a)
+
+        m = layernorm(x, "norm_m")
+
+        m = conv1d(m, 'proj_m1', n_state * hps.mlp_ratio, fast_gelu=True)
+        m = conv1d(m, 'proj_m2', n_state)
+
+        if train and hps.resid_pdrop > 0.0:
+            # preserve the dropout mask through recompute
+            key = scope + "_dropout_m"
+            m, hps.dropout_cache[key] = bs.dropout(m, keep_prob=1.0 - hps.resid_pdrop, mask=hps.dropout_cache.get(key))
+
+        return bs.add(x, m)
 
 
-def model(xs, ys, cost_scale, grad_scale):
+def model(xs, ys, loss_scale=None, train=False):
 
-    with tf.variable_scope("model"):
+    with tf.variable_scope("model", reuse=not train):
 
         with tf.device("/cpu:0"):
-            global_step   = tf.Variable(1.0, trainable=False)
-            learning_rate = tf.minimum(global_step * tf.constant(1.0/hps.warmup_iters), tf.constant(1.0)) * tf.constant(hps.lr)
+            if train:
+                grad_scale    = tf.reciprocal(loss_scale) if hps.float16 else 1.0
+                global_step   = tf.Variable(1.0, trainable=False)
+                learning_rate = tf.minimum(global_step * (1.0/hps.warmup_iters), 1.0) * hps.lr
+            mpi_scale = tf.constant(1.0 / mpi_size)
 
         with tf.device("/gpu:0"):
 
@@ -150,14 +153,25 @@ def model(xs, ys, cost_scale, grad_scale):
 
             # embed discrete inputs to continous space and add learned position embeddings
             with tf.variable_scope('embed'):
-                x_embed   = fp16(tf.get_variable("x",   [   hps.n_vocab,     hps.n_state], initializer=tf.random_normal_initializer(stddev=0.02)))
-                pos_embed = fp16(tf.get_variable('pos', [1, hps.n_timesteps, hps.n_state], initializer=tf.random_normal_initializer(stddev=0.01)))
-                h = bs.embedding_lookup(x_embed, xs) + pos_embed
+                x_embed = tf.get_variable("x",   [   hps.n_vocab,     hps.n_state], initializer=tf.random_normal_initializer(stddev=0.02))
+                p_embed = tf.get_variable('pos', [1, hps.n_timesteps, hps.n_state], initializer=tf.random_normal_initializer(stddev=0.01))
+
+                if hps.float16:
+                    x_embed = bs.float_cast(x_embed, dtype=tf.float16, dx_dtype=tf.float16)
+                    p_embed = bs.float_cast(p_embed, dtype=tf.float16, dx_dtype=tf.float16)
+
+                x = bs.embedding_lookup(x_embed, xs)
+
+                if train and hps.embed_pdrop > 0.0:
+                    x,       _ = bs.dropout(x,       keep_prob=1.0 - hps.embed_pdrop)
+                    p_embed, _ = bs.dropout(p_embed, keep_prob=1.0 - hps.embed_pdrop)
+
+                h = x + p_embed
                 grad_groups.insert(0, 'embed')
 
             for l in range(hps.n_layer):
                 layer_name = 'layer_%d' % l
-                h = transformer_block(h, layer_name, hps.n_head, hps.n_timesteps)
+                h = transformer_block(h, layer_name, train=train, recompute=train and hps.recompute)
                 grad_groups.insert(0, layer_name)
 
             #average pool transformer features and apply linear classifier
@@ -165,53 +179,65 @@ def model(xs, ys, cost_scale, grad_scale):
                 h = tf.reshape(h, [-1, hps.n_state])
                 logits = tf.matmul(h, x_embed, transpose_b=True)
 
+            if hps.float16:
+                # much faster and more memory efficient (but currently only implemented in fp16)
+                loss   = bs.softmax_cross_entropy(logits=logits, labels=ys)
+            else:
+                labels = tf.cast(tf.reshape(ys, [-1]), tf.int32)
+                loss   = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=labels)
 
-            # labels = tf.reshape(ys, [-1])
-            # loss   = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=fp32(logits), labels=tf.cast(labels, tf.int32))
-            loss   = bs.softmax_cross_entropy(logits=logits, labels=ys)
-            loss   = tf.reduce_mean(loss)
+            loss = tf.reduce_mean(loss)
 
-            params = tf.trainable_variables()
-            # use bs.scale_tensor so we can keep the cost_scale a host side placeholder
-            grads  = tf.gradients(bs.scale_tensor(loss, cost_scale), params)
+            if train:
 
-            if mpi_size > 1:
-                loss = bs.allreduce(loss) * tf.constant(1.0 / mpi_size)
-
-                bs.group_allreduce(grads, params, search_strings=grad_groups)
-
-            global_norm, norm_scale = bs.clip_by_global_norm(grads, grad_scale=grad_scale, clip_norm=hps.clip_norm)
-
-            # for tuning fp16 cost scaling
-            if hps.log_stats and mpi_rank == 0:
-                for i, (grad, param) in enumerate(zip(grads, params)):
-                    name = param.op.name + "_" + "_".join(str(x) for x in param.shape.as_list())
-                    grads[i] = bs.log_stats(grad, tf.cast(global_step, tf.int32), logfile="scale_stats.txt", name=name)
-
-
-            # use adafactor for most params and adam for embeddings
-            fact_grads = list()
-            adam_grads = list()
-            for grad, param in zip(grads, params):
-                if "embed" in param.op.name:
-                    # for input embedding, only update param + running stats when embedding vector was selected by input
-                    # more stable learning for rarely used embedding entries
-                    # Note that we use the x_embed as the output logits projection, so there's little value to using lazy here.
-                    # if "x" in param.op.name:
-                    #     grad.lazy = True
-                    adam_grads.append( (grad, param) )
+                # apply loss scaling in fp16 mode
+                if hps.float16:
+                    grad_loss = bs.scale_tensor(loss, loss_scale)
                 else:
-                    fact_grads.append( (grad, param) )
+                    grad_loss = loss
 
-            fact = bs.AdafactorOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale)
-            adam = bs.AdamOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale, fp16=True)
-            train_op = tf.group(fact.apply_gradients(fact_grads), adam.apply_gradients(adam_grads))
+                # use bs.gradients to allow bs.recomputable decorators to work
+                params = tf.trainable_variables()
+                grads  = bs.gradients(grad_loss, params)
 
-        # update global step after we're done using it for this update
-        with tf.control_dependencies([ train_op ]), tf.device("/cpu:0"):
-            update_op = tf.assign_add(global_step, 1.0)
+                if mpi_size > 1:
+                    # apply (1.0 / mpi_size) scaling prior to all_reduce to allow greater utilization of fp16 dynamic range.
+                    # That is we're ok with flushing some small values to zero to allow growth of large values in allreduce (without hitting inf).
+                    loss  = bs.scale_tensor(loss, mpi_scale)
+                    grads = [bs.scale_tensor(g, mpi_scale) for g in grads]
 
-        return loss, tf.group(train_op, update_op), global_norm, norm_scale
+                    # allreduce in an mpi context
+                    # bias and gain grads will in in fp32, but have them fp16 cast prior to allreduce
+                    cast_all = tf.float16 if H.float16 else None
+                    loss  = bs.allreduce(loss)
+                    grads = bs.group_allreduce(grads, params, search_strings=grad_groups, cast_all=cast_all)
+
+                # This does not actually perform the clippiing, only measures the norm_scale needed to be applied.
+                # norm_scale is then later applied in the fused optimizer ops (eliminating an extra pass over the gradients).
+                # norm_scale is also used to detect inf/nan values in any of the gradients so the whole update can be skipped
+                # and tried again with a new loss_scale.
+                global_norm, norm_scale = bs.clip_by_global_norm(grads, grad_scale=grad_scale, clip_norm=hps.clip_norm)
+
+                # Apply AdamOptimizer:
+                # fp16 mode is a special feature to store running mean and variance variables in custom fp16 formats.
+                # Using this mode should incure no loss in accuracy and save a lot of memory in your model.
+                # For futher memory savings consider using bs.AdafactorOptimizer.
+                adam = bs.AdamOptimizer(learning_rate=learning_rate, norm_scale=norm_scale, grad_scale=grad_scale, fp16=hps.float16)
+
+                train_op = adam.apply_gradients(zip(grads, params))
+
+                # update global step after we're done using it for this update
+                with tf.control_dependencies([ train_op ]), tf.device("/cpu:0"):
+                    update_op = tf.assign_add(global_step, 1.0)
+
+                return loss, tf.group(train_op, update_op), global_norm, norm_scale
+
+            else:
+                if mpi_size > 1:
+                    loss = bs.allreduce(bs.scale_tensor(loss, mpi_scale))
+
+                return loss
+
 
 
 def enwik8(path, n_train=int(90e6), n_valid=int(5e6), n_test=int(5e6)):
@@ -247,27 +273,33 @@ def print_rank0(*args):
 
 if __name__ == '__main__':
 
-    np.random.seed(0)
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--n_epochs',          type=int,   default=100)
-    parser.add_argument('--n_batch',           type=int,   default=32)
-    parser.add_argument('--n_state',           type=int,   default=512)
-    parser.add_argument('--n_head',            type=int,   default=4)
-    parser.add_argument('--n_layer',           type=int,   default=6)
-    parser.add_argument('--n_timesteps',       type=int,   default=320)
-    parser.add_argument('--n_vocab',           type=int,   default=256)
-    parser.add_argument('--lr',                type=float, default=0.0005)
-    parser.add_argument('--cost_scale',        type=float, default=2.0**16)
-    parser.add_argument('--cost_count',        type=int,   default=2000)
-    parser.add_argument('--clip_norm',         type=float, default=1.0)
-    parser.add_argument('--warmup_iters',      type=int,   default=1000)
-    parser.add_argument('--enwik8_path',       type=str,   default='/home/scott/datasets/enwik8')
-    parser.add_argument('--log_every_n_iters', type=int,   default=200)
-    parser.add_argument('--profile',           type=int,   default=0)
-    parser.add_argument('--log_stats',         type=int,   default=0)
+    parser.add_argument('--n_epochs',     type=int,   default=100)
+    parser.add_argument('--n_batch',      type=int,   default=32)
+    parser.add_argument('--n_state',      type=int,   default=512)
+    parser.add_argument('--n_head',       type=int,   default=4)
+    parser.add_argument('--n_layer',      type=int,   default=6)
+    parser.add_argument('--n_timesteps',  type=int,   default=320)
+    parser.add_argument('--n_vocab',      type=int,   default=256)
+    parser.add_argument('--mlp_ratio',    type=int,   default=4)
+    parser.add_argument('--lr',           type=float, default=0.0005)
+    parser.add_argument('--resid_pdrop',  type=float, default=0.05)
+    parser.add_argument('--embed_pdrop',  type=float, default=0.05)
+    parser.add_argument('--clip_norm',    type=float, default=1.0)
+    parser.add_argument('--loss_scale',   type=float, default=2.0**16)
+    parser.add_argument('--loss_count',   type=int,   default=1000)
+    parser.add_argument('--warmup_iters', type=int,   default=1000)
+    parser.add_argument('--enwik8_path',  type=str,   default='/home/scott/datasets/enwik8') # obviously change to your local path
+    parser.add_argument('--log_interval', type=int,   default=200)
+    parser.add_argument('--profile',      type=int,   default=3) # exit early for nvprof profiling
+    parser.add_argument('--float16',      type=int,   default=0) # only sm >= 7.0 (tensorcores)
+    parser.add_argument('--recompute',    type=int,   default=0) # allow use of large contexts and/or lots of layers/params
 
     hps = parser.parse_args()
+
+    hps.dropout_cache = dict()
+    hps.bst_cache = dict()
 
     comm = MPI.COMM_WORLD
     mpi_size = comm.Get_size()
@@ -282,16 +314,25 @@ if __name__ == '__main__':
         X = tf.placeholder(tf.uint8, shape=[hps.n_batch, hps.n_timesteps])
         Y = tf.placeholder(tf.uint8, shape=[hps.n_batch, hps.n_timesteps])
 
-    # cost_scale and grad_scale are host side scalars
+    # loss_scale and grad_scale are host side scalars
     with tf.device("/cpu:0"):
-        cost_scale = tf.placeholder(tf.float32, shape=[])
-        grad_scale = tf.constant(1.0) / (cost_scale * tf.constant(float(mpi_size)))
+        loss_scale = tf.placeholder(tf.float32, shape=[])
 
-    # initialize the cost_scale placeholder value
-    cur_cost_scale = hps.cost_scale
-    cost_count = 0
+    # needed for bs.dropout()
+    np.random.seed(mpi_rank)
+    bs.set_entropy()
 
-    loss, train_op, gn, ns = model(X, Y, cost_scale, grad_scale)
+    # initialize the loss_scale placeholder value
+    cur_loss_scale = hps.loss_scale
+    loss_count = 0
+
+    train_loss, train_op, gn, ns = model(X, Y, loss_scale, train=True)
+    valid_loss = model(X, Y)
+
+    # Free up some python memory
+    hps.bst_cache     = None
+    hps.dropout_cache = None
+    bs.clear_bst_constants()
 
     config = tf.ConfigProto()
     config.gpu_options.visible_device_list = str(mpi_rank)
@@ -302,6 +343,7 @@ if __name__ == '__main__':
 
         sess.run(tf.global_variables_initializer())
         if mpi_size > 1:
+            # sync variables initialized on rank 0 to all other ranks
             sess.run(bs.sync_variables_op(mpi_rank))
 
         for i in range(hps.n_epochs):
@@ -311,25 +353,28 @@ if __name__ == '__main__':
                 retry = True
                 while retry:
 
-                    cost, global_norm, norm_scale, _ = sess.run([loss, gn, ns, train_op], {X: x, Y: y, cost_scale: cur_cost_scale})
+                    loss, global_norm, norm_scale, _ = sess.run([train_loss, gn, ns, train_op], feed_dict={X: x, Y: y, loss_scale: cur_loss_scale})
 
-                    # slowly increase cost scale but quickly drop it when inf or nan is detected in the gradients
-                    # norm_scale will be zero when this happens
-                    if norm_scale == 0.0:
-                        cur_cost_scale *= 0.5
-                        cost_count      = 0
-                        print_rank0("fp16 saturation detected (%f), changing cost_scale to: 2^%.0f" % (global_norm, np.log2(cur_cost_scale)))
+                    if hps.float16:
+                        # slowly increase loss scale but quickly drop it when inf or nan is detected in the gradients
+                        # norm_scale will be zero when this happens
+                        if norm_scale == 0.0:
+                            cur_loss_scale *= 0.5
+                            loss_count      = 0
+                            print_rank0("fp16 saturation detected (%f), changing loss_scale to: 2^%.0f" % (global_norm, np.log2(cur_loss_scale)))
+                        else:
+                            retry = False
+                            if loss_count >= hps.loss_count:
+                                cur_loss_scale *= 2.0
+                                loss_count      = 0
+                                print_rank0("No fp16 saturation detected after %d iterations, changing loss_scale to: 2^%.0f" % (hps.loss_count, np.log2(cur_loss_scale)))
+                            else:
+                                loss_count += 1
                     else:
                         retry = False
-                        if cost_count >= hps.cost_count:
-                            cur_cost_scale *= 2.0
-                            cost_count      = 0
-                            print_rank0("No fp16 saturation detected after %d iterations, changing cost_scale to: 2^%.0f" % (hps.cost_count, np.log2(cur_cost_scale)))
-                        else:
-                            cost_count += 1
 
-                if iteration % hps.log_every_n_iters == 0:
-                    print_rank0('train iteration: %7d, loss: %.5f, bits per byte: %.5f ns:%.5f gn:%.5f' % (iteration, cost, cost/np.log(2), norm_scale, global_norm))
+                if iteration % hps.log_interval == 0:
+                    print_rank0('train iteration: %7d, loss: %.5f, bits per byte: %.5f ns:%.5f gn:%.5f' % (iteration, loss, loss/np.log(2), norm_scale, global_norm))
                 iteration += 1
 
                 if hps.profile and iteration >= hps.profile:
@@ -340,7 +385,7 @@ if __name__ == '__main__':
             valid_losses = []
             for x, y in iter_data(validX, hps.n_timesteps, hps.n_batch, mpi_rank, mpi_size):
 
-                valid_losses.append(sess.run(loss, {X: x, Y: y, cost_scale: cur_cost_scale}))
+                valid_losses.append(sess.run(valid_loss, feed_dict={X: x, Y: y}))
 
             avg_valid = sum(valid_losses) / len(valid_losses)
             print_rank0('Average validation loss: %.5f, bits per byte: %.5f' % (avg_valid, avg_valid/np.log(2)))
@@ -350,7 +395,7 @@ if __name__ == '__main__':
         test_losses = []
         for x, y in iter_data(testX, hps.n_timesteps, hps.n_batch, mpi_rank, mpi_size):
 
-            test_losses.append(sess.run(loss, {X: x, Y: y, cost_scale: cur_cost_scale}))
+            test_losses.append(sess.run(valid_loss, feed_dict={X: x, Y: y}))
 
         avg_test = sum(test_losses) / len(test_losses)
         print_rank0('Average test loss: %.5f, bits per byte: %.5f' % (avg_test, avg_test/np.log(2)))
