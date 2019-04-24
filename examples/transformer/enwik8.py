@@ -36,9 +36,13 @@ def conv1d(x, scope, nf, std=0.02, relu=False, fast_gelu=False):
         b = tf.get_variable("b", [    nf], initializer=tf.constant_initializer(0.0))
 
         if hps.float16:
-            # By setting dx_dtype to float16 we prevent useless casting back to fp32 in the backwards pass.
-            # Our all-reduce and fused optimizers can accept fp16 natively.
-            w = bs.float_cast(w, dtype=tf.float16, dx_dtype=tf.float16)
+            # We delay weight casting till just before use to minimize memory footprint.
+            # In recompute mode these casts are released just after use on forward pass,
+            # then remade on the recompute pass.
+            with tf.control_dependencies([x.op]):
+                # By setting dx_dtype to float16 we prevent useless casting back to fp32 in the backwards pass.
+                # Our all-reduce and fused optimizers can accept fp16 natively.
+                w = bs.float_cast(w, dtype=tf.float16, dx_dtype=tf.float16)
 
         # merge context and batch dims for more efficient matmul
         if ndims > 2:
@@ -221,7 +225,7 @@ def model(xs, ys, loss_scale=None, train=False):
                     grads = [bs.scale_tensor(g, mpi_scale) for g in grads]
 
                     # allreduce in an mpi context
-                    # bias, gain and x_embed grads will in in fp32, but have them fp16 cast prior to allreduce
+                    # bias and gain grads will be in fp32, but have them fp16 cast prior to allreduce
                     cast_all = tf.float16 if H.float16 else None
                     loss  = bs.allreduce(loss)
                     grads = bs.group_allreduce(grads, params, search_strings=grad_groups, cast_all=cast_all)
