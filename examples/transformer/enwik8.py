@@ -26,17 +26,18 @@ def layernorm(x, scope, epsilon=1e-5, relu=False):
         return bs.layer_norm(x, gain, bias, axis=-1, epsilon=epsilon, relu=relu)
 
 
-def conv1d(x, scope, nf, relu=False, fast_gelu=False):
+def conv1d(x, scope, nf, std=0.02, relu=False, fast_gelu=False):
     with tf.variable_scope(scope):
         nx    = x.shape[-1].value
         ndims = x.shape.ndims
 
-        w = tf.get_variable("w", [nx, nf], initializer=tf.random_normal_initializer(stddev=0.02))
+        # Note: param initializers are not particularly well tuned in this code
+        w = tf.get_variable("w", [nx, nf], initializer=tf.random_normal_initializer(stddev=std))
         b = tf.get_variable("b", [    nf], initializer=tf.constant_initializer(0.0))
 
         if hps.float16:
-            # by setting dx_dtype to float16 we prevent useless casting in the backwards pass
-            # our all-reduce and fused optimizers can accept fp16 natively.
+            # By setting dx_dtype to float16 we prevent useless casting back to fp32 in the backwards pass.
+            # Our all-reduce and fused optimizers can accept fp16 natively.
             w = bs.float_cast(w, dtype=tf.float16, dx_dtype=tf.float16)
 
         # merge context and batch dims for more efficient matmul
@@ -44,8 +45,10 @@ def conv1d(x, scope, nf, relu=False, fast_gelu=False):
             y_shape = tf.concat([tf.shape(x)[: ndims - 1], [nf]], axis=0)
             x = tf.reshape(x, [-1, nx])
 
+        y = tf.matmul(x, w)
+
         # avoid atomics in bias grad, but be careful as tf handles temp memory badly in the presense of async ops like all-reduce
-        y = bs.bias_relu(tf.matmul(x, w), b, relu=relu, fast_gelu=fast_gelu, atomics=False)
+        y = bs.bias_relu(y, b, relu=relu, fast_gelu=fast_gelu, atomics=False)
 
         if ndims > 2:
             y = tf.reshape(y, y_shape)
@@ -71,10 +74,12 @@ def causal_subblock_mask(blk_shape, head_idx, query_idx, key_idx, blk_idx):
 # Coarse sparse structure
 # Only layout[q,k] == 1 blocks are computed and materialized in memory
 # Block sizes of 8, 16, 32 and 64 are supported on volta fp16 tensorcores (64 being most appropriate for dense attention)
-# Only blocoksize 32 currently supported in fp32 on on other gpus.
+# Only blocksize 32 currently supported in fp32 on other gpus (sm >= 3.5).
 def get_blocksparse_transformer(n_timesteps, n_heads):
     blocksize = 64 if hps.float16 else 32
     n_time_blocks = n_timesteps // blocksize
+    # The block layout can also include a head dimension if you don't want the same layout shared by all heads.
+    # Each head just has to have the same number of active blocks (but you can always mask them away).
     layout = np.ones([n_time_blocks, n_time_blocks], dtype=np.bool)
     # No query blocks may attend to key blocks in the future.
     # Much more elaborate structures can be defined here aside from the usual lower triangular.
@@ -101,33 +106,38 @@ def transformer_block(x, scope, train=False):
         k = conv1d(h, 'proj_k', n_state)
         v = conv1d(h, 'proj_v', n_state)
 
-        bst = hps.bst_cache.get(scope)
+        # only need to create one bst per config
+        # we could pass this in as an external param but I like to keep the code more local
+        bst_params = (hps.n_timesteps, hps.n_head)
+        bst = bst_cache.get(bst_params)
         if bst is None:
-            bst = get_blocksparse_transformer(hps.n_timesteps, hps.n_head)
-            hps.bst_cache[scope] = bst
+            bst = bst_cache[bst_params] = get_blocksparse_transformer(*bst_params)
 
+        # run the core bst ops, transposes for dealing with heads are fused in here.
         w = bst.query_key_op(q, k)
         w = bst.masked_softmax(w, scale=1.0/np.sqrt(n_state / hps.n_head))
         a = bst.weight_value_op(w, v)
 
-        a = conv1d(a, 'proj_a', n_state)
+        a = conv1d(a, 'proj_a', n_state, std=0.02/hps.n_layer)
 
         if train and hps.resid_pdrop > 0.0:
             # preserve the dropout mask through recompute
             key = scope + "_dropout_a"
-            a, hps.dropout_cache[key] = bs.dropout(a, keep_prob=1.0 - hps.resid_pdrop, mask=hps.dropout_cache.get(key))
+            a, dropout_cache[key] = bs.dropout(a, keep_prob=1.0 - hps.resid_pdrop, mask=dropout_cache.get(key))
 
+        # many basic tf ops are about half as fast as they should be in fp16
         x = bs.add(x, a)
 
         m = layernorm(x, "norm_m")
 
+        # fast_gelu: x * sigmoid(1.702 * x)
         m = conv1d(m, 'proj_m1', n_state * hps.mlp_ratio, fast_gelu=True)
         m = conv1d(m, 'proj_m2', n_state)
 
         if train and hps.resid_pdrop > 0.0:
             # preserve the dropout mask through recompute
             key = scope + "_dropout_m"
-            m, hps.dropout_cache[key] = bs.dropout(m, keep_prob=1.0 - hps.resid_pdrop, mask=hps.dropout_cache.get(key))
+            m, dropout_cache[key] = bs.dropout(m, keep_prob=1.0 - hps.resid_pdrop, mask=dropout_cache.get(key))
 
         return bs.add(x, m)
 
@@ -139,7 +149,7 @@ def model(xs, ys, loss_scale=None, train=False):
         with tf.device("/cpu:0"):
             if train:
                 grad_scale    = tf.reciprocal(loss_scale) if hps.float16 else 1.0
-                global_step   = tf.Variable(1.0, trainable=False)
+                global_step   = tf.get_variable("global_step", [], initializer=tf.ones_initializer(), trainable=False)
                 learning_rate = tf.minimum(global_step * (1.0/hps.warmup_iters), 1.0) * hps.lr
             mpi_scale = tf.constant(1.0 / mpi_size)
 
@@ -160,9 +170,11 @@ def model(xs, ys, loss_scale=None, train=False):
                     x_embed = bs.float_cast(x_embed, dtype=tf.float16, dx_dtype=tf.float16)
                     p_embed = bs.float_cast(p_embed, dtype=tf.float16, dx_dtype=tf.float16)
 
+                # bs.embedding_lookup can be much faster than tf version for low entropy indexes or small vocabs
                 x = bs.embedding_lookup(x_embed, xs)
 
                 if train and hps.embed_pdrop > 0.0:
+                    # this part of the code is not recomputed so no need to remember the generated mask returned by bs.dropout
                     x,       _ = bs.dropout(x,       keep_prob=1.0 - hps.embed_pdrop)
                     p_embed, _ = bs.dropout(p_embed, keep_prob=1.0 - hps.embed_pdrop)
 
@@ -171,6 +183,8 @@ def model(xs, ys, loss_scale=None, train=False):
 
             for l in range(hps.n_layer):
                 layer_name = 'layer_%d' % l
+                # enable the recompute decorator in training
+                # see blocksparse/grads.py if you want understand how this works
                 h = transformer_block(h, layer_name, train=train, recompute=train and hps.recompute)
                 grad_groups.insert(0, layer_name)
 
@@ -207,7 +221,7 @@ def model(xs, ys, loss_scale=None, train=False):
                     grads = [bs.scale_tensor(g, mpi_scale) for g in grads]
 
                     # allreduce in an mpi context
-                    # bias and gain grads will in in fp32, but have them fp16 cast prior to allreduce
+                    # bias, gain and x_embed grads will in in fp32, but have them fp16 cast prior to allreduce
                     cast_all = tf.float16 if H.float16 else None
                     loss  = bs.allreduce(loss)
                     grads = bs.group_allreduce(grads, params, search_strings=grad_groups, cast_all=cast_all)
@@ -292,14 +306,15 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_iters', type=int,   default=1000)
     parser.add_argument('--enwik8_path',  type=str,   default='/home/scott/datasets/enwik8') # obviously change to your local path
     parser.add_argument('--log_interval', type=int,   default=200)
-    parser.add_argument('--profile',      type=int,   default=3) # exit early for nvprof profiling
+    parser.add_argument('--profile',      type=int,   default=0) # exit early for nvprof profiling
     parser.add_argument('--float16',      type=int,   default=0) # only sm >= 7.0 (tensorcores)
     parser.add_argument('--recompute',    type=int,   default=0) # allow use of large contexts and/or lots of layers/params
 
+    # use some global vars for convenience
     hps = parser.parse_args()
 
-    hps.dropout_cache = dict()
-    hps.bst_cache = dict()
+    bst_cache     = dict()
+    dropout_cache = dict()
 
     comm = MPI.COMM_WORLD
     mpi_size = comm.Get_size()
@@ -314,7 +329,7 @@ if __name__ == '__main__':
         X = tf.placeholder(tf.uint8, shape=[hps.n_batch, hps.n_timesteps])
         Y = tf.placeholder(tf.uint8, shape=[hps.n_batch, hps.n_timesteps])
 
-    # loss_scale and grad_scale are host side scalars
+    # loss_scale is a host side scalar
     with tf.device("/cpu:0"):
         loss_scale = tf.placeholder(tf.float32, shape=[])
 
@@ -326,12 +341,13 @@ if __name__ == '__main__':
     cur_loss_scale = hps.loss_scale
     loss_count = 0
 
+    # build the models for training and testing/validation
     train_loss, train_op, gn, ns = model(X, Y, loss_scale, train=True)
     valid_loss = model(X, Y)
 
-    # Free up some python memory
-    hps.bst_cache     = None
-    hps.dropout_cache = None
+    # Free up some python memory now that models are built
+    bst_cache     = None
+    dropout_cache = None
     bs.clear_bst_constants()
 
     config = tf.ConfigProto()
@@ -355,9 +371,11 @@ if __name__ == '__main__':
 
                     loss, global_norm, norm_scale, _ = sess.run([train_loss, gn, ns, train_op], feed_dict={X: x, Y: y, loss_scale: cur_loss_scale})
 
-                    if hps.float16:
+                    # auto loss scaling for fp16.
+                    if hps.float16 and np.isfinite(loss):
                         # slowly increase loss scale but quickly drop it when inf or nan is detected in the gradients
                         # norm_scale will be zero when this happens
+                        # You may also want to limit the change in loss_scale from any single minibatch and throw them away when this limit is exceeded.
                         if norm_scale == 0.0:
                             cur_loss_scale *= 0.5
                             loss_count      = 0
@@ -371,6 +389,7 @@ if __name__ == '__main__':
                             else:
                                 loss_count += 1
                     else:
+                        # if forward pass is not finite skip any further auto loss scaling.
                         retry = False
 
                 if iteration % hps.log_interval == 0:
