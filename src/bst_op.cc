@@ -223,6 +223,8 @@ class BlocksparseTransformerOp : public OpKernel {
 
     if (a.dtype() == DT_HALF)
     {
+      OP_REQUIRES(ctx, major_ >= 7, errors::InvalidArgument("Tensorcore GPU required"));
+
       const ehalf* a_ptr = (const ehalf*)a.tensor_data().data();
       const ehalf* b_ptr = (const ehalf*)b.tensor_data().data();
 
@@ -293,6 +295,8 @@ class BlocksparseTransformerOp : public OpKernel {
 
     if (a.dtype() == DT_HALF)
     {
+      OP_REQUIRES(ctx, major_ >= 7, errors::InvalidArgument("Tensorcore GPU required"));
+
       const ehalf* a_ptr = (const ehalf*)a.tensor_data().data();
       const ehalf* b_ptr = (const ehalf*)b.tensor_data().data();
             ehalf* c_ptr = (      ehalf*)c->tensor_data().data();

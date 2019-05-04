@@ -4,9 +4,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-import tensorflow as tf
-import blocksparse.ewops as ew
+import numpy       as np
+import tensorflow  as tf
+import blocksparse as bs
 from struct import pack, unpack
 from time import time
 
@@ -29,7 +29,7 @@ class QuantizeTest(tf.test.TestCase):
             entropy_ph   = tf.placeholder(tf.float32, entropy_init.shape)
             entropy_var  = tf.get_variable("entropy", initializer=entropy_ph, trainable=False)
             sess.run(tf.group(entropy_var.initializer), feed_dict={ entropy_ph : entropy_init })
-            ew.set_entropy(entropy_var)
+            bs.set_entropy(entropy_var)
 
             for size in (1024*16*64,): #1024*16*64-1 131072, 1728, 229376, 262144, 28672, 3670016, 442368, 57344, 802816
 
@@ -53,7 +53,7 @@ class QuantizeTest(tf.test.TestCase):
                 x = tf.placeholder(tf.float32, cpuX.shape)
                 #e = tf.placeholder(tf.float32, cpuE.shape)
 
-                qspec = ew.QuantizeSpec(
+                qspec = bs.QuantizeSpec(
                     ebits      = 4,
                     fbits      = 23,
                     stochastic = 0,
@@ -65,7 +65,7 @@ class QuantizeTest(tf.test.TestCase):
                     logfile    = "/home/scott/quant_log.txt",
                 )
 
-                y = ew.quantize(x, qspec)
+                y = bs.quantize(x, qspec)
 
                 sess.run(tf.group(*[v.initializer for v in tf.global_variables("quantize")], name="init"))
 

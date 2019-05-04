@@ -37,16 +37,14 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
         v_mean1 = ew_add(v_mean1, x);
         v_mean2 = ew_add(v_mean2, ew_sqr(x));
     }
-    float2 mean;
-    mean.x = ew_sum(v_mean1) * rcpK;
-    mean.y = ew_sum(v_mean2) * rcpK;
+    float2 stats;
+    stats.x = ew_sum(v_mean1) * rcpK;
+    stats.y = ew_sum(v_mean2) * rcpK;
 
     // reduce within warp
     for (int i = 16; i > 0; i >>= 1)
-    {
-        mean.x += shfl_xor(mean.x, i);
-        mean.y += shfl_xor(mean.y, i);
-    }
+        stats = ew_warp_sum(stats, i);
+
     // if using more than 1 warp, further reduced with shared memory
     if (THREADS > 32)
     {
@@ -54,35 +52,35 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
 
         // first thread of each warp store to shared
         if ((tid & 31) == 0)
-            Share[tid/32] = mean;
+            Share[tid/32] = stats;
 
         __syncthreads();
 
         if (tid < 32)
         {
             // first warp loads all prior reductions
-            mean = Share[tid];
+            stats = Share[tid];
 
             // reduce within this first warp
             for (int i = THREADS/64; i > 0; i >>= 1)
-            {
-                mean.x += shfl_xor(mean.x, i);
-                mean.y += shfl_xor(mean.y, i);
-            }
-            // outputs final reduction to shared
-            Share[tid] = mean;
+                stats = ew_warp_sum(stats, i);
+
+            // final reduction to shared
+            Share[tid] = stats;
         }
         __syncthreads();
 
         // broadcast result to all threads
-        mean = Share[0];
+        stats = Share[0];
     }
     // var  = avg(x**2) - avg(x)**2
     // rstd = 1/sqrt(var)
-    float rstd = rsqrtf((mean.y - ew_sqr(mean.x)) + epsilon);
+    float mean = stats.x;
+    float rstd = rsqrtf(precise_sub(stats.y, ew_sqr(mean)) + epsilon);
+
     if (tid == 0)
     {
-        Mean[n] = mean.x;
+        Mean[n] = mean;
         Rstd[n] = rstd;
     }
 
@@ -94,7 +92,7 @@ __global__ void __launch_bounds__(THREADS) layer_norm_NC(
         V g = load(G, k);
         V b = load(B, k);
 
-        V xhat = ew_mul(ew_sub(x, mean.x), rstd);
+        V xhat = ew_mul(ew_sub(x, mean), rstd);
         V    y = ew_add(ew_mul(xhat, g), b);
 
         if (relu)
@@ -513,17 +511,17 @@ __global__ void layer_norm_segmented_nc(
             #pragma unroll 1
             for (int i = thread2/64; i > 0; i >>= 1)
                 stats = ew_warp_sum(stats, i);
+
             // final reduction to shared
             Share[tid] = stats;
         }
         __syncthreads();
         stats = Share[0];
     }
-
     // var  = avg(x**2) - avg(x)**2
     // rstd = 1/sqrt(var)
     float mean = stats.x;
-    float rstd = rsqrtf((stats.y - mean*mean) + epsilon);
+    float rstd = rsqrtf(precise_sub(stats.y, ew_sqr(mean)) + epsilon);
     if (tid == 0)
     {
         __stg(add_ptr_u(Mean, m), mean);
@@ -808,17 +806,20 @@ bool LayerNormSegmentedBackward_NC(CUstream stream, int SMs,
     const float* b,
     const float* mean,
     const float* rstd,
-    float epsilon, uint N, uint S, uint K, float rcpK, int relu)
+    float epsilon, uint N, uint S, uint K, float rcpK, int relu, int atomics)
 {
     uint gridK = CEIL_DIV(K, 32);
     uint gridN = 1;
-    uint blocksK = gridK * S;
-    while (gridN < (N>>3) && gridN * blocksK < 32*SMs) gridN += 1;
-    if (gridN * blocksK > 32*SMs && gridN > 1) gridN -= 1;
-    if (gridN > 1)
+    if (atomics)
     {
-        cuMemsetD32Async((CUdeviceptr)dg, 0, S*K, stream);
-        cuMemsetD32Async((CUdeviceptr)db, 0, S*K, stream);
+        uint blocksK = gridK * S;
+        while (gridN < (N>>3) && gridN * blocksK < 32*SMs) gridN += 1;
+        if (gridN * blocksK > 32*SMs && gridN > 1) gridN -= 1;
+        if (gridN > 1)
+        {
+            cuMemsetD32Async((CUdeviceptr)dg, 0, S*K, stream);
+            cuMemsetD32Async((CUdeviceptr)db, 0, S*K, stream);
+        }
     }
     layer_norm_segmented_dg_db_nc<T><<<dim3(gridN,gridK,S),32,0,stream>>>(dg, db, dy, x, g, b, mean, rstd, N, S*K, S*K*gridN, K, relu);
 
@@ -869,9 +870,9 @@ bool LayerNormSegmentedBackward_NC(CUstream stream, int SMs,
     }
     return true; // TODO
 }
-template bool LayerNormSegmentedBackward_NC<float,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
-template bool LayerNormSegmentedBackward_NC<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
-template bool LayerNormSegmentedBackward_NC<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+template bool LayerNormSegmentedBackward_NC<float,float4>(CUstream stream, int SMs, float* dx, float* dg, float* db, const float* dy, const float* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu, int atomics);
+template bool LayerNormSegmentedBackward_NC<ehalf,ehalf4>(CUstream stream, int SMs, ehalf* dx, float* dg, float* db, const ehalf* dy, const ehalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu, int atomics);
+template bool LayerNormSegmentedBackward_NC<bhalf,bhalf4>(CUstream stream, int SMs, bhalf* dx, float* dg, float* db, const bhalf* dy, const bhalf* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu, int atomics);
 
 
 #endif // GOOGLE_CUDA

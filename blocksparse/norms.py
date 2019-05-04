@@ -20,7 +20,7 @@ batch_norm_grad_ncdhw_op = _op_module.batch_norm_grad_ncdhw
 
 
 
-def layer_norm(x, g, b, axis=1, segments=1, epsilon=1e-6, relu=False, bench=0, use_tf=False):
+def layer_norm(x, g, b, axis=1, segments=1, epsilon=1e-6, relu=False, atomics=True, bench=0, use_tf=False):
 
     dev = g.op.device.lower()
     if use_tf or not dev or "cpu" in dev:
@@ -51,7 +51,7 @@ def layer_norm(x, g, b, axis=1, segments=1, epsilon=1e-6, relu=False, bench=0, u
         if relu:
             y = tf.nn.relu(y)
     else:
-        y, m, v, _, _ = layer_norm_op(x, g, b, S=segments, axis=axis, epsilon=epsilon, relu=relu, bench=bench)
+        y, m, v, _, _ = layer_norm_op(x, g, b, S=segments, axis=axis, epsilon=epsilon, relu=relu, atomics=atomics, bench=bench)
 
     return y
 
@@ -61,8 +61,9 @@ def layer_norm_grad(op, dy, mean, rstd, p1, p2):
     epsilon = op.get_attr("epsilon")
     relu    = op.get_attr("relu")
     axis    = op.get_attr("axis")
+    atomics = op.get_attr("atomics")
     bench   = op.get_attr("bench")
-    dx, dg, db, _, _ = layer_norm_grad_op(dy, op.inputs[0], op.inputs[1], op.inputs[2], op.outputs[1], op.outputs[2], S=S, axis=axis, epsilon=epsilon, relu=relu, bench=bench)
+    dx, dg, db, _, _ = layer_norm_grad_op(dy, op.inputs[0], op.inputs[1], op.inputs[2], op.outputs[1], op.outputs[2], S=S, axis=axis, epsilon=epsilon, relu=relu, atomics=atomics, bench=bench)
     return dx, dg, db
 
 def batch_norm_inference(x, g, b, m, v, epsilon=1e-6):
@@ -168,8 +169,8 @@ def layer_norm_grad_test(dy, x, g, b, axis=1, segments=1, epsilon=1e-6, relu=Fal
 
         #print("x:%.2f, mean:%.2f, rstd:%.2f, xhat:%.2f, dy:%.2f\n" % (x[0,0], mean[0,0], xstdr[0,0], xhat[0,0], dy[0,0]));
 
-        dg[seg] = np.sum(dy[seg] * xhat, axis=1-axis)
-        db[seg] = np.sum(dy[seg],        axis=1-axis)
+        dg[seg] = np.sum(dy[seg] * xhat, axis=1-axis, keepdims=True)
+        db[seg] = np.sum(dy[seg],        axis=1-axis, keepdims=True)
         dy[seg] = dy[seg] * g[seg]
 
         sum1 = np.sum(xhat * dy[seg], axis=axis, keepdims=True)

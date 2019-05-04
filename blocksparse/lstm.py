@@ -62,7 +62,7 @@ def fused_lstm_gates_grad(op, ec, eh):
     # compute bias grad
     #db = ew_db_dzb_op(dh, op.inputs[2], op=BIASADD_OP)
     # db = bias_grad_op(dh, op.inputs[2])
-    db, _ = bias_grad_op(dh, op.inputs[2])
+    db, _ = bias_grad_op(dh, op.inputs[2], axis=1)
 
     return dc, dh, db
 

@@ -136,7 +136,7 @@ __global__ void __launch_bounds__(256) layer_norm_moments2_CN(
         // rstd = 1/sqrt(var)
         mean1 *= rcpK;
         mean2 *= rcpK;
-        float rstd = rsqrtf((mean2 - ew_sqr(mean1)) + epsilon);
+        float rstd = rsqrtf(precise_sub(mean2, ew_sqr(mean1)) + epsilon);
         store(add_ptr_u(Mean, n), mean1);
         store(add_ptr_u(Rstd, n), rstd);
     }

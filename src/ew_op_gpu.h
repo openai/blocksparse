@@ -849,7 +849,20 @@ __device__ __forceinline__ void ew_set(bhalf8 &a, uint val) { a.x = a.y = a.z = 
 __device__ __forceinline__ void ew_zero(vhalf  &a) { a.x = 0; }
 __device__ __forceinline__ void ew_zero(mhalf  &a) { a.x = 0; }
 
-
+// minimize catastrophic cancellation: https://en.wikipedia.org/wiki/Loss_of_significance
+// Probably unnecessary, but GPU supports it at no cost (when used sparingly)
+__device__ __forceinline__ float precise_sub(float a, float b)
+{
+    float r;
+    asm("{\n\t"
+        ".reg .f64 a, b, c;\n\t"
+        "cvt.f64.f32 a, %1;\n\t"
+        "cvt.f64.f32 b, %2;\n\t"
+        "sub.f64 c, a, b;\n\t"
+        "cvt.rn.f32.f64 %0, c;\n\t"
+        "}" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
 
 __device__ __forceinline__ float _ex2_approx(float x)
 {
@@ -1139,6 +1152,8 @@ MATH_Z_XY(ew_mul,      _mul)
 MATH_Z_XY(ew_div,      _div)
 MATH_Z_XY(ew_maximum, fmaxf)
 MATH_Z_XY(ew_minimum, fminf)
+MATH_Z_XY(ew_precise_sub, precise_sub)
+
 
 MATH_Z_X(ew_abs,           fabsf)
 MATH_Z_X(ew_neg,            _neg)

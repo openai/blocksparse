@@ -35,6 +35,7 @@ REGISTER_OP("LayerNorm")
     .Attr("axis: int")
     .Attr("epsilon: float")
     .Attr("relu: bool")
+    .Attr("atomics: bool = true")
     .Attr("bench: int = 0")
     .SetShapeFn([](InferenceContext* ctx) {
 
@@ -80,6 +81,7 @@ class LayerNormOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("S",       &S_      ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("relu",    &relu_   ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("axis",    &axis_   ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("atomics", &atomics_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("bench",   &bench_  ));
     repeat_ = bench_ ? bench_ : 1;
   }
@@ -104,6 +106,8 @@ class LayerNormOp : public OpKernel {
         N *= x.dim_size(i);
       }
     }
+    OP_REQUIRES(ctx, axis_ != 0 || (N & 3) == 0, errors::InvalidArgument("Sum of non-feature axis dims needs to be multiple of 4 for feature axis=0."));
+
     if (K_ == 0)
     {
       OP_REQUIRES(ctx, K == g.shape().num_elements(), errors::InvalidArgument("Bad Gain Shape"));
@@ -166,7 +170,7 @@ class LayerNormOp : public OpKernel {
   }
   float epsilon_, rcpK_;
   int S_, K_, axis_, SMs_, bench_, repeat_;
-  bool relu_;
+  bool relu_, atomics_;
 };
 REGISTER_KERNEL_BUILDER(Name("LayerNorm").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T"), LayerNormOp<FLOAT,float,float4>);
 REGISTER_KERNEL_BUILDER(Name("LayerNorm").Device(DEVICE_GPU).TypeConstraint<EHALF>("T"), LayerNormOp<EHALF,ehalf,ehalf4>);
@@ -174,7 +178,7 @@ REGISTER_KERNEL_BUILDER(Name("LayerNorm").Device(DEVICE_GPU).TypeConstraint<BHAL
 
 template <typename T, typename V> bool LayerNormBackward_NC(CUstream stream, int SMs, T* dx, float* dg, float* db, const T* dy, const T* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
 template <typename T, typename V> bool LayerNormBackward_CN(CUstream stream, int SMs, T* dx, float* dg, float* db, float* sum1, float* sum2, const T* dy, const T* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, int K, int N, float rcpK, int relu);
-template <typename T, typename V> bool LayerNormSegmentedBackward_NC(CUstream stream, int SMs, T* dx, float* dg, float* db, const T* dy, const T* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu);
+template <typename T, typename V> bool LayerNormSegmentedBackward_NC(CUstream stream, int SMs, T* dx, float* dg, float* db, const T* dy, const T* x, const float* g, const float* b, const float* mean, const float* rstd, float epsilon, uint N, uint S, uint K, float rcpK, int relu, int atomics);
 
 REGISTER_OP("LayerNormGrad")
     .Input("dy: T")
@@ -193,6 +197,7 @@ REGISTER_OP("LayerNormGrad")
     .Attr("axis: int")
     .Attr("epsilon: float")
     .Attr("relu: bool")
+    .Attr("atomics: bool = true")
     .Attr("bench: int = 0")
     .SetShapeFn([](InferenceContext* ctx) {
       ctx->set_output(0, ctx->input(1));
@@ -215,6 +220,7 @@ class LayerNormGradOp : public OpKernel {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("S",       &S_      ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("relu",    &relu_   ));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("axis",    &axis_   ));
+    OP_REQUIRES_OK(ctx, ctx->GetAttr("atomics", &atomics_));
     OP_REQUIRES_OK(ctx, ctx->GetAttr("bench",   &bench_  ));
     repeat_ = bench_ ? bench_ : 1;
   }
@@ -289,7 +295,7 @@ class LayerNormGradOp : public OpKernel {
       else
       {
         if (S_ > 1 || K_ <= 1024*8)
-          LayerNormSegmentedBackward_NC<V1,V4>(stream, SMs_, dx_ptr, dg_ptr, db_ptr, dy_ptr, x_ptr, g_ptr, b_ptr, mean_ptr, rstd_ptr, epsilon_, N, S_, K_, rcpK_, relu_);
+          LayerNormSegmentedBackward_NC<V1,V4>(stream, SMs_, dx_ptr, dg_ptr, db_ptr, dy_ptr, x_ptr, g_ptr, b_ptr, mean_ptr, rstd_ptr, epsilon_, N, S_, K_, rcpK_, relu_, atomics_);
         else
           LayerNormBackward_NC<V1,V4>(stream, SMs_, dx_ptr, dg_ptr, db_ptr, dy_ptr, x_ptr, g_ptr, b_ptr, mean_ptr, rstd_ptr, epsilon_, K_, N, rcpK_, relu_);
       }
@@ -298,7 +304,7 @@ class LayerNormGradOp : public OpKernel {
   }
   float epsilon_, rcpK_;
   int S_, K_, axis_, SMs_, bench_, repeat_;
-  bool relu_;
+  bool relu_, atomics_;
 };
 REGISTER_KERNEL_BUILDER(Name("LayerNormGrad").Device(DEVICE_GPU).TypeConstraint<FLOAT>("T"), LayerNormGradOp<FLOAT,float,float4>);
 REGISTER_KERNEL_BUILDER(Name("LayerNormGrad").Device(DEVICE_GPU).TypeConstraint<EHALF>("T"), LayerNormGradOp<EHALF,ehalf,ehalf4>);

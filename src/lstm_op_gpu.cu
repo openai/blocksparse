@@ -617,7 +617,7 @@ __global__ void __launch_bounds__(THREADS) sparse_relu_forward(
     }
     // var = avg(x**2) - avg(x)**2
     // std = sqrt(var)
-    float std = sqrtf(mean.y - mean.x*mean.x);
+    float std = sqrtf(precise_sub(mean.y, mean.x*mean.x));
 
     // Norm/Gain/Bias
     X += offset;

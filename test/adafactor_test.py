@@ -4,17 +4,18 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import numpy as np
-import tensorflow as tf
-import blocksparse.ewops as ew
+import numpy       as np
+import tensorflow  as tf
+import blocksparse as bs
 from blocksparse.optimize import adafactor1d_op, adafactor2d_op
 
 ones        = 0
-out         = 1
+out         = 0
 beta2       = 0.5
 learn_rate  = 0.5
 grad_scale  = 1.0
 clip_thresh = 1.0
+clip_norm   = 1.0
 epsilon     = 1e-30
 
 config = tf.ConfigProto(
@@ -55,16 +56,22 @@ class AdafactorTest(tf.test.TestCase):
                     r = tf.Variable(initial_value=R, name="r")
                     sess.run( tf.global_variables_initializer() )
 
-                    g = ew.float_cast(g, dtype=dtype)
+                    g = bs.float_cast(g, dtype=dtype)
 
                     # adafactor has it's own fused infinity filtering but quick test of this standalone op here.
-                    g = ew.filter_infinity(g)
+                    g = bs.filter_tensor(g)
+
+                    global_norm, norm_scale = bs.clip_by_global_norm([g], grad_scale=grad_scale, clip_norm=clip_norm)
 
                     if shape_g[0] > 1:
 
                         p, c, r, x, _ = sess.run(
-                            adafactor2d_op(p, c, r, g, beta2, learn_rate, grad_scale, clip_thresh, epsilon=epsilon, zero_nans=True),
+                            adafactor2d_op(p, c, r, g, beta2, learn_rate, grad_scale, clip_thresh, [norm_scale], epsilon=epsilon),
                             feed_dict={ g: G } )
+
+                        GN = np.sqrt(np.sum(np.square(G*grad_scale), keepdims=True))
+                        NS = clip_norm / np.maximum(GN, clip_norm)
+                        G *= NS * grad_scale
 
                         C = beta2 * C + (1.0 - beta2) * np.mean(np.square(G) + epsilon, axis=0, keepdims=True)
                         R = beta2 * R + (1.0 - beta2) * np.mean(np.square(G) + epsilon, axis=1, keepdims=True)
@@ -76,8 +83,12 @@ class AdafactorTest(tf.test.TestCase):
 
                         r = R
                         p, c, x, _ = sess.run(
-                            adafactor1d_op(p, c, g, beta2, learn_rate, grad_scale, clip_thresh, epsilon=epsilon, zero_nans=True),
+                            adafactor1d_op(p, c, g, beta2, learn_rate, grad_scale, clip_thresh, [norm_scale], epsilon=epsilon),
                             feed_dict={ g: G } )
+
+                        GN = np.sqrt(np.sum(np.square(G*grad_scale), keepdims=True))
+                        NS = clip_norm / np.maximum(GN, clip_norm)
+                        G *= NS * grad_scale
 
                         C = beta2 * C + (1.0 - beta2) * (np.square(G) + epsilon)
                         X = G / np.sqrt(C)
@@ -85,7 +96,7 @@ class AdafactorTest(tf.test.TestCase):
 
                     P -= learn_rate * X / np.maximum(1.0, RMS_X / clip_thresh)
 
-                    print("testAdafactor", dtype)
+                    print("testAdafactor", dtype, GN, NS)
                     for op, dev, cpu in [
                         [ "C", c, C ],
                         [ "R", r, R ],
