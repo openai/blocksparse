@@ -347,7 +347,7 @@ __device__ __forceinline__ float  to_float(vhalf  v)
             "}" : "=f"(r) : "h"(v.x));
     return r;
 }
-// 1s-6e-10m, exp 0 => 2**-60, exp 63 => 2**3
+// 1s-6e-9m, exp 0 => 2**-60, exp 63 => 2**3
 __device__ __forceinline__ float  to_float(mhalf  v)
 {
     float r;
@@ -377,7 +377,7 @@ __device__ __forceinline__ vhalf  to_vhalf(float  v)
     v = fminf(v, 15.9921875f);
 
     // 0x21802000 = "0x%08x" % (((127-60) << 23) | (1 << 13))
-    // 2.778268066994105e-17 = unpack("f", pack("I", 0x21802000))[0]
+    // 8.682087709356578e-19 = unpack("f", pack("I", 0x21802000))[0]
     if (v < 8.682087709356578e-19f)
         r.x = 0;
     else
@@ -397,17 +397,17 @@ __device__ __forceinline__ vhalf  to_vhalf(float  v)
             "}" : "=h"(r.x) : "f"(v));
     return r;
 }
-// 1s-6e-10m, exp 0 => 2**-60, exp 63 => 2**3
+// 1s-6e-9m, exp 0 => 2**-60, exp 63 => 2**3
 __device__ __forceinline__ mhalf  to_mhalf(float  v)
 {
     mhalf r;
 
     // 0x417fc000 = "0x%08x" % (((127+3) << 23) | (511 << 14))
-    // 511.5 = unpack("f", pack("I", 0x417fc000))[0]
+    // 15.984375 = unpack("f", pack("I", 0x417fc000))[0]
     v = fmaxf(fminf(v, 15.984375f), -15.984375f);
 
     // 0x21804000 = "0x%08x" % (((127-60) << 23) | (1 << 14))
-    // 2.780978572425319e-17 = unpack("f", pack("I", 0x21804000))[0]
+    // 8.690558038829121e-19 = unpack("f", pack("I", 0x21804000))[0]
     if (abs(v) < 8.690558038829121e-19f)
         r.x = 0;
     else

@@ -886,8 +886,11 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
     {
         V exp      = ew_exp(ew_sub(to_float(logits[i]), xmax));
         exp_sum   += ew_sum(exp);
-        exp_max[i] = to_ehalf(ew_mul(exp, 32768.0f)); // scale to maximize fp16 bit utilization
-        xor1(exp_max[i]); // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
+        // scale to maximize fp16 bit utilization
+        // Warning: this will flush the scaled values less than 2^-24 to zero
+        exp_max[i] = to_ehalf(ew_mul(exp, 32768.0f));
+        // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
+        xor1(exp_max[i]);
     }
 
     // reduce within warp
@@ -915,9 +918,14 @@ __global__ void __launch_bounds__(1024,BLOCKS) softmax_cross_entropy(
     {
         if (k + i*VSIZE*32 < K)
         {
-            xor1(exp_max[i]); // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
-            V softmax = ew_mul(to_float(exp_max[i]), rcp_exp_sum);
-            V loss    = ew_neg(ew_log(ew_maximum(softmax, 1.8189894035458565e-12f))); // cap loss at softmax of 2^-39 (fp16 2^-24 min * 2^-15 scaling)
+            // stupid no-op to force ptxas to pack 2 fp16 values into 32 bit registers, sigh.
+            xor1(exp_max[i]);
+            // Warning: scaled values less than 2^-24 will have been flushed to zero
+            V expmax2 = to_float(exp_max[i]);
+            // allow softmax for grad computation to have the flushed to zero values
+            V softmax = ew_mul(expmax2, rcp_exp_sum);
+            // to avoid a nan for log(0), we clip the flushed to zero values to 2^-24
+            V loss    = ew_neg(ew_log(ew_mul(ew_maximum(expmax2, 5.960464477539063e-08f), rcp_exp_sum)));
 
             for (uint j = 0; j < VSIZE; j++)
             {
