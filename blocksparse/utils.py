@@ -222,10 +222,10 @@ def bst_conv_layout(input_h=1, input_w=1, filter_h=1, filter_w=1, stride=1, blk_
             break
     assert pad_s >= 0, "Even size filters only work with stride 2."
 
-    print(f"P:{P} Q:{Q} H:{H} W:{W} R:{R} S:{S} std:{stride} pad_r:{pad_r} pad_s:{pad_s}")
+    print("P:%s Q:%s H:%s W:%s R:%s S:%s std:%s pad_r:%s pad_s:%s" % (P, Q, H, W, R, S, stride, pad_r, pad_s))
 
-    assert P*Q % blk_size == 0, f"P:{P} Q:{Q}"
-    assert H*W % blk_size == 0, f"H:{H} W:{W}"
+    assert P*Q % blk_size == 0, "P:%s Q:%s" % (P, Q)
+    assert H*W % blk_size == 0, "H:%s W:%s" % (H, W)
 
     mask_set = set()
     layout = np.zeros((P*Q//blk_size, H*W//blk_size), dtype=np.bool)
@@ -294,10 +294,10 @@ def bst_deconv_layout(output_h=1, output_w=1, filter_h=1, filter_w=1, stride=1, 
             break
     assert pad_s >= 0, "Even size filters only work with stride 2."
 
-    print(f"P:{P} Q:{Q} H:{H} W:{W} R:{R} S:{S} std:{stride} pad_r:{pad_r} pad_s:{pad_s}")
+    print("P:%s Q:%s H:%s W:%s R:%s S:%s std:%s pad_r:%s pad_s:%s" % (P, Q, H, W, R, S, stride, pad_r, pad_s))
 
-    assert P*Q % blk_size == 0, f"P:{P} Q:{Q}"
-    assert H*W % blk_size == 0, f"H:{H} W:{W}"
+    assert P*Q % blk_size == 0, "P:%s Q:%s" % (P, Q)
+    assert H*W % blk_size == 0, "H:%s W:%s" % (H, W)
 
     mask_set = set()
     layout = np.zeros((H*W//blk_size, P*Q//blk_size), dtype=np.bool)
