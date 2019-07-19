@@ -19,6 +19,12 @@ __device__ __forceinline__ uint div64(uint value, uint magic, uint shift)
     return result;
 }
 
+__device__ __forceinline__ ushort to_half(float* v)
+{
+    ushort ret;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(ret) : "f"(v[0]) );
+    return ret;
+}
 __device__ __forceinline__ uint to_half2(float* v)
 {
     uint ret;
@@ -81,6 +87,10 @@ __device__ __forceinline__ uint4 load_half8(const ehalf* a)
     return r;
 }
 
+__device__ __forceinline__ void store_half(const ehalf* a, ushort v)
+{
+    asm volatile ("st.global.wb.u16 [%0], %1;" :: "l"(a), "h"(v));
+}
 __device__ __forceinline__ void store_half2(const ehalf* a, uint  v)
 {
     asm volatile ("st.global.wb.u32 [%0], %1;" :: "l"(a), "r"(v));
@@ -317,5 +327,31 @@ struct fragmentC
     }
 };
 
+__device__ __forceinline__ void mma_m8n8k4_nn(float* acc, ehalf4 f4, ehalf4 i4)
+{
+    asm("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 \n\t"
+        "    {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 }, \n\t"
+        "    {  %8,  %9 }, { %10, %11 },                 \n\t"
+        "    {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 }; \n\t" :
+        "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
+        "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7]) :
+        "r"(f4.x), "r"(f4.y), "r"(i4.x), "r"(i4.y));
+}
+
+__device__ __forceinline__ void mma_m8n8k8_nt(float* acc, ehalf8 e8, ehalf8 i8)
+{
+    asm("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 \n\t"
+        "    {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 }, \n\t"
+        "    {  %8,  %9 }, { %10, %11 },                 \n\t"
+        "    {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 }; \n\t"
+        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 \n\t"
+        "    {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 }, \n\t"
+        "    { %12, %13 }, { %14, %15 },                 \n\t"
+        "    {  %0,  %1,  %2,  %3,  %4,  %5,  %6,  %7 }; \n\t" :
+        "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3]),
+        "+f"(acc[4]), "+f"(acc[5]), "+f"(acc[6]), "+f"(acc[7]) :
+        "r"(e8.x), "r"(e8.y), "r"(i8.x), "r"(i8.y),
+        "r"(e8.z), "r"(e8.w), "r"(i8.z), "r"(i8.w));
+}
 
 #endif // GPU_HMMA_H
