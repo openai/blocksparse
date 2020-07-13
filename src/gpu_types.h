@@ -6,92 +6,131 @@
 #include <vector_types.h>
 #include <cuda_runtime.h>
 
+#ifndef FLT_MAX
 #define FLT_MAX 3.402823466E+38F
+#endif // FLT_MAX
 
 // Eigen::half - IEEE half floating point memory format support (not used for compute)
 // 5 bits expoenent, 10 bits mantissa, 1 bit sign
 typedef struct __align__(2) ehalf {
     __device__ __forceinline__ ehalf() {}
-    __device__ __forceinline__ ehalf(const unsigned short val) : x(val) {}
-    unsigned short x;
+    __device__ __forceinline__ ehalf(ushort v) : x(v) {}
+    ushort x;
 } ehalf;
 
 typedef struct __align__(4) ehalf2 {
     __device__ __forceinline__ ehalf2() {}
-    __device__ __forceinline__ ehalf2(const unsigned int val) : x(val) {}
-    unsigned int x;
+    __device__ __forceinline__ ehalf2(uint v) : x(v) {}
+    uint x;
 } ehalf2;
 
 typedef struct __align__(8) ehalf4 {
     __device__ __forceinline__ ehalf4() {}
-    __device__ __forceinline__ ehalf4(const unsigned int val) : x(val), y(val) {}
-    unsigned int x;
-    unsigned int y;
+    __device__ __forceinline__ ehalf4(uint v) : x(v), y(v) {}
+    __device__ __forceinline__ ehalf4(uint v0, uint v1) : x(v0), y(v1) {}
+    uint x;
+    uint y;
 } ehalf4;
 
 typedef struct __align__(16) ehalf8 {
     __device__ __forceinline__ ehalf8() {}
-    __device__ __forceinline__ ehalf8(const unsigned int val) : x(val), y(val), z(val), w(val) {}
-    unsigned int x;
-    unsigned int y;
-    unsigned int z;
-    unsigned int w;
+    __device__ __forceinline__ ehalf8(uint v) : x(v), y(v), z(v), w(v) {}
+    __device__ __forceinline__ ehalf8(uint v0, uint v1, uint v2, uint v3) : x(v0), y(v1), z(v2), w(v3) {}
+    uint x;
+    uint y;
+    uint z;
+    uint w;
 } ehalf8;
 
 
 // tf.bfloat16 half floating point memory format support (not used for compute)
 // 8 bits expoenent, 7 bits mantissa, 1 bit sign
-
 typedef struct __align__(2) bhalf {
     __device__ __forceinline__ bhalf() {}
-    __device__ __forceinline__ bhalf(const unsigned short val) : x(val) {}
-    unsigned short x;
+    __device__ __forceinline__ bhalf(ushort v) : x(v) {}
+    ushort x;
 } bhalf;
 
 typedef struct __align__(4) bhalf2 {
     __device__ __forceinline__ bhalf2() {}
-    __device__ __forceinline__ bhalf2(const unsigned int val) : x(val) {}
-    unsigned int x;
+    __device__ __forceinline__ bhalf2(uint v) : x(v) {}
+    uint x;
 } bhalf2;
 
 typedef struct __align__(8) bhalf4 {
     __device__ __forceinline__ bhalf4() {}
-    __device__ __forceinline__ bhalf4(const unsigned int val) : x(val), y(val) {}
-    unsigned int x;
-    unsigned int y;
+    __device__ __forceinline__ bhalf4(uint v) : x(v), y(v) {}
+    __device__ __forceinline__ bhalf4(uint v0, uint v1) : x(v0), y(v1) {}
+    uint x;
+    uint y;
 } bhalf4;
 
 typedef struct __align__(16) bhalf8 {
     __device__ __forceinline__ bhalf8() {}
-    __device__ __forceinline__ bhalf8(const unsigned int val) : x(val), y(val), z(val), w(val) {}
-    unsigned int x;
-    unsigned int y;
-    unsigned int z;
-    unsigned int w;
+    __device__ __forceinline__ bhalf8(uint v) : x(v), y(v), z(v), w(v) {}
+    __device__ __forceinline__ bhalf8(uint v0, uint v1, uint v2, uint v3) : x(v0), y(v1), z(v2), w(v3) {}
+    uint x;
+    uint y;
+    uint z;
+    uint w;
 } bhalf8;
 
-// 16 bit storage format for Adam running gradient variance (unsigned)
+
+// vhalf: 16 bit storage format for Adam running gradient variance (unsigned)
 // 6 bits expoenent, 10 bits mantissa, 0 bit sign
 typedef struct __align__(2) vhalf {
     __device__ __forceinline__ vhalf() {}
-    __device__ __forceinline__ vhalf(const unsigned short val) : x(val) {}
-    unsigned short x;
+    __device__ __forceinline__ vhalf(ushort v) : x(v) {}
+    ushort x;
 } vhalf;
-// 16 bit storage format for Adam running gradient mean (signed)
+
+typedef struct __align__(4) vhalf2 {
+    __device__ __forceinline__ vhalf2() {}
+    __device__ __forceinline__ vhalf2(uint v) : x(v) {}
+    uint x;
+} vhalf2;
+
+typedef struct __align__(8) vhalf4 {
+    __device__ __forceinline__ vhalf4() {}
+    __device__ __forceinline__ vhalf4(uint v) : x(v), y(v) {}
+    __device__ __forceinline__ vhalf4(uint v0, uint v1) : x(v0), y(v1) {}
+    uint x;
+    uint y;
+} vhalf4;
+
+
+// mhalf: 16 bit storage format for Adam running gradient mean (signed)
 // 6 bits expoenent, 9 bits mantissa, 1 bit sign
 typedef struct __align__(2) mhalf {
     __device__ __forceinline__ mhalf() {}
-    __device__ __forceinline__ mhalf(const unsigned short val) : x(val) {}
-    unsigned short x;
+    __device__ __forceinline__ mhalf(ushort v) : x(v) {}
+    ushort x;
 } mhalf;
+
+typedef struct __align__(4) mhalf2 {
+    __device__ __forceinline__ mhalf2() {}
+    __device__ __forceinline__ mhalf2(uint v) : x(v) {}
+    uint x;
+} mhalf2;
+
+typedef struct __align__(8) mhalf4 {
+    __device__ __forceinline__ mhalf4() {}
+    __device__ __forceinline__ mhalf4(uint v) : x(v), y(v) {}
+    __device__ __forceinline__ mhalf4(uint v0, uint v1) : x(v0), y(v1) {}
+    uint x;
+    uint y;
+} mhalf4;
+
 
 typedef struct __align__(16) float8 {
     __device__ __forceinline__ float8() { }
+    __device__ __forceinline__ float8(float4 x, float4 y) : a(x), b(y) {}
     //__device__ __forceinline__ float8(const float val) : a({val,val,val,val}), b({val,val,val,val}) { }
     float4 a;
     float4 b;
 } float8;
 
+#define CTX_STREAM(ctx) reinterpret_cast<CUstream>(ctx->op_device_context()->stream()->implementation()->GpuStreamHack())
 
 #define NT_OP 0
 #define NN_OP 1

@@ -24,13 +24,13 @@ CUDA_HOME?=/usr/local/cuda
 NV_INC?=$(CUDA_HOME)/include
 NV_LIB?=$(CUDA_HOME)/lib64
 
-# NCCL_HOME?=/usr/local/nccl
-# NCCL_INC?=$(NCCL_HOME)/include
-# NCCL_LIB?=$(NCCL_HOME)/lib
-#
-# MPI_HOME?=/usr/lib/mpich
-# MPI_INC?=$(MPI_HOME)/include
-# MPI_LIB?=$(MPI_HOME)/lib
+NCCL_HOME?=/usr/local/nccl
+NCCL_INC?=$(NCCL_HOME)/include
+NCCL_LIB?=$(NCCL_HOME)/lib
+
+MPI_HOME?=/usr/lib/mpich
+MPI_INC?=$(MPI_HOME)/include
+MPI_LIB?=$(MPI_HOME)/lib
 
 TF_INC=$(shell python -c 'from os.path import dirname; import tensorflow as tf; print(dirname(dirname(tf.sysconfig.get_include())))')
 TF_LIB=$(shell python -c 'import tensorflow as tf; print(tf.sysconfig.get_lib())')
@@ -42,10 +42,9 @@ CCFLAGS=-std=c++11 -O3 -fPIC -DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) 
 	-I$(TF_INC)/tensorflow/include \
 	-I$(TF_INC)/tensorflow/include/external/nsync/public \
 	-I$(TF_INC)/external/local_config_cuda/cuda \
+	-I$(NCCL_INC) \
+	-I$(MPI_INC) \
 	-I/usr/local
-
-	# -I$(NCCL_INC) \
-	# -I$(MPI_INC) \
 
 NVCCFLAGS=-DGOOGLE_CUDA=1 -D_GLIBCXX_USE_CXX11_ABI=$(TF_ABI) -O3 -Xcompiler -fPIC -std=c++11 --prec-div=false --prec-sqrt=false \
  	-gencode=arch=compute_35,code=sm_35 \
@@ -74,8 +73,8 @@ OBJS=\
 	$(TARGET)/quantize_op.o \
 	$(TARGET)/transformer_op.o \
 	$(TARGET)/embedding_op.o \
-	$(TARGET)/matmul_op.o
-	#$(TARGET)/nccl_op.o \
+	$(TARGET)/matmul_op.o \
+	$(TARGET)/nccl_op.o
 
 CU_OBJS=\
 	$(TARGET)/batch_norm_op_gpu.cu.o \
@@ -104,10 +103,7 @@ $(TARGET)/blocksparse_kernels.h: src/sass/*.sass
 	python generate_kernels.py
 
 blocksparse/blocksparse_ops.so: $(OBJS) $(CU_OBJS)
-	g++ $^ -shared -o $@ -L$(TF_LIB) -L$(NV_LIB) -ltensorflow_framework -lcudart -lcuda
-
-	# -L$(NCCL_LIB) -L$(MPI_LIB)
-	# -lnccl -lmpi
+	g++ $^ -shared -o $@ -L$(TF_LIB) -L$(NV_LIB) -ltensorflow_framework -lcudart -lcuda -L$(NCCL_LIB) -L$(MPI_LIB) -lnccl -lmpi
 
 $(TARGET)/%.cu.o: src/%.cu $(TARGET)/blocksparse_kernels.h
 	mkdir -p $(shell dirname $@)
