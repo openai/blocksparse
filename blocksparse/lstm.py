@@ -19,7 +19,7 @@ lstm_gates4_op      = _op_module.lstm_gates4
 lstm_gates4_grad_op = _op_module.lstm_gates4_grad
 bias_grad_op        = _op_module.bias_grad
 
-def fused_lstm_gates(c, *args, bias=None, forget_bias=1.0, name=None):
+def fused_lstm_gates(c, bias=None, forget_bias=1.0, name=None, *args):
     # returns c_next, h_next
 
     dev = args[0].op.device.lower()

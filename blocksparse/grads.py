@@ -211,7 +211,7 @@ def gradients(ys, xs, grad_ys=None, stop_grads=None, group_aggregations=8, custo
         for i, dy in enumerate(grad_ys):
             if dy is None:
                 # float grads start at ones by default
-                grad_ys[i] = tf.fill(tf.shape(ys[i]), tf.constant(1.0, dtype=ys[i].dtype, name=f"grad_ys_{i}"))
+                grad_ys[i] = tf.fill(tf.shape(ys[i]), tf.constant(1.0, dtype=ys[i].dtype, name="grad_ys_%s" % (i)))
 
         ys_ops = [t.op for t in ys]
         xs_ops = [t.op for t in xs]
@@ -261,7 +261,7 @@ def gradients(ys, xs, grad_ys=None, stop_grads=None, group_aggregations=8, custo
                     else:
                         grad_fn = ops.get_gradient_function(op)
                 except LookupError:
-                    raise LookupError(f"No gradient defined for operation '{op.name}' (op type: {op.type})")
+                    raise LookupError("No gradient defined for operation '%s' (op type: %s)" % (op.name, op.type))
 
                 # for any missing input grads, build a zero input of the right dtype/shape
                 for i, dy in enumerate(dys):
@@ -273,7 +273,7 @@ def gradients(ys, xs, grad_ys=None, stop_grads=None, group_aggregations=8, custo
                     dxs = _AsList(grad_fn(op, *dys))
 
                     if len(dxs) != len(op.inputs):
-                        raise ValueError(f"Num gradients {len(dxs)} generated for op {op.node_def} do not match num inputs {len(op.inputs)}")
+                        raise ValueError("Num gradients %s generated for op %s do not match num inputs %s" % (len(dxs), op.node_def, len(op.inputs)))
 
                     #_LogOpGradients(op, dys, dxs)
             else:
@@ -315,5 +315,4 @@ def gradients(ys, xs, grad_ys=None, stop_grads=None, group_aggregations=8, custo
             op._update_input(i+n_out, x)
 
     return [_GetGrad(grads, x) for x in xs]
-
 

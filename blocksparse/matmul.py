@@ -46,7 +46,7 @@ def get_constant(lut, name):
     #print(name, lut.size)
     #tf_entry = tf.constant(lut, name=name+"_lut")
     with tf.control_dependencies(None):
-        tf_entry = tf.get_variable(f"{name}_lut_{g_lut_idx}", initializer=lut.view(np.int64), trainable=False)
+        tf_entry = tf.get_variable("%s_lut_%s" % (name, g_lut_idx), initializer=lut.view(np.int64), trainable=False)
     g_lut_idx += 1
 
     g_lookup_cache[name].append( (lut, tf_entry) )
@@ -736,14 +736,14 @@ def group_dg_grads(bsmm_dw_op, dw, scope):
     # that takes in the final accumulated dw value
     dg_op  = bsmm_dw_op.outputs[0].consumers()[0]
     assert dg_op.type == "BlocksparseMatmulDG"
-    dw, dg = blocksparse_matmul_dg(dw, *dg_op.inputs[1:], name=f"{scope}/BlocksparseMatmulDG")
+    dw, dg = blocksparse_matmul_dg(dw, *dg_op.inputs[1:], name="%s/BlocksparseMatmulDG" % (scope))
 
     # splice old add_n op out of graph
     addn_op  = dg_op.outputs[1].consumers()[0]
     addn_ops = list()
     addn_ops.append(addn_op)
     if addn_op.type[0:3] != "Add":
-        raise ValueError(f"bad type: {addn_ops[0].type} Cause: this segment does not share a broadcasted gate.")
+        raise ValueError("bad type: %s Cause: this segment does not share a broadcasted gate." % (addn_ops[0].type))
     elif addn_op.type == "AddN8":
         while True:
             addn_op = addn_op.outputs[0].consumers()[0]
@@ -768,12 +768,12 @@ def group_dg_grads(bsmm_dw_op, dw, scope):
         for i, t in enumerate(dg_consumer.inputs):
             #print(i, t.name)
             if t is addn:
-                #print(f"splicing dg into: {dg_consumer.name} at {i}")
+                #print("splicing dg into: %s at %s" % (dg_consumer.name, i))
                 dg_consumer._update_input(i, dg)
                 found = True
                 break
         if not found:
-            print(f"splice failed for {dg_consumer.name}")
+            print("splice failed for %s" % (dg_consumer.name))
     return dw
 
 
