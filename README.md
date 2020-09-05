@@ -76,6 +76,7 @@ If you're interested in hacking on the ops and kernels, go ahead and build from 
     git clone git@github.com:openai/blocksparse.git
     cd blocksparse
 
+    python generate_kernels.py
     make compile
     pip install dist/*.whl
 
