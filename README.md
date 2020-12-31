@@ -1,3 +1,49 @@
+# Kite usage, read first
+
+## Manual build for tf 1.13.1
+NOTE:
+- commands prefixed by `$` should be run in a shell on the host machine
+- commands prefixed by `#` should be run in an interactive shell in the docker container
+
+1) Build image
+```
+$ docker image build -f Dockerfile-tf-1.13.1 --rm -t blocksparse:local-tf.1.13.1 .
+```
+
+2) Start docker container with an interactive terminal, *Choose the relevant CPU/GPU option below*
+
+CPU
+- the tests below will fail if you try to run them without GPU support
+- the `ln` command should be run inside the docker container
+```
+$ docker run -it --privileged -w /working_dir -v ${PWD}:/working_dir --rm blocksparse:local-tf.1.13.1
+# ln -s /usr/local/cuda/compat/libcuda.so /usr/lib/libcuda.so
+```
+
+GPU
+```
+$ docker run -it --gpus all --privileged -w /working_dir -v ${PWD}:/working_dir --rm blocksparse:local-tf.1.13.1
+```
+
+3) Compile (inside the docker container)
+```
+# make compile
+```
+
+4) Install compiled version (inside the docker container)
+```
+# pip3 install dist/*.whl
+```
+
+5) Test compiled version (inside the docker container)
+```
+# test/blocksparse_matmul_test.py
+# test/blocksparse_conv_test.py
+```
+
+
+# Original README.md below
+
 **Status:** Active (under active development, breaking changes may occur)
 
 # Blocksparse
